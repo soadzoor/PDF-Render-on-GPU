@@ -44,7 +44,8 @@ export interface VectorScene {
   textInstanceB: Float32Array;
   textGlyphMetaA: Float32Array;
   textGlyphMetaB: Float32Array;
-  textGlyphSegments: Float32Array;
+  textGlyphSegmentsA: Float32Array;
+  textGlyphSegmentsB: Float32Array;
   endpoints: Float32Array;
   styles: Float32Array;
   bounds: Bounds;
@@ -120,8 +121,8 @@ const COVER_INTERVAL_EPSILON = 0.05;
 const COVER_HALF_WIDTH_EPSILON = 1e-4;
 const FILL_CURVE_FLATNESS = 0.18;
 const MAX_FILL_CURVE_SPLIT_DEPTH = 8;
-const TEXT_CURVE_FLATNESS = 0.08;
-const MAX_TEXT_CURVE_SPLIT_DEPTH = 7;
+const TEXT_CUBIC_TO_QUAD_ERROR = 0.05;
+const MAX_TEXT_CUBIC_TO_QUAD_DEPTH = 10;
 const TEXT_BOUNDS_EPSILON = 1e-4;
 const FONT_MATRIX_FALLBACK = 0.001;
 const TEXT_MIN_ALPHA = 1e-3;
@@ -134,6 +135,9 @@ const TEXT_RENDER_MODE_FILL = 0;
 const TEXT_RENDER_MODE_FILL_STROKE = 2;
 const TEXT_RENDER_MODE_FILL_ADD_PATH = 4;
 const TEXT_RENDER_MODE_FILL_STROKE_ADD_PATH = 6;
+
+const TEXT_PRIMITIVE_LINE = 0;
+const TEXT_PRIMITIVE_QUADRATIC = 1;
 
 export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const enableSegmentMerge = options.enableSegmentMerge !== false;
@@ -390,7 +394,8 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       textInstanceB: textData.instanceB,
       textGlyphMetaA: textData.glyphMetaA,
       textGlyphMetaB: textData.glyphMetaB,
-      textGlyphSegments: textData.glyphSegments,
+      textGlyphSegmentsA: textData.glyphSegmentsA,
+      textGlyphSegmentsB: textData.glyphSegmentsB,
       endpoints,
       styles,
       bounds: combinedBounds,
@@ -509,7 +514,8 @@ interface TextExtractResult {
   instanceB: Float32Array;
   glyphMetaA: Float32Array;
   glyphMetaB: Float32Array;
-  glyphSegments: Float32Array;
+  glyphSegmentsA: Float32Array;
+  glyphSegmentsB: Float32Array;
   bounds: Bounds | null;
 }
 
@@ -1460,7 +1466,8 @@ async function extractTextVectorData(
   const textInstanceB = new Float4Builder(4_096);
   const textGlyphMetaA = new Float4Builder(2_048);
   const textGlyphMetaB = new Float4Builder(2_048);
-  const textGlyphSegments = new Float4Builder(16_384);
+  const textGlyphSegmentsA = new Float4Builder(16_384);
+  const textGlyphSegmentsB = new Float4Builder(16_384);
 
   const glyphIndexByKey = new Map<string, number>();
   const glyphBoundsByIndex: Bounds[] = [];
@@ -1494,8 +1501,8 @@ async function extractTextVectorData(
       return null;
     }
 
-    const segmentStart = textGlyphSegments.quadCount;
-    const glyphBuild = emitTextGlyphSegmentsFromPath(pathData, textGlyphSegments);
+    const segmentStart = textGlyphSegmentsA.quadCount;
+    const glyphBuild = emitTextGlyphSegmentsFromPath(pathData, textGlyphSegmentsA, textGlyphSegmentsB);
     if (glyphBuild.segmentCount <= 0) {
       return null;
     }
@@ -1729,14 +1736,15 @@ async function extractTextVectorData(
     sourceTextCount,
     instanceCount: textInstanceA.quadCount,
     glyphCount: textGlyphMetaA.quadCount,
-    glyphSegmentCount: textGlyphSegments.quadCount,
+    glyphSegmentCount: textGlyphSegmentsA.quadCount,
     inPageCount,
     outOfPageCount,
     instanceA: textInstanceA.toTypedArray(),
     instanceB: textInstanceB.toTypedArray(),
     glyphMetaA: textGlyphMetaA.toTypedArray(),
     glyphMetaB: textGlyphMetaB.toTypedArray(),
-    glyphSegments: textGlyphSegments.toTypedArray(),
+    glyphSegmentsA: textGlyphSegmentsA.toTypedArray(),
+    glyphSegmentsB: textGlyphSegmentsB.toTypedArray(),
     bounds: textBounds
   };
 }
@@ -1753,7 +1761,8 @@ function createEmptyTextExtractResult(): TextExtractResult {
     instanceB: new Float32Array(0),
     glyphMetaA: new Float32Array(0),
     glyphMetaB: new Float32Array(0),
-    glyphSegments: new Float32Array(0),
+    glyphSegmentsA: new Float32Array(0),
+    glyphSegmentsB: new Float32Array(0),
     bounds: null
   };
 }
@@ -2044,7 +2053,11 @@ function toFloat32Path(raw: unknown): Float32Array | null {
   return null;
 }
 
-function emitTextGlyphSegmentsFromPath(pathData: Float32Array, outSegments: Float4Builder): TextGlyphBuildResult {
+function emitTextGlyphSegmentsFromPath(
+  pathData: Float32Array,
+  outSegmentsA: Float4Builder,
+  outSegmentsB: Float4Builder
+): TextGlyphBuildResult {
   let segmentCount = 0;
 
   let cursorX = 0;
@@ -2067,13 +2080,33 @@ function emitTextGlyphSegmentsFromPath(pathData: Float32Array, outSegments: Floa
       return;
     }
 
-    outSegments.push(x0, y0, x1, y1);
+    outSegmentsA.push(x0, y0, x1, y1);
+    outSegmentsB.push(x1, y1, TEXT_PRIMITIVE_LINE, 0);
     segmentCount += 1;
 
     bounds.minX = Math.min(bounds.minX, x0, x1);
     bounds.minY = Math.min(bounds.minY, y0, y1);
     bounds.maxX = Math.max(bounds.maxX, x0, x1);
     bounds.maxY = Math.max(bounds.maxY, y0, y1);
+  };
+
+  const emitQuadratic = (x0: number, y0: number, cx: number, cy: number, x1: number, y1: number): void => {
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const cdx = cx - x0;
+    const cdy = cy - y0;
+    if (dx * dx + dy * dy < 1e-12 && cdx * cdx + cdy * cdy < 1e-12) {
+      return;
+    }
+
+    outSegmentsA.push(x0, y0, cx, cy);
+    outSegmentsB.push(x1, y1, TEXT_PRIMITIVE_QUADRATIC, 0);
+    segmentCount += 1;
+
+    bounds.minX = Math.min(bounds.minX, x0, cx, x1);
+    bounds.minY = Math.min(bounds.minY, y0, cy, y1);
+    bounds.maxX = Math.max(bounds.maxX, x0, cx, x1);
+    bounds.maxY = Math.max(bounds.maxY, y0, cy, y1);
   };
 
   for (let i = 0; i < pathData.length; ) {
@@ -2105,7 +2138,7 @@ function emitTextGlyphSegmentsFromPath(pathData: Float32Array, outSegments: Floa
       const x3 = pathData[i++];
       const y3 = pathData[i++];
 
-      flattenCubic(
+      emitCubicAsQuadratics(
         cursorX,
         cursorY,
         x1,
@@ -2114,9 +2147,9 @@ function emitTextGlyphSegmentsFromPath(pathData: Float32Array, outSegments: Floa
         y2,
         x3,
         y3,
-        emitLine,
-        TEXT_CURVE_FLATNESS,
-        MAX_TEXT_CURVE_SPLIT_DEPTH
+        emitQuadratic,
+        TEXT_CUBIC_TO_QUAD_ERROR,
+        MAX_TEXT_CUBIC_TO_QUAD_DEPTH
       );
 
       cursorX = x3;
@@ -2125,32 +2158,15 @@ function emitTextGlyphSegmentsFromPath(pathData: Float32Array, outSegments: Floa
     }
 
     if (op === DRAW_QUAD_TO) {
-      const x1 = pathData[i++];
-      const y1 = pathData[i++];
-      const x2 = pathData[i++];
-      const y2 = pathData[i++];
+      const cx = pathData[i++];
+      const cy = pathData[i++];
+      const x = pathData[i++];
+      const y = pathData[i++];
 
-      const c1x = cursorX + (2 / 3) * (x1 - cursorX);
-      const c1y = cursorY + (2 / 3) * (y1 - cursorY);
-      const c2x = x2 + (2 / 3) * (x1 - x2);
-      const c2y = y2 + (2 / 3) * (y1 - y2);
+      emitQuadratic(cursorX, cursorY, cx, cy, x, y);
 
-      flattenCubic(
-        cursorX,
-        cursorY,
-        c1x,
-        c1y,
-        c2x,
-        c2y,
-        x2,
-        y2,
-        emitLine,
-        TEXT_CURVE_FLATNESS,
-        MAX_TEXT_CURVE_SPLIT_DEPTH
-      );
-
-      cursorX = x2;
-      cursorY = y2;
+      cursorX = x;
+      cursorY = y;
       continue;
     }
 
@@ -2174,6 +2190,155 @@ function emitTextGlyphSegmentsFromPath(pathData: Float32Array, outSegments: Floa
   }
 
   return { segmentCount, bounds };
+}
+
+function emitCubicAsQuadratics(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  x3: number,
+  y3: number,
+  emitQuadratic: (sx: number, sy: number, cx: number, cy: number, ex: number, ey: number) => void,
+  maxError: number,
+  maxDepth: number
+): void {
+  const stack: number[] = [x0, y0, x1, y1, x2, y2, x3, y3, 0];
+  const maxErrorSq = maxError * maxError;
+
+  while (stack.length > 0) {
+    const depth = stack.pop() as number;
+    const q3y = stack.pop() as number;
+    const q3x = stack.pop() as number;
+    const q2y = stack.pop() as number;
+    const q2x = stack.pop() as number;
+    const q1y = stack.pop() as number;
+    const q1x = stack.pop() as number;
+    const q0y = stack.pop() as number;
+    const q0x = stack.pop() as number;
+
+    const [controlX, controlY] = approximateCubicAsQuadraticControl(q0x, q0y, q1x, q1y, q2x, q2y, q3x, q3y);
+    const errorSq = cubicQuadraticApproxErrorSq(q0x, q0y, q1x, q1y, q2x, q2y, q3x, q3y, controlX, controlY);
+    if (depth >= maxDepth || errorSq <= maxErrorSq) {
+      emitQuadratic(q0x, q0y, controlX, controlY, q3x, q3y);
+      continue;
+    }
+
+    const x01 = (q0x + q1x) * 0.5;
+    const y01 = (q0y + q1y) * 0.5;
+    const x12 = (q1x + q2x) * 0.5;
+    const y12 = (q1y + q2y) * 0.5;
+    const x23 = (q2x + q3x) * 0.5;
+    const y23 = (q2y + q3y) * 0.5;
+
+    const x012 = (x01 + x12) * 0.5;
+    const y012 = (y01 + y12) * 0.5;
+    const x123 = (x12 + x23) * 0.5;
+    const y123 = (y12 + y23) * 0.5;
+
+    const x0123 = (x012 + x123) * 0.5;
+    const y0123 = (y012 + y123) * 0.5;
+
+    const nextDepth = depth + 1;
+    stack.push(x0123, y0123, x123, y123, x23, y23, q3x, q3y, nextDepth);
+    stack.push(q0x, q0y, x01, y01, x012, y012, x0123, y0123, nextDepth);
+  }
+}
+
+function approximateCubicAsQuadraticControl(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  x3: number,
+  y3: number
+): [number, number] {
+  return [
+    (3 * (x1 + x2) - x0 - x3) * 0.25,
+    (3 * (y1 + y2) - y0 - y3) * 0.25
+  ];
+}
+
+function cubicQuadraticApproxErrorSq(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  x3: number,
+  y3: number,
+  cx: number,
+  cy: number
+): number {
+  const tValues = [0.25, 0.5, 0.75];
+  let maxSq = 0;
+
+  for (const t of tValues) {
+    const cubic = evaluateCubicPoint(x0, y0, x1, y1, x2, y2, x3, y3, t);
+    const quad = evaluateQuadraticPoint(x0, y0, cx, cy, x3, y3, t);
+    const dx = cubic[0] - quad[0];
+    const dy = cubic[1] - quad[1];
+    const distSq = dx * dx + dy * dy;
+    if (distSq > maxSq) {
+      maxSq = distSq;
+    }
+  }
+
+  return maxSq;
+}
+
+function evaluateCubicPoint(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  x3: number,
+  y3: number,
+  t: number
+): [number, number] {
+  const oneMinusT = 1 - t;
+  const oneMinusTSq = oneMinusT * oneMinusT;
+  const oneMinusTCube = oneMinusTSq * oneMinusT;
+  const tSq = t * t;
+  const tCube = tSq * t;
+
+  const x =
+    oneMinusTCube * x0 +
+    3 * oneMinusTSq * t * x1 +
+    3 * oneMinusT * tSq * x2 +
+    tCube * x3;
+  const y =
+    oneMinusTCube * y0 +
+    3 * oneMinusTSq * t * y1 +
+    3 * oneMinusT * tSq * y2 +
+    tCube * y3;
+
+  return [x, y];
+}
+
+function evaluateQuadraticPoint(
+  x0: number,
+  y0: number,
+  cx: number,
+  cy: number,
+  x1: number,
+  y1: number,
+  t: number
+): [number, number] {
+  const oneMinusT = 1 - t;
+  const oneMinusTSq = oneMinusT * oneMinusT;
+  const tSq = t * t;
+
+  const x = oneMinusTSq * x0 + 2 * oneMinusT * t * cx + tSq * x1;
+  const y = oneMinusTSq * y0 + 2 * oneMinusT * t * cy + tSq * y1;
+  return [x, y];
 }
 
 function buildTextGlyphTransform(state: TextState, glyphX: number, glyphY: number): Mat2D {

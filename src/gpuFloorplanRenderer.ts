@@ -332,7 +332,8 @@ const TEXT_FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
 precision highp sampler2D;
 
-uniform sampler2D uTextGlyphSegmentTex;
+uniform sampler2D uTextGlyphSegmentTexA;
+uniform sampler2D uTextGlyphSegmentTexB;
 uniform ivec2 uTextGlyphSegmentTexSize;
 uniform float uTextAAScreenPx;
 
@@ -343,12 +344,146 @@ in vec2 vLocal;
 
 out vec4 outColor;
 
-const int MAX_GLYPH_SEGMENTS = 256;
+const int MAX_GLYPH_PRIMITIVES = 256;
+const float TEXT_PRIMITIVE_QUADRATIC = 1.0;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   int x = index % sizeValue.x;
   int y = index / sizeValue.x;
   return ivec2(x, y);
+}
+
+float distanceToLineSegment(vec2 p, vec2 a, vec2 b) {
+  vec2 ab = b - a;
+  float abLenSq = dot(ab, ab);
+  if (abLenSq <= 1e-10) {
+    return length(p - a);
+  }
+  float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
+  return length(p - (a + ab * t));
+}
+
+float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
+  vec2 aa = b - a;
+  vec2 bb = a - 2.0 * b + c;
+  vec2 cc = aa * 2.0;
+  vec2 dd = a - p;
+
+  float bbLenSq = dot(bb, bb);
+  if (bbLenSq <= 1e-12) {
+    return distanceToLineSegment(p, a, c);
+  }
+
+  float inv = 1.0 / bbLenSq;
+  float kx = inv * dot(aa, bb);
+  float ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
+  float kz = inv * dot(dd, aa);
+
+  float pValue = ky - kx * kx;
+  float pCube = pValue * pValue * pValue;
+  float qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
+  float hValue = qValue * qValue + 4.0 * pCube;
+
+  float best = 1e20;
+
+  if (hValue >= 0.0) {
+    float hSqrt = sqrt(hValue);
+    vec2 roots = (vec2(hSqrt, -hSqrt) - qValue) * 0.5;
+    vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
+    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+    vec2 delta = dd + (cc + bb * t) * t;
+    best = dot(delta, delta);
+  } else {
+    float z = sqrt(-pValue);
+    float acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
+    float angle = acos(acosArg) / 3.0;
+    float cosine = cos(angle);
+    float sine = sin(angle) * 1.732050808;
+    vec3 t = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
+
+    vec2 delta = dd + (cc + bb * t.x) * t.x;
+    best = min(best, dot(delta, delta));
+    delta = dd + (cc + bb * t.y) * t.y;
+    best = min(best, dot(delta, delta));
+    delta = dd + (cc + bb * t.z) * t.z;
+    best = min(best, dot(delta, delta));
+  }
+
+  return sqrt(max(best, 0.0));
+}
+
+void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding, inout int crossings) {
+  bool crosses = (a.y <= p.y && b.y > p.y) || (b.y <= p.y && a.y > p.y);
+  if (!crosses) {
+    return;
+  }
+
+  float denom = b.y - a.y;
+  if (abs(denom) <= 1e-6) {
+    return;
+  }
+
+  float xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
+  if (xCross > p.x) {
+    crossings += 1;
+    winding += (b.y > a.y) ? 1 : -1;
+  }
+}
+
+void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding, inout int crossings) {
+  float qa = a.y - 2.0 * b.y + c.y;
+  float qb = 2.0 * (b.y - a.y);
+  float qc = a.y - p.y;
+
+  float roots[2];
+  int rootCount = 0;
+
+  if (abs(qa) <= 1e-7) {
+    if (abs(qb) <= 1e-7) {
+      return;
+    }
+    roots[0] = -qc / qb;
+    rootCount = 1;
+  } else {
+    float disc = qb * qb - 4.0 * qa * qc;
+    if (disc < 0.0) {
+      return;
+    }
+    float sqrtDisc = sqrt(max(disc, 0.0));
+    float inv = 0.5 / qa;
+    roots[0] = (-qb - sqrtDisc) * inv;
+    roots[1] = (-qb + sqrtDisc) * inv;
+    rootCount = 2;
+  }
+
+  for (int i = 0; i < 2; i += 1) {
+    if (i >= rootCount) {
+      break;
+    }
+
+    float t = roots[i];
+    if (t <= 1e-5 || t > 1.0) {
+      continue;
+    }
+
+    if (rootCount == 2 && i == 1 && abs(t - roots[0]) <= 1e-5) {
+      continue;
+    }
+
+    float oneMinusT = 1.0 - t;
+    float xCross = oneMinusT * oneMinusT * a.x + 2.0 * oneMinusT * t * b.x + t * t * c.x;
+    if (xCross <= p.x) {
+      continue;
+    }
+
+    crossings += 1;
+    float dy = 2.0 * qa * t + qb;
+    if (dy > 1e-5) {
+      winding += 1;
+    } else if (dy < -1e-5) {
+      winding -= 1;
+    }
+  }
 }
 
 void main() {
@@ -360,34 +495,24 @@ void main() {
   int winding = 0;
   int crossings = 0;
 
-  for (int i = 0; i < MAX_GLYPH_SEGMENTS; i += 1) {
+  for (int i = 0; i < MAX_GLYPH_PRIMITIVES; i += 1) {
     if (i >= vSegmentCount) {
       break;
     }
 
-    vec4 segment = texelFetch(uTextGlyphSegmentTex, coordFromIndex(vSegmentStart + i, uTextGlyphSegmentTexSize), 0);
-    vec2 a = segment.xy;
-    vec2 b = segment.zw;
-    vec2 ab = b - a;
-    vec2 ap = vLocal - a;
-    float abLenSq = dot(ab, ab);
+    vec4 primitiveA = texelFetch(uTextGlyphSegmentTexA, coordFromIndex(vSegmentStart + i, uTextGlyphSegmentTexSize), 0);
+    vec4 primitiveB = texelFetch(uTextGlyphSegmentTexB, coordFromIndex(vSegmentStart + i, uTextGlyphSegmentTexSize), 0);
+    vec2 p0 = primitiveA.xy;
+    vec2 p1 = primitiveA.zw;
+    vec2 p2 = primitiveB.xy;
+    float primitiveType = primitiveB.z;
 
-    if (abLenSq > 1e-10) {
-      float t = clamp(dot(ap, ab) / abLenSq, 0.0, 1.0);
-      vec2 closest = a + t * ab;
-      minDistance = min(minDistance, length(vLocal - closest));
-    }
-
-    bool crosses = (a.y <= vLocal.y && b.y > vLocal.y) || (b.y <= vLocal.y && a.y > vLocal.y);
-    if (crosses) {
-      float denom = b.y - a.y;
-      if (abs(denom) > 1e-6) {
-        float xCross = a.x + (vLocal.y - a.y) * (b.x - a.x) / denom;
-        if (xCross > vLocal.x) {
-          crossings += 1;
-          winding += (b.y > a.y) ? 1 : -1;
-        }
-      }
+    if (primitiveType >= TEXT_PRIMITIVE_QUADRATIC) {
+      minDistance = min(minDistance, distanceToQuadraticBezier(vLocal, p0, p1, p2));
+      accumulateQuadraticCrossing(p0, p1, p2, vLocal, winding, crossings);
+    } else {
+      minDistance = min(minDistance, distanceToLineSegment(vLocal, p0, p2));
+      accumulateLineCrossing(p0, p2, vLocal, winding, crossings);
     }
   }
 
@@ -530,7 +655,9 @@ export class GpuFloorplanRenderer {
 
   private readonly textGlyphMetaTextureB: WebGLTexture;
 
-  private readonly textGlyphSegmentTexture: WebGLTexture;
+  private readonly textGlyphSegmentTextureA: WebGLTexture;
+
+  private readonly textGlyphSegmentTextureB: WebGLTexture;
 
   private readonly uSegmentTexA: WebGLUniformLocation;
 
@@ -574,7 +701,9 @@ export class GpuFloorplanRenderer {
 
   private readonly uTextGlyphMetaTexB: WebGLUniformLocation;
 
-  private readonly uTextGlyphSegmentTex: WebGLUniformLocation;
+  private readonly uTextGlyphSegmentTexA: WebGLUniformLocation;
+
+  private readonly uTextGlyphSegmentTexB: WebGLUniformLocation;
 
   private readonly uTextInstanceTexSize: WebGLUniformLocation;
 
@@ -743,7 +872,8 @@ export class GpuFloorplanRenderer {
     this.textInstanceTextureB = this.mustCreateTexture();
     this.textGlyphMetaTextureA = this.mustCreateTexture();
     this.textGlyphMetaTextureB = this.mustCreateTexture();
-    this.textGlyphSegmentTexture = this.mustCreateTexture();
+    this.textGlyphSegmentTextureA = this.mustCreateTexture();
+    this.textGlyphSegmentTextureB = this.mustCreateTexture();
 
     this.uSegmentTexA = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexA");
     this.uSegmentTexB = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexB");
@@ -768,7 +898,8 @@ export class GpuFloorplanRenderer {
     this.uTextInstanceTexB = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexB");
     this.uTextGlyphMetaTexA = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexA");
     this.uTextGlyphMetaTexB = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexB");
-    this.uTextGlyphSegmentTex = this.mustGetUniformLocation(this.textProgram, "uTextGlyphSegmentTex");
+    this.uTextGlyphSegmentTexA = this.mustGetUniformLocation(this.textProgram, "uTextGlyphSegmentTexA");
+    this.uTextGlyphSegmentTexB = this.mustGetUniformLocation(this.textProgram, "uTextGlyphSegmentTexB");
     this.uTextInstanceTexSize = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexSize");
     this.uTextGlyphMetaTexSize = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexSize");
     this.uTextGlyphSegmentTexSize = this.mustGetUniformLocation(this.textProgram, "uTextGlyphSegmentTexSize");
@@ -1204,13 +1335,16 @@ export class GpuFloorplanRenderer {
     gl.activeTexture(gl.TEXTURE5);
     gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureB);
     gl.activeTexture(gl.TEXTURE6);
-    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTexture);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureA);
+    gl.activeTexture(gl.TEXTURE7);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureB);
 
     gl.uniform1i(this.uTextInstanceTexA, 2);
     gl.uniform1i(this.uTextInstanceTexB, 3);
     gl.uniform1i(this.uTextGlyphMetaTexA, 4);
     gl.uniform1i(this.uTextGlyphMetaTexB, 5);
-    gl.uniform1i(this.uTextGlyphSegmentTex, 6);
+    gl.uniform1i(this.uTextGlyphSegmentTexA, 6);
+    gl.uniform1i(this.uTextGlyphSegmentTexB, 7);
     gl.uniform2i(this.uTextInstanceTexSize, this.textInstanceTextureWidth, this.textInstanceTextureHeight);
     gl.uniform2i(this.uTextGlyphMetaTexSize, this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight);
     gl.uniform2i(this.uTextGlyphSegmentTexSize, this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight);
@@ -1608,8 +1742,11 @@ export class GpuFloorplanRenderer {
     const glyphMetaBData = new Float32Array(glyphMetaTexelCount * 4);
     glyphMetaBData.set(scene.textGlyphMetaB);
 
-    const glyphSegmentData = new Float32Array(glyphSegmentTexelCount * 4);
-    glyphSegmentData.set(scene.textGlyphSegments);
+    const glyphSegmentDataA = new Float32Array(glyphSegmentTexelCount * 4);
+    glyphSegmentDataA.set(scene.textGlyphSegmentsA);
+
+    const glyphSegmentDataB = new Float32Array(glyphSegmentTexelCount * 4);
+    glyphSegmentDataB.set(scene.textGlyphSegmentsB);
 
     gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureA);
     configureFloatTexture(gl);
@@ -1667,7 +1804,7 @@ export class GpuFloorplanRenderer {
       glyphMetaBData
     );
 
-    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTexture);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureA);
     configureFloatTexture(gl);
     gl.texImage2D(
       gl.TEXTURE_2D,
@@ -1678,7 +1815,21 @@ export class GpuFloorplanRenderer {
       0,
       gl.RGBA,
       gl.FLOAT,
-      glyphSegmentData
+      glyphSegmentDataA
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTextureB);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.textGlyphSegmentTextureWidth,
+      this.textGlyphSegmentTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      glyphSegmentDataB
     );
 
     return {
