@@ -259,14 +259,16 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       return;
     }
 
-    if (scene.segmentCount === 0) {
-      setStatus(`No visible stroke segments were extracted from ${label}.`);
+    if (scene.segmentCount === 0 && scene.textInstanceCount === 0) {
+      setStatus(`No visible vector geometry was extracted from ${label}.`);
       runtimeTextElement.textContent = "";
       setMetricPlaceholder(label);
       return;
     }
 
-    setStatus(`Uploading ${scene.segmentCount.toLocaleString()} segments to GPU...`);
+    setStatus(
+      `Uploading ${scene.segmentCount.toLocaleString()} segments and ${scene.textInstanceCount.toLocaleString()} text instances to GPU...`
+    );
     const uploadStart = performance.now();
     const sceneStats = renderer.setScene(scene);
     if (!options.preserveView) {
@@ -280,7 +282,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
     logSegmentMergeStats(label, scene);
     logInvisibleCullStats(label, scene);
-    logTextureSizeStats(label, scene.segmentCount, sceneStats);
+    logTextVectorStats(label, scene);
+    logTextureSizeStats(label, scene, sceneStats);
 
     updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadEnd - uploadStart);
     baseStatus = formatSceneStatus(label, scene);
@@ -316,9 +319,11 @@ function formatSceneStatus(
   label: string,
   scene: VectorScene
 ): string {
+  const fillPathCount = scene.fillPathCount.toLocaleString();
   const sourceSegmentCount = scene.sourceSegmentCount.toLocaleString();
   const visibleSegmentCount = scene.segmentCount.toLocaleString();
-  return `${label} loaded | ${visibleSegmentCount} visible from ${sourceSegmentCount} source segments`;
+  const textInstanceCount = scene.textInstanceCount.toLocaleString();
+  return `${label} loaded | fills ${fillPathCount}, ${visibleSegmentCount} visible from ${sourceSegmentCount} source segments, ${textInstanceCount} text instances`;
 }
 
 function setStatus(message: string): void {
@@ -355,13 +360,29 @@ function setMetricPlaceholder(label: string = "-"): void {
 function updateMetricsPanel(
   label: string,
   scene: VectorScene,
-  sceneStats: { textureWidth: number; textureHeight: number; maxTextureSize: number; maxCellPopulation: number },
+  sceneStats: {
+    fillPathTextureWidth: number;
+    fillPathTextureHeight: number;
+    fillSegmentTextureWidth: number;
+    fillSegmentTextureHeight: number;
+    textureWidth: number;
+    textureHeight: number;
+    maxTextureSize: number;
+    maxCellPopulation: number;
+    textInstanceTextureWidth: number;
+    textInstanceTextureHeight: number;
+    textGlyphTextureWidth: number;
+    textGlyphTextureHeight: number;
+    textSegmentTextureWidth: number;
+    textSegmentTextureHeight: number;
+  },
   parseMs: number,
   uploadMs: number
 ): void {
   const sourceSegments = scene.sourceSegmentCount;
   const mergedSegments = scene.mergedSegmentCount;
   const visibleSegments = scene.segmentCount;
+  const fillPaths = scene.fillPathCount;
 
   const mergeReduction = sourceSegments > 0 ? (1 - mergedSegments / sourceSegments) * 100 : 0;
   const cullReduction = mergedSegments > 0 ? (1 - visibleSegments / mergedSegments) * 100 : 0;
@@ -372,14 +393,15 @@ function updateMetricsPanel(
   metricOperatorsTextElement.textContent = scene.operatorCount.toLocaleString();
   metricSourceSegmentsTextElement.textContent = sourceSegments.toLocaleString();
   metricMergedSegmentsTextElement.textContent = `${mergedSegments.toLocaleString()} (${formatPercent(mergeReduction)} reduction)`;
-  metricVisibleSegmentsTextElement.textContent = `${visibleSegments.toLocaleString()} (${formatPercent(totalReduction)} total reduction)`;
+  metricVisibleSegmentsTextElement.textContent =
+    `${visibleSegments.toLocaleString()} (${formatPercent(totalReduction)} total reduction), fills ${fillPaths.toLocaleString()}, text ${scene.textInstanceCount.toLocaleString()} instances`;
   metricReductionsTextElement.textContent =
     `merge ${formatPercent(mergeReduction)}, invisible-cull ${formatPercent(cullReduction)}, total ${formatPercent(totalReduction)}`;
   metricCullDiscardsTextElement.textContent =
-    `transparent ${scene.discardedTransparentCount.toLocaleString()}, degenerate ${scene.discardedDegenerateCount.toLocaleString()}, duplicates ${scene.discardedDuplicateCount.toLocaleString()}, contained ${scene.discardedContainedCount.toLocaleString()}`;
+    `transparent ${scene.discardedTransparentCount.toLocaleString()}, degenerate ${scene.discardedDegenerateCount.toLocaleString()}, duplicates ${scene.discardedDuplicateCount.toLocaleString()}, contained ${scene.discardedContainedCount.toLocaleString()}, glyphs ${scene.textGlyphCount.toLocaleString()} / glyph segments ${scene.textGlyphSegmentCount.toLocaleString()}`;
   metricTimesTextElement.textContent = `parse ${parseMs.toFixed(0)} ms, upload ${uploadMs.toFixed(0)} ms`;
   metricTextureTextElement.textContent =
-    `${sceneStats.textureWidth}x${sceneStats.textureHeight} (${textureUtilization.toFixed(1)}% of max ${sceneStats.maxTextureSize})`;
+    `fill paths ${sceneStats.fillPathTextureWidth}x${sceneStats.fillPathTextureHeight}, fill seg ${sceneStats.fillSegmentTextureWidth}x${sceneStats.fillSegmentTextureHeight}, segments ${sceneStats.textureWidth}x${sceneStats.textureHeight} (${textureUtilization.toFixed(1)}% of max ${sceneStats.maxTextureSize}), text inst ${sceneStats.textInstanceTextureWidth}x${sceneStats.textInstanceTextureHeight}, glyph ${sceneStats.textGlyphTextureWidth}x${sceneStats.textGlyphTextureHeight}, glyph-seg ${sceneStats.textSegmentTextureWidth}x${sceneStats.textSegmentTextureHeight}`;
   metricGridMaxCellTextElement.textContent = sceneStats.maxCellPopulation.toLocaleString();
   metricsPanelElement.dataset.ready = "true";
 }
@@ -403,12 +425,26 @@ function updateFpsMetric(): void {
 
 function logTextureSizeStats(
   label: string,
-  segmentCount: number,
-  sceneStats: { textureWidth: number; textureHeight: number; maxTextureSize: number }
+  scene: VectorScene,
+  sceneStats: {
+    fillPathTextureWidth: number;
+    fillPathTextureHeight: number;
+    fillSegmentTextureWidth: number;
+    fillSegmentTextureHeight: number;
+    textureWidth: number;
+    textureHeight: number;
+    maxTextureSize: number;
+    textInstanceTextureWidth: number;
+    textInstanceTextureHeight: number;
+    textGlyphTextureWidth: number;
+    textGlyphTextureHeight: number;
+    textSegmentTextureWidth: number;
+    textSegmentTextureHeight: number;
+  }
 ): void {
   const utilization = (Math.max(sceneStats.textureWidth, sceneStats.textureHeight) / sceneStats.maxTextureSize) * 100;
   console.log(
-    `[GPU texture size] ${label}: ${sceneStats.textureWidth}x${sceneStats.textureHeight} (segments=${segmentCount.toLocaleString()}, maxTextureSize=${sceneStats.maxTextureSize}, max-dim utilization=${utilization.toFixed(1)}%)`
+    `[GPU texture size] ${label}: fills=${sceneStats.fillPathTextureWidth}x${sceneStats.fillPathTextureHeight} (paths=${scene.fillPathCount.toLocaleString()}), fill-segments=${sceneStats.fillSegmentTextureWidth}x${sceneStats.fillSegmentTextureHeight} (count=${scene.fillSegmentCount.toLocaleString()}), segments=${sceneStats.textureWidth}x${sceneStats.textureHeight} (count=${scene.segmentCount.toLocaleString()}, max=${sceneStats.maxTextureSize}, util=${utilization.toFixed(1)}%), text instances=${sceneStats.textInstanceTextureWidth}x${sceneStats.textInstanceTextureHeight} (count=${scene.textInstanceCount.toLocaleString()}), glyphs=${sceneStats.textGlyphTextureWidth}x${sceneStats.textGlyphTextureHeight} (count=${scene.textGlyphCount.toLocaleString()}), glyph-segments=${sceneStats.textSegmentTextureWidth}x${sceneStats.textSegmentTextureHeight} (count=${scene.textGlyphSegmentCount.toLocaleString()})`
   );
 }
 
@@ -437,6 +473,12 @@ function logInvisibleCullStats(label: string, scene: VectorScene): void {
 
   console.log(
     `[Invisible cull] ${label}: ${visible.toLocaleString()} visible / ${merged.toLocaleString()} merged (${reduction.toFixed(1)}% reduction, transparent=${scene.discardedTransparentCount.toLocaleString()}, degenerate=${scene.discardedDegenerateCount.toLocaleString()}, duplicates=${scene.discardedDuplicateCount.toLocaleString()}, contained=${scene.discardedContainedCount.toLocaleString()})`
+  );
+}
+
+function logTextVectorStats(label: string, scene: VectorScene): void {
+  console.log(
+    `[Text vectors] ${label}: instances=${scene.textInstanceCount.toLocaleString()}, sourceText=${scene.sourceTextCount.toLocaleString()}, glyphs=${scene.textGlyphCount.toLocaleString()}, glyphSegments=${scene.textGlyphSegmentCount.toLocaleString()}, inPage=${scene.textInPageCount.toLocaleString()}, outOfPage=${scene.textOutOfPageCount.toLocaleString()}, fillPaths=${scene.fillPathCount.toLocaleString()}, fillSegments=${scene.fillSegmentCount.toLocaleString()}`
   );
 }
 

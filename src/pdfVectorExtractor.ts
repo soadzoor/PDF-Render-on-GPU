@@ -13,6 +13,8 @@ interface GraphicsState {
   lineWidth: number;
   strokeLuma: number;
   strokeAlpha: number;
+  fillLuma: number;
+  fillAlpha: number;
 }
 
 export interface Bounds {
@@ -23,9 +25,26 @@ export interface Bounds {
 }
 
 export interface VectorScene {
+  fillPathCount: number;
+  fillSegmentCount: number;
+  fillPathMetaA: Float32Array;
+  fillPathMetaB: Float32Array;
+  fillPathMetaC: Float32Array;
+  fillSegments: Float32Array;
   segmentCount: number;
   sourceSegmentCount: number;
   mergedSegmentCount: number;
+  sourceTextCount: number;
+  textInstanceCount: number;
+  textGlyphCount: number;
+  textGlyphSegmentCount: number;
+  textInPageCount: number;
+  textOutOfPageCount: number;
+  textInstanceA: Float32Array;
+  textInstanceB: Float32Array;
+  textGlyphMetaA: Float32Array;
+  textGlyphMetaB: Float32Array;
+  textGlyphSegments: Float32Array;
   endpoints: Float32Array;
   styles: Float32Array;
   bounds: Bounds;
@@ -99,12 +118,32 @@ const COVER_DIRECTION_SCALE = 2_000;
 const COVER_OFFSET_SCALE = 200;
 const COVER_INTERVAL_EPSILON = 0.05;
 const COVER_HALF_WIDTH_EPSILON = 1e-4;
+const FILL_CURVE_FLATNESS = 0.18;
+const MAX_FILL_CURVE_SPLIT_DEPTH = 8;
+const TEXT_CURVE_FLATNESS = 0.08;
+const MAX_TEXT_CURVE_SPLIT_DEPTH = 7;
+const TEXT_BOUNDS_EPSILON = 1e-4;
+const FONT_MATRIX_FALLBACK = 0.001;
+const TEXT_MIN_ALPHA = 1e-3;
+const FILL_MIN_ALPHA = 1e-3;
+
+const FILL_RULE_NONZERO = 0;
+const FILL_RULE_EVEN_ODD = 1;
+
+const TEXT_RENDER_MODE_FILL = 0;
+const TEXT_RENDER_MODE_FILL_STROKE = 2;
+const TEXT_RENDER_MODE_FILL_ADD_PATH = 4;
+const TEXT_RENDER_MODE_FILL_STROKE_ADD_PATH = 6;
 
 export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene> {
   const enableSegmentMerge = options.enableSegmentMerge !== false;
   const enableInvisibleCull = options.enableInvisibleCull !== false;
 
-  const loadingTask = getDocument({ data: new Uint8Array(pdfData) });
+  const loadingTask = getDocument({
+    data: new Uint8Array(pdfData),
+    disableFontFace: true,
+    fontExtraProperties: true
+  });
   const pdf = await loadingTask.promise;
 
   try {
@@ -113,6 +152,10 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
 
     const endpointBuilder = new Float4Builder();
     const styleBuilder = new Float4Builder();
+    const fillPathMetaABuilder = new Float4Builder(8_192);
+    const fillPathMetaBBuilder = new Float4Builder(8_192);
+    const fillPathMetaCBuilder = new Float4Builder(8_192);
+    const fillSegmentBuilder = new Float4Builder(65_536);
 
     const pageView = page.view;
     const rawPageBounds: Bounds = {
@@ -130,10 +173,17 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       maxX: Number.NEGATIVE_INFINITY,
       maxY: Number.NEGATIVE_INFINITY
     };
+    const fillBounds: Bounds = {
+      minX: Number.POSITIVE_INFINITY,
+      minY: Number.POSITIVE_INFINITY,
+      maxX: Number.NEGATIVE_INFINITY,
+      maxY: Number.NEGATIVE_INFINITY
+    };
 
     let pathCount = 0;
     let sourceSegmentCount = 0;
     let maxHalfWidth = 0;
+    let fillPathCount = 0;
 
     const stateStack: GraphicsState[] = [];
     let currentState: GraphicsState = createDefaultState(pageMatrix);
@@ -170,7 +220,7 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       }
 
       if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeColor) {
-        currentState.strokeLuma = parseLuma(readArg(args, 0), currentState.strokeLuma);
+        currentState.strokeLuma = parseColorLumaFromOperatorArgs(args, currentState.strokeLuma);
         continue;
       }
 
@@ -181,7 +231,22 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       }
 
       if (fn === OPS.setStrokeCMYKColor) {
-        currentState.strokeLuma = parseLuma(readArg(args, 0), currentState.strokeLuma);
+        currentState.strokeLuma = parseCmykLumaFromOperatorArgs(args, currentState.strokeLuma);
+        continue;
+      }
+
+      if (fn === OPS.setFillRGBColor || fn === OPS.setFillColor) {
+        currentState.fillLuma = parseColorLumaFromOperatorArgs(args, currentState.fillLuma);
+        continue;
+      }
+
+      if (fn === OPS.setFillGray) {
+        currentState.fillLuma = parseLuma(readArg(args, 0), currentState.fillLuma);
+        continue;
+      }
+
+      if (fn === OPS.setFillCMYKColor) {
+        currentState.fillLuma = parseCmykLumaFromOperatorArgs(args, currentState.fillLuma);
         continue;
       }
 
@@ -195,7 +260,9 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
       }
 
       const paintOp = readNumber(args, 0, -1);
-      if (!isStrokePaintOp(paintOp)) {
+      const strokePaint = isStrokePaintOp(paintOp);
+      const fillPaint = isFillPaintOp(paintOp);
+      if (!strokePaint && !fillPaint) {
         continue;
       }
 
@@ -206,105 +273,135 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
 
       pathCount += 1;
 
-      const widthScale = matrixScale(currentState.matrix);
-      const strokeWidth = currentState.lineWidth > 0 ? currentState.lineWidth * widthScale : 0.7;
-      const halfWidth = Math.max(0.2, strokeWidth * 0.5);
-      maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
+      if (strokePaint) {
+        const widthScale = matrixScale(currentState.matrix);
+        const strokeWidth = currentState.lineWidth > 0 ? currentState.lineWidth * widthScale : 0.7;
+        const halfWidth = Math.max(0.2, strokeWidth * 0.5);
+        maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
 
-      const styleLuma = clamp01(currentState.strokeLuma);
-      const styleAlpha = clamp01(currentState.strokeAlpha);
-      sourceSegmentCount += emitSegmentsFromPath(
-        pathData,
-        currentState.matrix,
-        halfWidth,
-        styleLuma,
-        styleAlpha,
-        enableSegmentMerge,
-        endpointBuilder,
-        styleBuilder,
-        bounds
-      );
+        const styleLuma = clamp01(currentState.strokeLuma);
+        const styleAlpha = clamp01(currentState.strokeAlpha);
+        sourceSegmentCount += emitSegmentsFromPath(
+          pathData,
+          currentState.matrix,
+          halfWidth,
+          styleLuma,
+          styleAlpha,
+          enableSegmentMerge,
+          endpointBuilder,
+          styleBuilder,
+          bounds
+        );
+      }
+
+      if (fillPaint) {
+        const fillRule = isEvenOddFillPaintOp(paintOp) ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
+        const fillAlpha = clamp01(currentState.fillAlpha);
+        if (fillAlpha > FILL_MIN_ALPHA) {
+          const emitted = emitFilledPathFromPath(
+            pathData,
+            currentState.matrix,
+            fillRule,
+            clamp01(currentState.fillLuma),
+            fillAlpha,
+            fillPathMetaABuilder,
+            fillPathMetaBBuilder,
+            fillPathMetaCBuilder,
+            fillSegmentBuilder,
+            fillBounds
+          );
+          if (emitted) {
+            fillPathCount += 1;
+          }
+        }
+      }
     }
 
     const mergedSegmentCount = endpointBuilder.quadCount;
-
-    if (mergedSegmentCount === 0) {
-      return {
-        segmentCount: 0,
-        sourceSegmentCount,
-        mergedSegmentCount,
-        endpoints: new Float32Array(0),
-        styles: new Float32Array(0),
-        bounds: { ...pageBounds },
-        pageBounds,
-        maxHalfWidth: 0,
-        operatorCount: operatorList.fnArray.length,
-        pathCount,
-        discardedTransparentCount: 0,
-        discardedDegenerateCount: 0,
-        discardedDuplicateCount: 0,
-        discardedContainedCount: 0
-      };
-    }
-
     const mergedEndpoints = endpointBuilder.toTypedArray();
     const mergedStyles = styleBuilder.toTypedArray();
+    const fillSegmentCount = fillSegmentBuilder.quadCount;
+    const fillPathMetaA = fillPathMetaABuilder.toTypedArray();
+    const fillPathMetaB = fillPathMetaBBuilder.toTypedArray();
+    const fillPathMetaC = fillPathMetaCBuilder.toTypedArray();
+    const fillSegments = fillSegmentBuilder.toTypedArray();
+    const resolvedFillBounds = fillPathCount > 0 ? fillBounds : null;
 
-    if (!enableInvisibleCull) {
-      return {
-        segmentCount: mergedSegmentCount,
-        sourceSegmentCount,
-        mergedSegmentCount,
-        endpoints: mergedEndpoints,
-        styles: mergedStyles,
-        bounds,
-        pageBounds,
-        maxHalfWidth,
-        operatorCount: operatorList.fnArray.length,
-        pathCount,
-        discardedTransparentCount: 0,
-        discardedDegenerateCount: 0,
-        discardedDuplicateCount: 0,
-        discardedContainedCount: 0
-      };
+    let segmentCount = mergedSegmentCount;
+    let endpoints = mergedEndpoints;
+    let styles = mergedStyles;
+    let segmentBounds: Bounds | null = mergedSegmentCount > 0 ? bounds : null;
+    let resolvedMaxHalfWidth = mergedSegmentCount > 0 ? maxHalfWidth : 0;
+    let discardedTransparentCount = 0;
+    let discardedDegenerateCount = 0;
+    let discardedDuplicateCount = 0;
+    let discardedContainedCount = 0;
+
+    if (mergedSegmentCount > 0 && enableInvisibleCull) {
+      const culled = cullInvisibleSegments(mergedEndpoints, mergedStyles);
+      segmentCount = culled.segmentCount;
+      endpoints = culled.endpoints;
+      styles = culled.styles;
+      segmentBounds = culled.segmentCount > 0 ? culled.bounds : null;
+      resolvedMaxHalfWidth = culled.maxHalfWidth;
+      discardedTransparentCount = culled.discardedTransparentCount;
+      discardedDegenerateCount = culled.discardedDegenerateCount;
+      discardedDuplicateCount = culled.discardedDuplicateCount;
+      discardedContainedCount = culled.discardedContainedCount;
     }
 
-    const culled = cullInvisibleSegments(mergedEndpoints, mergedStyles);
-
-    if (culled.segmentCount === 0) {
-      return {
-        segmentCount: 0,
-        sourceSegmentCount,
-        mergedSegmentCount,
-        endpoints: new Float32Array(0),
-        styles: new Float32Array(0),
-        bounds: { ...pageBounds },
-        pageBounds,
-        maxHalfWidth: 0,
-        operatorCount: operatorList.fnArray.length,
-        pathCount,
-        discardedTransparentCount: culled.discardedTransparentCount,
-        discardedDegenerateCount: culled.discardedDegenerateCount,
-        discardedDuplicateCount: culled.discardedDuplicateCount,
-        discardedContainedCount: culled.discardedContainedCount
-      };
+    if (segmentCount === 0) {
+      endpoints = new Float32Array(0);
+      styles = new Float32Array(0);
+      resolvedMaxHalfWidth = 0;
     }
+
+    let textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
+    if (textData.instanceCount === 0 && hasTextShowOperators(operatorList)) {
+      await warmUpTextPathCache(page);
+      textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
+    }
+
+    if (textData.instanceCount > 0 && textData.inPageCount < textData.instanceCount * 0.2) {
+      const fallbackTextData = await extractTextVectorData(page, operatorList, IDENTITY_MATRIX, pageBounds);
+      if (fallbackTextData.inPageCount > textData.inPageCount) {
+        textData = fallbackTextData;
+      }
+    }
+    const combinedBounds = combineBounds(combineBounds(segmentBounds, resolvedFillBounds), textData.bounds) ?? { ...pageBounds };
 
     return {
-      segmentCount: culled.segmentCount,
+      fillPathCount,
+      fillSegmentCount,
+      fillPathMetaA,
+      fillPathMetaB,
+      fillPathMetaC,
+      fillSegments,
+      segmentCount,
       sourceSegmentCount,
       mergedSegmentCount,
-      endpoints: culled.endpoints,
-      styles: culled.styles,
-      bounds: culled.bounds,
+      sourceTextCount: textData.sourceTextCount,
+      textInstanceCount: textData.instanceCount,
+      textGlyphCount: textData.glyphCount,
+      textGlyphSegmentCount: textData.glyphSegmentCount,
+      textInPageCount: textData.inPageCount,
+      textOutOfPageCount: textData.outOfPageCount,
+      textInstanceA: textData.instanceA,
+      textInstanceB: textData.instanceB,
+      textGlyphMetaA: textData.glyphMetaA,
+      textGlyphMetaB: textData.glyphMetaB,
+      textGlyphSegments: textData.glyphSegments,
+      endpoints,
+      styles,
+      bounds: combinedBounds,
       pageBounds,
-      maxHalfWidth: culled.maxHalfWidth,
+      maxHalfWidth: resolvedMaxHalfWidth,
       operatorCount: operatorList.fnArray.length,
       pathCount,
-      discardedTransparentCount: culled.discardedTransparentCount,
-      discardedDegenerateCount: culled.discardedDegenerateCount,
-      discardedDuplicateCount: culled.discardedDuplicateCount,
-      discardedContainedCount: culled.discardedContainedCount
+      discardedTransparentCount,
+      discardedDegenerateCount,
+      discardedDuplicateCount,
+      discardedContainedCount
     };
   } finally {
     await pdf.destroy();
@@ -316,7 +413,9 @@ function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX): GraphicsSta
     matrix: [...initialMatrix],
     lineWidth: 1,
     strokeLuma: 0,
-    strokeAlpha: 1
+    strokeAlpha: 1,
+    fillLuma: 0,
+    fillAlpha: 1
   };
 }
 
@@ -376,24 +475,107 @@ function cloneState(state: GraphicsState): GraphicsState {
     matrix: [...state.matrix],
     lineWidth: state.lineWidth,
     strokeLuma: state.strokeLuma,
-    strokeAlpha: state.strokeAlpha
+    strokeAlpha: state.strokeAlpha,
+    fillLuma: state.fillLuma,
+    fillAlpha: state.fillAlpha
   };
 }
 
+interface FontPathInfoLike {
+  path?: unknown;
+}
+
+interface FontLike {
+  loadedName?: string;
+  fontMatrix?: unknown;
+  vertical?: boolean;
+}
+
+interface GlyphTokenLike {
+  fontChar?: unknown;
+  width?: unknown;
+  isSpace?: unknown;
+}
+
+interface TextExtractResult {
+  sourceTextCount: number;
+  instanceCount: number;
+  glyphCount: number;
+  glyphSegmentCount: number;
+  inPageCount: number;
+  outOfPageCount: number;
+  instanceA: Float32Array;
+  instanceB: Float32Array;
+  glyphMetaA: Float32Array;
+  glyphMetaB: Float32Array;
+  glyphSegments: Float32Array;
+  bounds: Bounds | null;
+}
+
+interface TextGlyphBuildResult {
+  segmentCount: number;
+  bounds: Bounds;
+}
+
+interface CommonObjsLike {
+  get(id: string): unknown;
+  has?(id: string): boolean;
+}
+
+interface TextState {
+  matrix: Mat2D;
+  fillLuma: number;
+  fillAlpha: number;
+  textMatrix: Mat2D;
+  textX: number;
+  textY: number;
+  lineX: number;
+  lineY: number;
+  charSpacing: number;
+  wordSpacing: number;
+  textHScale: number;
+  leading: number;
+  textRise: number;
+  renderMode: number;
+  fontRef: string;
+  fontSize: number;
+  fontDirection: number;
+}
+
 function readTransform(args: unknown): Mat2D | null {
-  if (!Array.isArray(args) || args.length < 6) {
+  const topLevel = asNumberArrayLike(args);
+  if (!topLevel) {
     return null;
   }
-  const a = Number(args[0]);
-  const b = Number(args[1]);
-  const c = Number(args[2]);
-  const d = Number(args[3]);
-  const e = Number(args[4]);
-  const f = Number(args[5]);
+
+  const nested = Array.isArray(args) ? asNumberArrayLike(args[0]) : null;
+  const matrixArgs = topLevel.length >= 6 ? topLevel : nested;
+  if (!matrixArgs || matrixArgs.length < 6) {
+    return null;
+  }
+
+  const a = Number(matrixArgs[0]);
+  const b = Number(matrixArgs[1]);
+  const c = Number(matrixArgs[2]);
+  const d = Number(matrixArgs[3]);
+  const e = Number(matrixArgs[4]);
+  const f = Number(matrixArgs[5]);
   if (![a, b, c, d, e, f].every(Number.isFinite)) {
     return null;
   }
   return [a, b, c, d, e, f];
+}
+
+function asNumberArrayLike(value: unknown): ArrayLike<unknown> | null {
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (ArrayBuffer.isView(value)) {
+    return value as unknown as ArrayLike<unknown>;
+  }
+
+  return null;
 }
 
 function readPathData(args: unknown): Float32Array | null {
@@ -432,6 +614,21 @@ function isStrokePaintOp(op: number): boolean {
   );
 }
 
+function isFillPaintOp(op: number): boolean {
+  return (
+    op === OPS.fill ||
+    op === OPS.eoFill ||
+    op === OPS.fillStroke ||
+    op === OPS.eoFillStroke ||
+    op === OPS.closeFillStroke ||
+    op === OPS.closeEOFillStroke
+  );
+}
+
+function isEvenOddFillPaintOp(op: number): boolean {
+  return op === OPS.eoFill || op === OPS.eoFillStroke || op === OPS.closeEOFillStroke;
+}
+
 function parseLuma(value: unknown, fallback: number): number {
   if (typeof value === "number" && Number.isFinite(value)) {
     return clamp01(value);
@@ -455,6 +652,55 @@ function parseLuma(value: unknown, fallback: number): number {
   }
 
   return fallback;
+}
+
+function parseColorLumaFromOperatorArgs(args: unknown, fallback: number): number {
+  if (!Array.isArray(args)) {
+    return parseLuma(args, fallback);
+  }
+
+  if (args.length >= 3 && args.slice(0, 3).every((entry) => Number.isFinite(Number(entry)))) {
+    return parseLuma([args[0], args[1], args[2]], fallback);
+  }
+
+  if (args.length > 0) {
+    return parseLuma(args[0], fallback);
+  }
+
+  return fallback;
+}
+
+function parseCmykLumaFromOperatorArgs(args: unknown, fallback: number): number {
+  if (!Array.isArray(args) || args.length < 4) {
+    return parseColorLumaFromOperatorArgs(args, fallback);
+  }
+
+  const c = normalizeColorComponent(args[0]);
+  const m = normalizeColorComponent(args[1]);
+  const y = normalizeColorComponent(args[2]);
+  const k = normalizeColorComponent(args[3]);
+  if ([c, m, y, k].some((component) => component === null)) {
+    return parseColorLumaFromOperatorArgs(args, fallback);
+  }
+
+  const cyan = c as number;
+  const magenta = m as number;
+  const yellow = y as number;
+  const black = k as number;
+
+  const r = 1 - Math.min(1, cyan + black);
+  const g = 1 - Math.min(1, magenta + black);
+  const b = 1 - Math.min(1, yellow + black);
+  return clamp01(0.2126 * r + 0.7152 * g + 0.0722 * b);
+}
+
+function normalizeColorComponent(value: unknown): number | null {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  const normalized = numeric > 1 ? numeric / 100 : numeric;
+  return clamp01(normalized);
 }
 
 function parseHexColor(hex: string): [number, number, number] {
@@ -488,6 +734,14 @@ function applyGraphicsStateEntries(rawEntries: unknown, state: GraphicsState): v
       const alpha = Number(value);
       if (Number.isFinite(alpha)) {
         state.strokeAlpha = clamp01(alpha);
+      }
+      continue;
+    }
+
+    if (key === "ca") {
+      const alpha = Number(value);
+      if (Number.isFinite(alpha)) {
+        state.fillAlpha = clamp01(alpha);
       }
       continue;
     }
@@ -722,6 +976,181 @@ function emitSegmentsFromPath(
 
   flushPending();
   return sourceSegmentCount;
+}
+
+function emitFilledPathFromPath(
+  pathData: Float32Array,
+  matrix: Mat2D,
+  fillRule: number,
+  luma: number,
+  alpha: number,
+  metaA: Float4Builder,
+  metaB: Float4Builder,
+  metaC: Float4Builder,
+  segments: Float4Builder,
+  bounds: Bounds
+): boolean {
+  let cursorX = 0;
+  let cursorY = 0;
+  let startX = 0;
+  let startY = 0;
+  let hasStart = false;
+
+  const segmentStart = segments.quadCount;
+  let segmentCount = 0;
+
+  const localBounds: Bounds = {
+    minX: Number.POSITIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY
+  };
+
+  const emitLine = (x0: number, y0: number, x1: number, y1: number): void => {
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    if (dx * dx + dy * dy < 1e-12) {
+      return;
+    }
+
+    segments.push(x0, y0, x1, y1);
+    segmentCount += 1;
+
+    localBounds.minX = Math.min(localBounds.minX, x0, x1);
+    localBounds.minY = Math.min(localBounds.minY, y0, y1);
+    localBounds.maxX = Math.max(localBounds.maxX, x0, x1);
+    localBounds.maxY = Math.max(localBounds.maxY, y0, y1);
+  };
+
+  const closeSubpath = (): void => {
+    if (!hasStart) {
+      return;
+    }
+    if (cursorX !== startX || cursorY !== startY) {
+      const [tx0, ty0] = applyMatrix(matrix, cursorX, cursorY);
+      const [tx1, ty1] = applyMatrix(matrix, startX, startY);
+      emitLine(tx0, ty0, tx1, ty1);
+    }
+    cursorX = startX;
+    cursorY = startY;
+  };
+
+  for (let i = 0; i < pathData.length; ) {
+    const op = pathData[i++];
+
+    if (op === DRAW_MOVE_TO) {
+      closeSubpath();
+      cursorX = pathData[i++];
+      cursorY = pathData[i++];
+      startX = cursorX;
+      startY = cursorY;
+      hasStart = true;
+      continue;
+    }
+
+    if (op === DRAW_LINE_TO) {
+      const x = pathData[i++];
+      const y = pathData[i++];
+      const [tx0, ty0] = applyMatrix(matrix, cursorX, cursorY);
+      const [tx1, ty1] = applyMatrix(matrix, x, y);
+      emitLine(tx0, ty0, tx1, ty1);
+      cursorX = x;
+      cursorY = y;
+      continue;
+    }
+
+    if (op === DRAW_CURVE_TO) {
+      const x1 = pathData[i++];
+      const y1 = pathData[i++];
+      const x2 = pathData[i++];
+      const y2 = pathData[i++];
+      const x3 = pathData[i++];
+      const y3 = pathData[i++];
+
+      const [t0x, t0y] = applyMatrix(matrix, cursorX, cursorY);
+      const [t1x, t1y] = applyMatrix(matrix, x1, y1);
+      const [t2x, t2y] = applyMatrix(matrix, x2, y2);
+      const [t3x, t3y] = applyMatrix(matrix, x3, y3);
+
+      flattenCubic(
+        t0x,
+        t0y,
+        t1x,
+        t1y,
+        t2x,
+        t2y,
+        t3x,
+        t3y,
+        emitLine,
+        FILL_CURVE_FLATNESS,
+        MAX_FILL_CURVE_SPLIT_DEPTH
+      );
+
+      cursorX = x3;
+      cursorY = y3;
+      continue;
+    }
+
+    if (op === DRAW_QUAD_TO) {
+      const x1 = pathData[i++];
+      const y1 = pathData[i++];
+      const x2 = pathData[i++];
+      const y2 = pathData[i++];
+
+      const c1x = cursorX + (2 / 3) * (x1 - cursorX);
+      const c1y = cursorY + (2 / 3) * (y1 - cursorY);
+      const c2x = x2 + (2 / 3) * (x1 - x2);
+      const c2y = y2 + (2 / 3) * (y1 - y2);
+
+      const [t0x, t0y] = applyMatrix(matrix, cursorX, cursorY);
+      const [t1x, t1y] = applyMatrix(matrix, c1x, c1y);
+      const [t2x, t2y] = applyMatrix(matrix, c2x, c2y);
+      const [t3x, t3y] = applyMatrix(matrix, x2, y2);
+
+      flattenCubic(
+        t0x,
+        t0y,
+        t1x,
+        t1y,
+        t2x,
+        t2y,
+        t3x,
+        t3y,
+        emitLine,
+        FILL_CURVE_FLATNESS,
+        MAX_FILL_CURVE_SPLIT_DEPTH
+      );
+
+      cursorX = x2;
+      cursorY = y2;
+      continue;
+    }
+
+    if (op === DRAW_CLOSE) {
+      closeSubpath();
+      continue;
+    }
+
+    closeSubpath();
+    break;
+  }
+
+  closeSubpath();
+
+  if (segmentCount === 0) {
+    return false;
+  }
+
+  metaA.push(segmentStart, segmentCount, localBounds.minX, localBounds.minY);
+  metaB.push(localBounds.maxX, localBounds.maxY, luma, alpha);
+  metaC.push(fillRule, 0, 0, 0);
+
+  bounds.minX = Math.min(bounds.minX, localBounds.minX);
+  bounds.minY = Math.min(bounds.minY, localBounds.minY);
+  bounds.maxX = Math.max(bounds.maxX, localBounds.maxX);
+  bounds.maxY = Math.max(bounds.maxY, localBounds.maxY);
+
+  return true;
 }
 
 interface CoverageCandidate {
@@ -1013,6 +1442,755 @@ function buildCoverageCandidate(
   ].join("|");
 
   return { key, index, start, end, halfWidth, alpha };
+}
+
+async function extractTextVectorData(
+  page: unknown,
+  operatorList: { fnArray: number[]; argsArray: unknown[] },
+  pageMatrix: Mat2D,
+  pageBounds?: Bounds
+): Promise<TextExtractResult> {
+  const commonObjs = resolveCommonObjs(page);
+  if (!commonObjs) {
+    return createEmptyTextExtractResult();
+  }
+
+  const textInstanceA = new Float4Builder(4_096);
+  const textInstanceB = new Float4Builder(4_096);
+  const textGlyphMetaA = new Float4Builder(2_048);
+  const textGlyphMetaB = new Float4Builder(2_048);
+  const textGlyphSegments = new Float4Builder(16_384);
+
+  const glyphIndexByKey = new Map<string, number>();
+  const glyphBoundsByIndex: Bounds[] = [];
+
+  let sourceTextCount = 0;
+  let textBounds: Bounds | null = null;
+  let inPageCount = 0;
+  let outOfPageCount = 0;
+
+  const stateStack: TextState[] = [];
+  let state = createDefaultTextState(pageMatrix);
+
+  const getOrCreateGlyph = (font: FontLike | null, fontRef: string, fontChar: string): { index: number; bounds: Bounds } | null => {
+    if (!fontChar) {
+      return null;
+    }
+
+    const loadedName = typeof font?.loadedName === "string" && font.loadedName.length > 0 ? font.loadedName : fontRef;
+    if (!loadedName) {
+      return null;
+    }
+
+    const glyphKey = `${loadedName}|${fontChar}`;
+    const cachedIndex = glyphIndexByKey.get(glyphKey);
+    if (cachedIndex !== undefined) {
+      return { index: cachedIndex, bounds: glyphBoundsByIndex[cachedIndex] };
+    }
+
+    const pathData = getGlyphPathData(commonObjs, loadedName, fontChar);
+    if (!pathData) {
+      return null;
+    }
+
+    const segmentStart = textGlyphSegments.quadCount;
+    const glyphBuild = emitTextGlyphSegmentsFromPath(pathData, textGlyphSegments);
+    if (glyphBuild.segmentCount <= 0) {
+      return null;
+    }
+
+    const glyphIndex = textGlyphMetaA.quadCount;
+    textGlyphMetaA.push(segmentStart, glyphBuild.segmentCount, glyphBuild.bounds.minX, glyphBuild.bounds.minY);
+    textGlyphMetaB.push(glyphBuild.bounds.maxX, glyphBuild.bounds.maxY, 0, 0);
+
+    glyphIndexByKey.set(glyphKey, glyphIndex);
+    glyphBoundsByIndex[glyphIndex] = glyphBuild.bounds;
+
+    return { index: glyphIndex, bounds: glyphBuild.bounds };
+  };
+
+  const emitTextEntries = (entries: unknown[]): void => {
+    if (entries.length === 0 || state.fontSize === 0) {
+      return;
+    }
+
+    const font = resolveFont(commonObjs, state.fontRef);
+    const fontMatrixScale = resolveFontMatrixScale(font);
+    const widthAdvanceScale = state.fontSize * fontMatrixScale;
+    const vertical = font?.vertical === true;
+    const spacingDir = vertical ? 1 : -1;
+    const textHScale = state.textHScale * state.fontDirection;
+
+    let x = 0;
+
+    for (const entry of entries) {
+      if (typeof entry === "number" && Number.isFinite(entry)) {
+        x += spacingDir * entry * state.fontSize / 1000;
+        continue;
+      }
+
+      const glyph = entry as GlyphTokenLike;
+      const fontChar = typeof glyph.fontChar === "string" ? glyph.fontChar : "";
+      const width = Number(glyph.width);
+      const glyphWidth = Number.isFinite(width) ? width : 0;
+      const isSpace = glyph.isSpace === true;
+      const spacing = (isSpace ? state.wordSpacing : 0) + state.charSpacing;
+
+      if (!vertical && shouldRenderFilledText(state.renderMode) && state.fillAlpha > TEXT_MIN_ALPHA) {
+        const glyphRecord = getOrCreateGlyph(font, state.fontRef, fontChar);
+        if (glyphRecord) {
+          const glyphMatrix = buildTextGlyphTransform(state, x, 0);
+          textInstanceA.push(glyphMatrix[0], glyphMatrix[1], glyphMatrix[2], glyphMatrix[3]);
+          textInstanceB.push(glyphMatrix[4], glyphMatrix[5], glyphRecord.index, state.fillLuma);
+          sourceTextCount += 1;
+
+          const transformedGlyphBounds = transformBounds(glyphRecord.bounds, glyphMatrix);
+          if (pageBounds) {
+            if (boundsIntersect(transformedGlyphBounds, pageBounds)) {
+              inPageCount += 1;
+            } else {
+              outOfPageCount += 1;
+            }
+          }
+          if (!textBounds) {
+            textBounds = {
+              minX: transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON,
+              minY: transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON,
+              maxX: transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON,
+              maxY: transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON
+            };
+          } else {
+            textBounds.minX = Math.min(textBounds.minX, transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON);
+            textBounds.minY = Math.min(textBounds.minY, transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON);
+            textBounds.maxX = Math.max(textBounds.maxX, transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON);
+            textBounds.maxY = Math.max(textBounds.maxY, transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON);
+          }
+        }
+      }
+
+      const charWidth = vertical
+        ? glyphWidth * widthAdvanceScale - spacing * state.fontDirection
+        : glyphWidth * widthAdvanceScale + spacing * state.fontDirection;
+      x += charWidth;
+    }
+
+    if (vertical) {
+      state.textY -= x;
+    } else {
+      state.textX += x * textHScale;
+    }
+  };
+
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const fn = operatorList.fnArray[i];
+    const args = operatorList.argsArray[i];
+
+    if (fn === OPS.save) {
+      stateStack.push(cloneTextState(state));
+      continue;
+    }
+
+    if (fn === OPS.restore) {
+      const restored = stateStack.pop();
+      if (restored) {
+        state = restored;
+      }
+      continue;
+    }
+
+    if (fn === OPS.transform) {
+      const transform = readTransform(args);
+      if (transform) {
+        state.matrix = multiplyMatrices(state.matrix, transform);
+      }
+      continue;
+    }
+
+    if (fn === OPS.setFillRGBColor || fn === OPS.setFillColor || fn === OPS.setFillGray || fn === OPS.setFillCMYKColor) {
+      if (fn === OPS.setFillCMYKColor) {
+        state.fillLuma = parseCmykLumaFromOperatorArgs(args, state.fillLuma);
+      } else {
+        state.fillLuma = parseColorLumaFromOperatorArgs(args, state.fillLuma);
+      }
+      continue;
+    }
+
+    if (fn === OPS.setGState) {
+      applyTextGraphicsStateEntries(readArg(args, 0), state);
+      continue;
+    }
+
+    if (fn === OPS.beginText) {
+      beginText(state);
+      continue;
+    }
+
+    if (fn === OPS.setCharSpacing) {
+      state.charSpacing = readNumber(args, 0, state.charSpacing);
+      continue;
+    }
+
+    if (fn === OPS.setWordSpacing) {
+      state.wordSpacing = readNumber(args, 0, state.wordSpacing);
+      continue;
+    }
+
+    if (fn === OPS.setHScale) {
+      state.textHScale = readNumber(args, 0, state.textHScale * 100) / 100;
+      continue;
+    }
+
+    if (fn === OPS.setLeading) {
+      state.leading = -readNumber(args, 0, -state.leading);
+      continue;
+    }
+
+    if (fn === OPS.setFont) {
+      const fontRef = readArg(args, 0);
+      const rawSize = readNumber(args, 1, state.fontSize);
+      if (typeof fontRef === "string") {
+        state.fontRef = fontRef;
+      }
+      if (rawSize < 0) {
+        state.fontSize = -rawSize;
+        state.fontDirection = -1;
+      } else {
+        state.fontSize = rawSize;
+        state.fontDirection = 1;
+      }
+      continue;
+    }
+
+    if (fn === OPS.setTextRenderingMode) {
+      state.renderMode = Math.max(0, Math.trunc(readNumber(args, 0, state.renderMode)));
+      continue;
+    }
+
+    if (fn === OPS.setTextRise) {
+      state.textRise = readNumber(args, 0, state.textRise);
+      continue;
+    }
+
+    if (fn === OPS.moveText) {
+      const tx = readNumber(args, 0, 0);
+      const ty = readNumber(args, 1, 0);
+      moveText(state, tx, ty);
+      continue;
+    }
+
+    if (fn === OPS.setLeadingMoveText) {
+      const tx = readNumber(args, 0, 0);
+      const ty = readNumber(args, 1, 0);
+      state.leading = ty;
+      moveText(state, tx, ty);
+      continue;
+    }
+
+    if (fn === OPS.setTextMatrix) {
+      const matrix = readTransform(args);
+      if (matrix) {
+        state.textMatrix = matrix;
+        state.textX = 0;
+        state.textY = 0;
+        state.lineX = 0;
+        state.lineY = 0;
+      }
+      continue;
+    }
+
+    if (fn === OPS.nextLine) {
+      moveText(state, 0, state.leading);
+      continue;
+    }
+
+    if (fn === OPS.showText || fn === OPS.showSpacedText) {
+      emitTextEntries(readTextEntries(readArg(args, 0)));
+      continue;
+    }
+
+    if (fn === OPS.nextLineShowText) {
+      moveText(state, 0, state.leading);
+      emitTextEntries(readTextEntries(readArg(args, 0)));
+      continue;
+    }
+
+    if (fn === OPS.nextLineSetSpacingShowText) {
+      state.wordSpacing = readNumber(args, 0, state.wordSpacing);
+      state.charSpacing = readNumber(args, 1, state.charSpacing);
+      moveText(state, 0, state.leading);
+      emitTextEntries(readTextEntries(readArg(args, 2)));
+      continue;
+    }
+  }
+
+  return {
+    sourceTextCount,
+    instanceCount: textInstanceA.quadCount,
+    glyphCount: textGlyphMetaA.quadCount,
+    glyphSegmentCount: textGlyphSegments.quadCount,
+    inPageCount,
+    outOfPageCount,
+    instanceA: textInstanceA.toTypedArray(),
+    instanceB: textInstanceB.toTypedArray(),
+    glyphMetaA: textGlyphMetaA.toTypedArray(),
+    glyphMetaB: textGlyphMetaB.toTypedArray(),
+    glyphSegments: textGlyphSegments.toTypedArray(),
+    bounds: textBounds
+  };
+}
+
+function createEmptyTextExtractResult(): TextExtractResult {
+  return {
+    sourceTextCount: 0,
+    instanceCount: 0,
+    glyphCount: 0,
+    glyphSegmentCount: 0,
+    inPageCount: 0,
+    outOfPageCount: 0,
+    instanceA: new Float32Array(0),
+    instanceB: new Float32Array(0),
+    glyphMetaA: new Float32Array(0),
+    glyphMetaB: new Float32Array(0),
+    glyphSegments: new Float32Array(0),
+    bounds: null
+  };
+}
+
+function resolveCommonObjs(page: unknown): CommonObjsLike | null {
+  const candidate = page as { commonObjs?: CommonObjsLike };
+  if (!candidate.commonObjs || typeof candidate.commonObjs.get !== "function") {
+    return null;
+  }
+  return candidate.commonObjs;
+}
+
+function hasTextShowOperators(operatorList: { fnArray: number[] }): boolean {
+  for (const fn of operatorList.fnArray) {
+    if (
+      fn === OPS.showText ||
+      fn === OPS.showSpacedText ||
+      fn === OPS.nextLineShowText ||
+      fn === OPS.nextLineSetSpacingShowText
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function warmUpTextPathCache(page: unknown): Promise<void> {
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  const pageLike = page as {
+    rotate: number;
+    view: number[];
+    getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { width: number; height: number };
+    render: (params: { canvasContext: CanvasRenderingContext2D; viewport: unknown; intent?: string }) => { promise: Promise<unknown> };
+  };
+
+  if (
+    !Array.isArray(pageLike.view) ||
+    typeof pageLike.getViewport !== "function" ||
+    typeof pageLike.render !== "function"
+  ) {
+    return;
+  }
+
+  const pageWidth = Math.max(1, Math.abs(pageLike.view[2] - pageLike.view[0]));
+  const pageHeight = Math.max(1, Math.abs(pageLike.view[3] - pageLike.view[1]));
+  const maxDim = Math.max(pageWidth, pageHeight);
+  const targetMaxDim = 1024;
+  const scale = clamp01(targetMaxDim / maxDim) * 0.95 + 0.05;
+
+  const viewport = pageLike.getViewport({
+    scale,
+    rotation: normalizeRotationDegrees(pageLike.rotate),
+    dontFlip: true
+  });
+
+  const width = Math.max(1, Math.ceil(viewport.width));
+  const height = Math.max(1, Math.ceil(viewport.height));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d", {
+    alpha: false
+  });
+
+  if (!context) {
+    return;
+  }
+
+  try {
+    await pageLike.render({
+      canvasContext: context,
+      viewport,
+      intent: "display"
+    }).promise;
+  } catch {
+    // Best-effort warm-up only; extraction continues regardless.
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+}
+
+function createDefaultTextState(matrix: Mat2D): TextState {
+  return {
+    matrix: [...matrix],
+    fillLuma: 0,
+    fillAlpha: 1,
+    textMatrix: [...IDENTITY_MATRIX],
+    textX: 0,
+    textY: 0,
+    lineX: 0,
+    lineY: 0,
+    charSpacing: 0,
+    wordSpacing: 0,
+    textHScale: 1,
+    leading: 0,
+    textRise: 0,
+    renderMode: TEXT_RENDER_MODE_FILL,
+    fontRef: "",
+    fontSize: 0,
+    fontDirection: 1
+  };
+}
+
+function cloneTextState(state: TextState): TextState {
+  return {
+    matrix: [...state.matrix],
+    fillLuma: state.fillLuma,
+    fillAlpha: state.fillAlpha,
+    textMatrix: [...state.textMatrix],
+    textX: state.textX,
+    textY: state.textY,
+    lineX: state.lineX,
+    lineY: state.lineY,
+    charSpacing: state.charSpacing,
+    wordSpacing: state.wordSpacing,
+    textHScale: state.textHScale,
+    leading: state.leading,
+    textRise: state.textRise,
+    renderMode: state.renderMode,
+    fontRef: state.fontRef,
+    fontSize: state.fontSize,
+    fontDirection: state.fontDirection
+  };
+}
+
+function beginText(state: TextState): void {
+  state.textMatrix = [...IDENTITY_MATRIX];
+  state.textX = 0;
+  state.textY = 0;
+  state.lineX = 0;
+  state.lineY = 0;
+}
+
+function moveText(state: TextState, tx: number, ty: number): void {
+  state.lineX += tx;
+  state.lineY += ty;
+  state.textX = state.lineX;
+  state.textY = state.lineY;
+}
+
+function applyTextGraphicsStateEntries(rawEntries: unknown, state: TextState): void {
+  if (!Array.isArray(rawEntries)) {
+    return;
+  }
+
+  for (const pair of rawEntries) {
+    if (!Array.isArray(pair) || pair.length < 2) {
+      continue;
+    }
+
+    const key = pair[0];
+    const value = pair[1];
+
+    if (key === "ca") {
+      const alpha = Number(value);
+      if (Number.isFinite(alpha)) {
+        state.fillAlpha = clamp01(alpha);
+      }
+      continue;
+    }
+
+    if (key === "Font" && Array.isArray(value)) {
+      const fontRef = value[0];
+      const rawSize = Number(value[1]);
+
+      if (typeof fontRef === "string") {
+        state.fontRef = fontRef;
+      }
+
+      if (Number.isFinite(rawSize)) {
+        if (rawSize < 0) {
+          state.fontSize = -rawSize;
+          state.fontDirection = -1;
+        } else {
+          state.fontSize = rawSize;
+          state.fontDirection = 1;
+        }
+      }
+    }
+  }
+}
+
+function shouldRenderFilledText(renderMode: number): boolean {
+  return (
+    renderMode === TEXT_RENDER_MODE_FILL ||
+    renderMode === TEXT_RENDER_MODE_FILL_STROKE ||
+    renderMode === TEXT_RENDER_MODE_FILL_ADD_PATH ||
+    renderMode === TEXT_RENDER_MODE_FILL_STROKE_ADD_PATH
+  );
+}
+
+function readTextEntries(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function resolveFont(commonObjs: CommonObjsLike, fontRef: string): FontLike | null {
+  if (!fontRef) {
+    return null;
+  }
+
+  try {
+    const raw = commonObjs.get(fontRef);
+    if (!raw || typeof raw !== "object") {
+      return null;
+    }
+    return raw as FontLike;
+  } catch {
+    return null;
+  }
+}
+
+function resolveFontMatrixScale(font: FontLike | null): number {
+  const matrix = font?.fontMatrix;
+  if (Array.isArray(matrix) && matrix.length >= 1) {
+    const value = Number(matrix[0]);
+    if (Number.isFinite(value) && value !== 0) {
+      return value;
+    }
+  }
+  return FONT_MATRIX_FALLBACK;
+}
+
+function getGlyphPathData(commonObjs: CommonObjsLike, loadedFontName: string, fontChar: string): Float32Array | null {
+  const objId = `${loadedFontName}_path_${fontChar}`;
+  let pathInfo: unknown;
+
+  try {
+    pathInfo = commonObjs.get(objId);
+  } catch {
+    return null;
+  }
+
+  const rawPath = (pathInfo as FontPathInfoLike | null)?.path;
+  return toFloat32Path(rawPath);
+}
+
+function toFloat32Path(raw: unknown): Float32Array | null {
+  if (!raw) {
+    return null;
+  }
+
+  if (raw instanceof Float32Array) {
+    return raw;
+  }
+
+  if (ArrayBuffer.isView(raw)) {
+    const view = raw as unknown as ArrayLike<number>;
+    const out = new Float32Array(view.length);
+    for (let i = 0; i < view.length; i += 1) {
+      const value = Number(view[i]);
+      out[i] = Number.isFinite(value) ? value : 0;
+    }
+    return out;
+  }
+
+  if (Array.isArray(raw)) {
+    const out = new Float32Array(raw.length);
+    for (let i = 0; i < raw.length; i += 1) {
+      const value = Number(raw[i]);
+      out[i] = Number.isFinite(value) ? value : 0;
+    }
+    return out;
+  }
+
+  return null;
+}
+
+function emitTextGlyphSegmentsFromPath(pathData: Float32Array, outSegments: Float4Builder): TextGlyphBuildResult {
+  let segmentCount = 0;
+
+  let cursorX = 0;
+  let cursorY = 0;
+  let startX = 0;
+  let startY = 0;
+  let hasStart = false;
+
+  const bounds: Bounds = {
+    minX: Number.POSITIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY
+  };
+
+  const emitLine = (x0: number, y0: number, x1: number, y1: number): void => {
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    if (dx * dx + dy * dy < 1e-12) {
+      return;
+    }
+
+    outSegments.push(x0, y0, x1, y1);
+    segmentCount += 1;
+
+    bounds.minX = Math.min(bounds.minX, x0, x1);
+    bounds.minY = Math.min(bounds.minY, y0, y1);
+    bounds.maxX = Math.max(bounds.maxX, x0, x1);
+    bounds.maxY = Math.max(bounds.maxY, y0, y1);
+  };
+
+  for (let i = 0; i < pathData.length; ) {
+    const op = pathData[i++];
+
+    if (op === DRAW_MOVE_TO) {
+      cursorX = pathData[i++];
+      cursorY = pathData[i++];
+      startX = cursorX;
+      startY = cursorY;
+      hasStart = true;
+      continue;
+    }
+
+    if (op === DRAW_LINE_TO) {
+      const x = pathData[i++];
+      const y = pathData[i++];
+      emitLine(cursorX, cursorY, x, y);
+      cursorX = x;
+      cursorY = y;
+      continue;
+    }
+
+    if (op === DRAW_CURVE_TO) {
+      const x1 = pathData[i++];
+      const y1 = pathData[i++];
+      const x2 = pathData[i++];
+      const y2 = pathData[i++];
+      const x3 = pathData[i++];
+      const y3 = pathData[i++];
+
+      flattenCubic(
+        cursorX,
+        cursorY,
+        x1,
+        y1,
+        x2,
+        y2,
+        x3,
+        y3,
+        emitLine,
+        TEXT_CURVE_FLATNESS,
+        MAX_TEXT_CURVE_SPLIT_DEPTH
+      );
+
+      cursorX = x3;
+      cursorY = y3;
+      continue;
+    }
+
+    if (op === DRAW_QUAD_TO) {
+      const x1 = pathData[i++];
+      const y1 = pathData[i++];
+      const x2 = pathData[i++];
+      const y2 = pathData[i++];
+
+      const c1x = cursorX + (2 / 3) * (x1 - cursorX);
+      const c1y = cursorY + (2 / 3) * (y1 - cursorY);
+      const c2x = x2 + (2 / 3) * (x1 - x2);
+      const c2y = y2 + (2 / 3) * (y1 - y2);
+
+      flattenCubic(
+        cursorX,
+        cursorY,
+        c1x,
+        c1y,
+        c2x,
+        c2y,
+        x2,
+        y2,
+        emitLine,
+        TEXT_CURVE_FLATNESS,
+        MAX_TEXT_CURVE_SPLIT_DEPTH
+      );
+
+      cursorX = x2;
+      cursorY = y2;
+      continue;
+    }
+
+    if (op === DRAW_CLOSE) {
+      if (hasStart && (cursorX !== startX || cursorY !== startY)) {
+        emitLine(cursorX, cursorY, startX, startY);
+      }
+      cursorX = startX;
+      cursorY = startY;
+      continue;
+    }
+
+    break;
+  }
+
+  if (segmentCount === 0) {
+    return {
+      segmentCount: 0,
+      bounds: { minX: 0, minY: 0, maxX: 0, maxY: 0 }
+    };
+  }
+
+  return { segmentCount, bounds };
+}
+
+function buildTextGlyphTransform(state: TextState, glyphX: number, glyphY: number): Mat2D {
+  let matrix = state.matrix;
+  matrix = multiplyMatrices(matrix, state.textMatrix);
+  matrix = multiplyMatrices(matrix, [1, 0, 0, 1, state.textX, state.textY + state.textRise]);
+  matrix = multiplyMatrices(matrix, [state.textHScale * state.fontDirection, 0, 0, state.fontDirection > 0 ? -1 : 1, 0, 0]);
+  matrix = multiplyMatrices(matrix, [1, 0, 0, 1, glyphX, glyphY]);
+  matrix = multiplyMatrices(matrix, [state.fontSize, 0, 0, -state.fontSize, 0, 0]);
+  return matrix;
+}
+
+function combineBounds(primary: Bounds | null, secondary: Bounds | null): Bounds | null {
+  if (!primary && !secondary) {
+    return null;
+  }
+  if (!primary && secondary) {
+    return { ...secondary };
+  }
+  if (primary && !secondary) {
+    return { ...primary };
+  }
+
+  const a = primary as Bounds;
+  const b = secondary as Bounds;
+
+  return {
+    minX: Math.min(a.minX, b.minX),
+    minY: Math.min(a.minY, b.minY),
+    maxX: Math.max(a.maxX, b.maxX),
+    maxY: Math.max(a.maxY, b.maxY)
+  };
+}
+
+function boundsIntersect(a: Bounds, b: Bounds): boolean {
+  return !(a.maxX < b.minX || a.minX > b.maxX || a.maxY < b.minY || a.minY > b.maxY);
 }
 
 function flattenCubic(

@@ -112,6 +112,303 @@ void main() {
 }
 `;
 
+const FILL_VERTEX_SHADER_SOURCE = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+layout(location = 0) in vec2 aCorner;
+layout(location = 3) in float aFillPathIndex;
+
+uniform sampler2D uFillPathMetaTexA;
+uniform sampler2D uFillPathMetaTexB;
+uniform sampler2D uFillPathMetaTexC;
+uniform ivec2 uFillPathMetaTexSize;
+uniform vec2 uViewport;
+uniform vec2 uCameraCenter;
+uniform float uZoom;
+
+flat out int vSegmentStart;
+flat out int vSegmentCount;
+flat out float vLuma;
+flat out float vAlpha;
+flat out float vFillRule;
+out vec2 vLocal;
+
+ivec2 coordFromIndex(int index, ivec2 sizeValue) {
+  int x = index % sizeValue.x;
+  int y = index / sizeValue.x;
+  return ivec2(x, y);
+}
+
+void main() {
+  int pathIndex = int(aFillPathIndex + 0.5);
+  vec4 metaA = texelFetch(uFillPathMetaTexA, coordFromIndex(pathIndex, uFillPathMetaTexSize), 0);
+  vec4 metaB = texelFetch(uFillPathMetaTexB, coordFromIndex(pathIndex, uFillPathMetaTexSize), 0);
+  vec4 metaC = texelFetch(uFillPathMetaTexC, coordFromIndex(pathIndex, uFillPathMetaTexSize), 0);
+
+  int segmentCount = int(metaA.y + 0.5);
+  float alpha = metaB.w;
+  if (segmentCount <= 0 || alpha <= 0.001) {
+    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+    vSegmentStart = 0;
+    vSegmentCount = 0;
+    vLuma = 0.0;
+    vAlpha = 0.0;
+    vFillRule = 0.0;
+    vLocal = vec2(0.0);
+    return;
+  }
+
+  vec2 minBounds = metaA.zw;
+  vec2 maxBounds = metaB.xy;
+  vec2 corner01 = aCorner * 0.5 + 0.5;
+  vec2 world = mix(minBounds, maxBounds, corner01);
+
+  vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
+  vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+  gl_Position = vec4(clip, 0.0, 1.0);
+
+  vSegmentStart = int(metaA.x + 0.5);
+  vSegmentCount = segmentCount;
+  vLuma = metaB.z;
+  vAlpha = alpha;
+  vFillRule = metaC.x;
+  vLocal = world;
+}
+`;
+
+const FILL_FRAGMENT_SHADER_SOURCE = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+uniform sampler2D uFillSegmentTex;
+uniform ivec2 uFillSegmentTexSize;
+uniform float uFillAAScreenPx;
+
+flat in int vSegmentStart;
+flat in int vSegmentCount;
+flat in float vLuma;
+flat in float vAlpha;
+flat in float vFillRule;
+in vec2 vLocal;
+
+out vec4 outColor;
+
+const int MAX_FILL_PATH_SEGMENTS = 1024;
+
+ivec2 coordFromIndex(int index, ivec2 sizeValue) {
+  int x = index % sizeValue.x;
+  int y = index / sizeValue.x;
+  return ivec2(x, y);
+}
+
+void main() {
+  if (vSegmentCount <= 0 || vAlpha <= 0.001) {
+    discard;
+  }
+
+  float minDistance = 1e20;
+  int winding = 0;
+  int crossings = 0;
+
+  for (int i = 0; i < MAX_FILL_PATH_SEGMENTS; i += 1) {
+    if (i >= vSegmentCount) {
+      break;
+    }
+
+    vec4 segment = texelFetch(uFillSegmentTex, coordFromIndex(vSegmentStart + i, uFillSegmentTexSize), 0);
+    vec2 a = segment.xy;
+    vec2 b = segment.zw;
+    vec2 ab = b - a;
+    vec2 ap = vLocal - a;
+    float abLenSq = dot(ab, ab);
+
+    if (abLenSq > 1e-10) {
+      float t = clamp(dot(ap, ab) / abLenSq, 0.0, 1.0);
+      vec2 closest = a + t * ab;
+      minDistance = min(minDistance, length(vLocal - closest));
+    }
+
+    bool crosses = (a.y <= vLocal.y && b.y > vLocal.y) || (b.y <= vLocal.y && a.y > vLocal.y);
+    if (crosses) {
+      float denom = b.y - a.y;
+      if (abs(denom) > 1e-6) {
+        float xCross = a.x + (vLocal.y - a.y) * (b.x - a.x) / denom;
+        if (xCross > vLocal.x) {
+          crossings += 1;
+          winding += (b.y > a.y) ? 1 : -1;
+        }
+      }
+    }
+  }
+
+  bool insideNonZero = winding != 0;
+  bool insideEvenOdd = (crossings & 1) == 1;
+  bool inside = vFillRule >= 0.5 ? insideEvenOdd : insideNonZero;
+  float signedDistance = inside ? -minDistance : minDistance;
+
+  float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float aaWidth = max(max(pixelToLocalX, pixelToLocalY) * uFillAAScreenPx, 1e-4);
+
+  float alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0) * vAlpha;
+  if (alpha <= 0.001) {
+    discard;
+  }
+
+  outColor = vec4(vec3(vLuma), alpha);
+}
+`;
+
+const TEXT_VERTEX_SHADER_SOURCE = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+layout(location = 0) in vec2 aCorner;
+layout(location = 2) in float aTextInstanceIndex;
+
+uniform sampler2D uTextInstanceTexA;
+uniform sampler2D uTextInstanceTexB;
+uniform sampler2D uTextGlyphMetaTexA;
+uniform sampler2D uTextGlyphMetaTexB;
+uniform ivec2 uTextInstanceTexSize;
+uniform ivec2 uTextGlyphMetaTexSize;
+uniform vec2 uViewport;
+uniform vec2 uCameraCenter;
+uniform float uZoom;
+
+flat out int vSegmentStart;
+flat out int vSegmentCount;
+flat out float vLuma;
+out vec2 vLocal;
+
+ivec2 coordFromIndex(int index, ivec2 sizeValue) {
+  int x = index % sizeValue.x;
+  int y = index / sizeValue.x;
+  return ivec2(x, y);
+}
+
+void main() {
+  int instanceIndex = int(aTextInstanceIndex + 0.5);
+  vec4 instanceA = texelFetch(uTextInstanceTexA, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
+  vec4 instanceB = texelFetch(uTextInstanceTexB, coordFromIndex(instanceIndex, uTextInstanceTexSize), 0);
+
+  int glyphIndex = int(instanceB.z + 0.5);
+  vec4 glyphMetaA = texelFetch(uTextGlyphMetaTexA, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
+  vec4 glyphMetaB = texelFetch(uTextGlyphMetaTexB, coordFromIndex(glyphIndex, uTextGlyphMetaTexSize), 0);
+
+  int segmentCount = int(glyphMetaA.y + 0.5);
+  if (segmentCount <= 0) {
+    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+    vSegmentStart = 0;
+    vSegmentCount = 0;
+    vLuma = 0.0;
+    vLocal = vec2(0.0);
+    return;
+  }
+
+  vec2 minBounds = glyphMetaA.zw;
+  vec2 maxBounds = glyphMetaB.xy;
+  vec2 corner01 = aCorner * 0.5 + 0.5;
+  vec2 local = mix(minBounds, maxBounds, corner01);
+
+  vec2 world = vec2(
+    instanceA.x * local.x + instanceA.z * local.y + instanceB.x,
+    instanceA.y * local.x + instanceA.w * local.y + instanceB.y
+  );
+
+  vec2 screen = (world - uCameraCenter) * uZoom + 0.5 * uViewport;
+  vec2 clip = (screen / (0.5 * uViewport)) - 1.0;
+
+  gl_Position = vec4(clip, 0.0, 1.0);
+  vSegmentStart = int(glyphMetaA.x + 0.5);
+  vSegmentCount = segmentCount;
+  vLuma = instanceB.w;
+  vLocal = local;
+}
+`;
+
+const TEXT_FRAGMENT_SHADER_SOURCE = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+uniform sampler2D uTextGlyphSegmentTex;
+uniform ivec2 uTextGlyphSegmentTexSize;
+uniform float uTextAAScreenPx;
+
+flat in int vSegmentStart;
+flat in int vSegmentCount;
+flat in float vLuma;
+in vec2 vLocal;
+
+out vec4 outColor;
+
+const int MAX_GLYPH_SEGMENTS = 256;
+
+ivec2 coordFromIndex(int index, ivec2 sizeValue) {
+  int x = index % sizeValue.x;
+  int y = index / sizeValue.x;
+  return ivec2(x, y);
+}
+
+void main() {
+  if (vSegmentCount <= 0) {
+    discard;
+  }
+
+  float minDistance = 1e20;
+  int winding = 0;
+  int crossings = 0;
+
+  for (int i = 0; i < MAX_GLYPH_SEGMENTS; i += 1) {
+    if (i >= vSegmentCount) {
+      break;
+    }
+
+    vec4 segment = texelFetch(uTextGlyphSegmentTex, coordFromIndex(vSegmentStart + i, uTextGlyphSegmentTexSize), 0);
+    vec2 a = segment.xy;
+    vec2 b = segment.zw;
+    vec2 ab = b - a;
+    vec2 ap = vLocal - a;
+    float abLenSq = dot(ab, ab);
+
+    if (abLenSq > 1e-10) {
+      float t = clamp(dot(ap, ab) / abLenSq, 0.0, 1.0);
+      vec2 closest = a + t * ab;
+      minDistance = min(minDistance, length(vLocal - closest));
+    }
+
+    bool crosses = (a.y <= vLocal.y && b.y > vLocal.y) || (b.y <= vLocal.y && a.y > vLocal.y);
+    if (crosses) {
+      float denom = b.y - a.y;
+      if (abs(denom) > 1e-6) {
+        float xCross = a.x + (vLocal.y - a.y) * (b.x - a.x) / denom;
+        if (xCross > vLocal.x) {
+          crossings += 1;
+          winding += (b.y > a.y) ? 1 : -1;
+        }
+      }
+    }
+  }
+
+  bool insideWinding = winding != 0;
+  bool insideEvenOdd = (crossings & 1) == 1;
+  bool inside = insideWinding || insideEvenOdd;
+  float signedDistance = inside ? -minDistance : minDistance;
+
+  float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));
+  float pixelToLocalY = length(vec2(dFdx(vLocal.y), dFdy(vLocal.y)));
+  float aaWidth = max(max(pixelToLocalX, pixelToLocalY) * uTextAAScreenPx, 1e-4);
+
+  float alpha = clamp(0.5 - signedDistance / aaWidth, 0.0, 1.0);
+  if (alpha <= 0.001) {
+    discard;
+  }
+
+  outColor = vec4(vec3(vLuma), alpha);
+}
+`;
+
 const BLIT_VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
 
@@ -165,9 +462,19 @@ export interface SceneStats {
   gridHeight: number;
   gridIndexCount: number;
   maxCellPopulation: number;
+  fillPathTextureWidth: number;
+  fillPathTextureHeight: number;
+  fillSegmentTextureWidth: number;
+  fillSegmentTextureHeight: number;
   textureWidth: number;
   textureHeight: number;
   maxTextureSize: number;
+  textInstanceTextureWidth: number;
+  textInstanceTextureHeight: number;
+  textGlyphTextureWidth: number;
+  textGlyphTextureHeight: number;
+  textSegmentTextureWidth: number;
+  textSegmentTextureHeight: number;
 }
 
 type FrameListener = (stats: DrawStats) => void;
@@ -179,9 +486,17 @@ export class GpuFloorplanRenderer {
 
   private readonly segmentProgram: WebGLProgram;
 
+  private readonly fillProgram: WebGLProgram;
+
+  private readonly textProgram: WebGLProgram;
+
   private readonly blitProgram: WebGLProgram;
 
   private readonly segmentVao: WebGLVertexArrayObject;
+
+  private readonly fillVao: WebGLVertexArrayObject;
+
+  private readonly textVao: WebGLVertexArrayObject;
 
   private readonly blitVao: WebGLVertexArrayObject;
 
@@ -191,9 +506,31 @@ export class GpuFloorplanRenderer {
 
   private readonly visibleSegmentIdBuffer: WebGLBuffer;
 
+  private readonly allFillPathIdBuffer: WebGLBuffer;
+
+  private readonly allTextInstanceIdBuffer: WebGLBuffer;
+
   private readonly segmentTextureA: WebGLTexture;
 
   private readonly segmentTextureB: WebGLTexture;
+
+  private readonly fillPathMetaTextureA: WebGLTexture;
+
+  private readonly fillPathMetaTextureB: WebGLTexture;
+
+  private readonly fillPathMetaTextureC: WebGLTexture;
+
+  private readonly fillSegmentTexture: WebGLTexture;
+
+  private readonly textInstanceTextureA: WebGLTexture;
+
+  private readonly textInstanceTextureB: WebGLTexture;
+
+  private readonly textGlyphMetaTextureA: WebGLTexture;
+
+  private readonly textGlyphMetaTextureB: WebGLTexture;
+
+  private readonly textGlyphSegmentTexture: WebGLTexture;
 
   private readonly uSegmentTexA: WebGLUniformLocation;
 
@@ -208,6 +545,50 @@ export class GpuFloorplanRenderer {
   private readonly uZoom: WebGLUniformLocation;
 
   private readonly uAAScreenPx: WebGLUniformLocation;
+
+  private readonly uFillPathMetaTexA: WebGLUniformLocation;
+
+  private readonly uFillPathMetaTexB: WebGLUniformLocation;
+
+  private readonly uFillPathMetaTexC: WebGLUniformLocation;
+
+  private readonly uFillSegmentTex: WebGLUniformLocation;
+
+  private readonly uFillPathMetaTexSize: WebGLUniformLocation;
+
+  private readonly uFillSegmentTexSize: WebGLUniformLocation;
+
+  private readonly uFillViewport: WebGLUniformLocation;
+
+  private readonly uFillCameraCenter: WebGLUniformLocation;
+
+  private readonly uFillZoom: WebGLUniformLocation;
+
+  private readonly uFillAAScreenPx: WebGLUniformLocation;
+
+  private readonly uTextInstanceTexA: WebGLUniformLocation;
+
+  private readonly uTextInstanceTexB: WebGLUniformLocation;
+
+  private readonly uTextGlyphMetaTexA: WebGLUniformLocation;
+
+  private readonly uTextGlyphMetaTexB: WebGLUniformLocation;
+
+  private readonly uTextGlyphSegmentTex: WebGLUniformLocation;
+
+  private readonly uTextInstanceTexSize: WebGLUniformLocation;
+
+  private readonly uTextGlyphMetaTexSize: WebGLUniformLocation;
+
+  private readonly uTextGlyphSegmentTexSize: WebGLUniformLocation;
+
+  private readonly uTextViewport: WebGLUniformLocation;
+
+  private readonly uTextCameraCenter: WebGLUniformLocation;
+
+  private readonly uTextZoom: WebGLUniformLocation;
+
+  private readonly uTextAAScreenPx: WebGLUniformLocation;
 
   private readonly uCacheTex: WebGLUniformLocation;
 
@@ -227,6 +608,10 @@ export class GpuFloorplanRenderer {
 
   private visibleSegmentIds = new Float32Array(0);
 
+  private allFillPathIds = new Float32Array(0);
+
+  private allTextInstanceIds = new Float32Array(0);
+
   private segmentMarks = new Uint32Array(0);
 
   private segmentMinX = new Float32Array(0);
@@ -241,6 +626,10 @@ export class GpuFloorplanRenderer {
 
   private segmentCount = 0;
 
+  private fillPathCount = 0;
+
+  private textInstanceCount = 0;
+
   private visibleSegmentCount = 0;
 
   private usingAllSegments = true;
@@ -248,6 +637,26 @@ export class GpuFloorplanRenderer {
   private segmentTextureWidth = 1;
 
   private segmentTextureHeight = 1;
+
+  private fillPathMetaTextureWidth = 1;
+
+  private fillPathMetaTextureHeight = 1;
+
+  private fillSegmentTextureWidth = 1;
+
+  private fillSegmentTextureHeight = 1;
+
+  private textInstanceTextureWidth = 1;
+
+  private textInstanceTextureHeight = 1;
+
+  private textGlyphMetaTextureWidth = 1;
+
+  private textGlyphMetaTextureHeight = 1;
+
+  private textGlyphSegmentTextureWidth = 1;
+
+  private textGlyphSegmentTextureHeight = 1;
 
   private needsVisibleSetUpdate = false;
 
@@ -309,17 +718,32 @@ export class GpuFloorplanRenderer {
     this.gl = context;
 
     this.segmentProgram = this.createProgram(VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE);
+    this.fillProgram = this.createProgram(FILL_VERTEX_SHADER_SOURCE, FILL_FRAGMENT_SHADER_SOURCE);
+    this.textProgram = this.createProgram(TEXT_VERTEX_SHADER_SOURCE, TEXT_FRAGMENT_SHADER_SOURCE);
     this.blitProgram = this.createProgram(BLIT_VERTEX_SHADER_SOURCE, BLIT_FRAGMENT_SHADER_SOURCE);
 
     this.segmentVao = this.createVertexArray();
+    this.fillVao = this.createVertexArray();
+    this.textVao = this.createVertexArray();
     this.blitVao = this.createVertexArray();
 
     this.cornerBuffer = this.mustCreateBuffer();
     this.allSegmentIdBuffer = this.mustCreateBuffer();
     this.visibleSegmentIdBuffer = this.mustCreateBuffer();
+    this.allFillPathIdBuffer = this.mustCreateBuffer();
+    this.allTextInstanceIdBuffer = this.mustCreateBuffer();
 
     this.segmentTextureA = this.mustCreateTexture();
     this.segmentTextureB = this.mustCreateTexture();
+    this.fillPathMetaTextureA = this.mustCreateTexture();
+    this.fillPathMetaTextureB = this.mustCreateTexture();
+    this.fillPathMetaTextureC = this.mustCreateTexture();
+    this.fillSegmentTexture = this.mustCreateTexture();
+    this.textInstanceTextureA = this.mustCreateTexture();
+    this.textInstanceTextureB = this.mustCreateTexture();
+    this.textGlyphMetaTextureA = this.mustCreateTexture();
+    this.textGlyphMetaTextureB = this.mustCreateTexture();
+    this.textGlyphSegmentTexture = this.mustCreateTexture();
 
     this.uSegmentTexA = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexA");
     this.uSegmentTexB = this.mustGetUniformLocation(this.segmentProgram, "uSegmentTexB");
@@ -328,6 +752,30 @@ export class GpuFloorplanRenderer {
     this.uCameraCenter = this.mustGetUniformLocation(this.segmentProgram, "uCameraCenter");
     this.uZoom = this.mustGetUniformLocation(this.segmentProgram, "uZoom");
     this.uAAScreenPx = this.mustGetUniformLocation(this.segmentProgram, "uAAScreenPx");
+
+    this.uFillPathMetaTexA = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexA");
+    this.uFillPathMetaTexB = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexB");
+    this.uFillPathMetaTexC = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexC");
+    this.uFillSegmentTex = this.mustGetUniformLocation(this.fillProgram, "uFillSegmentTex");
+    this.uFillPathMetaTexSize = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexSize");
+    this.uFillSegmentTexSize = this.mustGetUniformLocation(this.fillProgram, "uFillSegmentTexSize");
+    this.uFillViewport = this.mustGetUniformLocation(this.fillProgram, "uViewport");
+    this.uFillCameraCenter = this.mustGetUniformLocation(this.fillProgram, "uCameraCenter");
+    this.uFillZoom = this.mustGetUniformLocation(this.fillProgram, "uZoom");
+    this.uFillAAScreenPx = this.mustGetUniformLocation(this.fillProgram, "uFillAAScreenPx");
+
+    this.uTextInstanceTexA = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexA");
+    this.uTextInstanceTexB = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexB");
+    this.uTextGlyphMetaTexA = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexA");
+    this.uTextGlyphMetaTexB = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexB");
+    this.uTextGlyphSegmentTex = this.mustGetUniformLocation(this.textProgram, "uTextGlyphSegmentTex");
+    this.uTextInstanceTexSize = this.mustGetUniformLocation(this.textProgram, "uTextInstanceTexSize");
+    this.uTextGlyphMetaTexSize = this.mustGetUniformLocation(this.textProgram, "uTextGlyphMetaTexSize");
+    this.uTextGlyphSegmentTexSize = this.mustGetUniformLocation(this.textProgram, "uTextGlyphSegmentTexSize");
+    this.uTextViewport = this.mustGetUniformLocation(this.textProgram, "uViewport");
+    this.uTextCameraCenter = this.mustGetUniformLocation(this.textProgram, "uCameraCenter");
+    this.uTextZoom = this.mustGetUniformLocation(this.textProgram, "uZoom");
+    this.uTextAAScreenPx = this.mustGetUniformLocation(this.textProgram, "uTextAAScreenPx");
 
     this.uCacheTex = this.mustGetUniformLocation(this.blitProgram, "uCacheTex");
     this.uViewportPx = this.mustGetUniformLocation(this.blitProgram, "uViewportPx");
@@ -392,20 +840,34 @@ export class GpuFloorplanRenderer {
   setScene(scene: VectorScene): SceneStats {
     this.scene = scene;
     this.segmentCount = scene.segmentCount;
+    this.fillPathCount = scene.fillPathCount;
+    this.textInstanceCount = scene.textInstanceCount;
     this.buildSegmentBounds(scene);
     this.isPanInteracting = false;
     this.panCacheValid = false;
 
-    this.grid = buildSpatialGrid(scene);
+    this.grid = this.segmentCount > 0 ? buildSpatialGrid(scene) : null;
+    const fillTextureStats = this.uploadFillPaths(scene);
     const textureStats = this.uploadSegments(scene);
+    const textTextureStats = this.uploadTextData(scene);
     this.sceneStats = {
-      gridWidth: this.grid.gridWidth,
-      gridHeight: this.grid.gridHeight,
-      gridIndexCount: this.grid.indices.length,
-      maxCellPopulation: this.grid.maxCellPopulation,
+      gridWidth: this.grid?.gridWidth ?? 0,
+      gridHeight: this.grid?.gridHeight ?? 0,
+      gridIndexCount: this.grid?.indices.length ?? 0,
+      maxCellPopulation: this.grid?.maxCellPopulation ?? 0,
+      fillPathTextureWidth: fillTextureStats.pathMetaTextureWidth,
+      fillPathTextureHeight: fillTextureStats.pathMetaTextureHeight,
+      fillSegmentTextureWidth: fillTextureStats.segmentTextureWidth,
+      fillSegmentTextureHeight: fillTextureStats.segmentTextureHeight,
       textureWidth: textureStats.textureWidth,
       textureHeight: textureStats.textureHeight,
-      maxTextureSize: textureStats.maxTextureSize
+      maxTextureSize: textureStats.maxTextureSize,
+      textInstanceTextureWidth: textTextureStats.instanceTextureWidth,
+      textInstanceTextureHeight: textTextureStats.instanceTextureHeight,
+      textGlyphTextureWidth: textTextureStats.glyphMetaTextureWidth,
+      textGlyphTextureHeight: textTextureStats.glyphMetaTextureHeight,
+      textSegmentTextureWidth: textTextureStats.glyphSegmentTextureWidth,
+      textSegmentTextureHeight: textTextureStats.glyphSegmentTextureHeight
     };
 
     this.allSegmentIds = new Float32Array(this.segmentCount);
@@ -415,6 +877,22 @@ export class GpuFloorplanRenderer {
 
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.allSegmentIdBuffer);
     this.gl.bufferData(this.gl.ARRAY_BUFFER, this.allSegmentIds, this.gl.STATIC_DRAW);
+
+    this.allFillPathIds = new Float32Array(this.fillPathCount);
+    for (let i = 0; i < this.fillPathCount; i += 1) {
+      this.allFillPathIds[i] = i;
+    }
+
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.allFillPathIdBuffer);
+    this.gl.bufferData(this.gl.ARRAY_BUFFER, this.allFillPathIds, this.gl.STATIC_DRAW);
+
+    this.allTextInstanceIds = new Float32Array(this.textInstanceCount);
+    for (let i = 0; i < this.textInstanceCount; i += 1) {
+      this.allTextInstanceIds[i] = i;
+    }
+
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.allTextInstanceIdBuffer);
+    this.gl.bufferData(this.gl.ARRAY_BUFFER, this.allTextInstanceIds, this.gl.STATIC_DRAW);
 
     if (this.visibleSegmentIds.length < this.segmentCount) {
       this.visibleSegmentIds = new Float32Array(this.segmentCount);
@@ -506,7 +984,7 @@ export class GpuFloorplanRenderer {
   private render(): void {
     const gl = this.gl;
 
-    if (!this.scene || this.segmentCount === 0) {
+    if (!this.scene || (this.fillPathCount === 0 && this.segmentCount === 0 && this.textInstanceCount === 0)) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
       gl.clearColor(1, 1, 1, 1);
@@ -546,7 +1024,9 @@ export class GpuFloorplanRenderer {
       this.needsVisibleSetUpdate = false;
     }
 
+    this.drawFilledPaths(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
     const instanceCount = this.drawVisibleSegments(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
+    this.drawTextInstances(this.canvas.width, this.canvas.height, this.cameraCenterX, this.cameraCenterY);
 
     this.frameListener?.({
       renderedSegments: instanceCount,
@@ -586,7 +1066,19 @@ export class GpuFloorplanRenderer {
       gl.clearColor(1, 1, 1, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
 
+      this.drawFilledPaths(
+        this.panCacheWidth,
+        this.panCacheHeight,
+        this.panCacheCenterX,
+        this.panCacheCenterY
+      );
       this.panCacheRenderedSegments = this.drawVisibleSegments(
+        this.panCacheWidth,
+        this.panCacheHeight,
+        this.panCacheCenterX,
+        this.panCacheCenterY
+      );
+      this.drawTextInstances(
         this.panCacheWidth,
         this.panCacheHeight,
         this.panCacheCenterX,
@@ -607,6 +1099,45 @@ export class GpuFloorplanRenderer {
       usedCulling: this.panCacheUsedCulling,
       zoom: this.zoom
     });
+  }
+
+  private drawFilledPaths(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number
+  ): number {
+    if (!this.scene || this.fillPathCount <= 0) {
+      return 0;
+    }
+
+    const gl = this.gl;
+
+    gl.useProgram(this.fillProgram);
+    gl.bindVertexArray(this.fillVao);
+
+    gl.activeTexture(gl.TEXTURE7);
+    gl.bindTexture(gl.TEXTURE_2D, this.fillPathMetaTextureA);
+    gl.activeTexture(gl.TEXTURE8);
+    gl.bindTexture(gl.TEXTURE_2D, this.fillPathMetaTextureB);
+    gl.activeTexture(gl.TEXTURE9);
+    gl.bindTexture(gl.TEXTURE_2D, this.fillPathMetaTextureC);
+    gl.activeTexture(gl.TEXTURE10);
+    gl.bindTexture(gl.TEXTURE_2D, this.fillSegmentTexture);
+
+    gl.uniform1i(this.uFillPathMetaTexA, 7);
+    gl.uniform1i(this.uFillPathMetaTexB, 8);
+    gl.uniform1i(this.uFillPathMetaTexC, 9);
+    gl.uniform1i(this.uFillSegmentTex, 10);
+    gl.uniform2i(this.uFillPathMetaTexSize, this.fillPathMetaTextureWidth, this.fillPathMetaTextureHeight);
+    gl.uniform2i(this.uFillSegmentTexSize, this.fillSegmentTextureWidth, this.fillSegmentTextureHeight);
+    gl.uniform2f(this.uFillViewport, viewportWidth, viewportHeight);
+    gl.uniform2f(this.uFillCameraCenter, cameraCenterX, cameraCenterY);
+    gl.uniform1f(this.uFillZoom, this.zoom);
+    gl.uniform1f(this.uFillAAScreenPx, 1);
+
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.fillPathCount);
+    return this.fillPathCount;
   }
 
   private drawVisibleSegments(
@@ -647,6 +1178,49 @@ export class GpuFloorplanRenderer {
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
 
     return instanceCount;
+  }
+
+  private drawTextInstances(
+    viewportWidth: number,
+    viewportHeight: number,
+    cameraCenterX: number,
+    cameraCenterY: number
+  ): number {
+    if (!this.scene || this.textInstanceCount <= 0) {
+      return 0;
+    }
+
+    const gl = this.gl;
+
+    gl.useProgram(this.textProgram);
+    gl.bindVertexArray(this.textVao);
+
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureA);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureB);
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureA);
+    gl.activeTexture(gl.TEXTURE5);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureB);
+    gl.activeTexture(gl.TEXTURE6);
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTexture);
+
+    gl.uniform1i(this.uTextInstanceTexA, 2);
+    gl.uniform1i(this.uTextInstanceTexB, 3);
+    gl.uniform1i(this.uTextGlyphMetaTexA, 4);
+    gl.uniform1i(this.uTextGlyphMetaTexB, 5);
+    gl.uniform1i(this.uTextGlyphSegmentTex, 6);
+    gl.uniform2i(this.uTextInstanceTexSize, this.textInstanceTextureWidth, this.textInstanceTextureHeight);
+    gl.uniform2i(this.uTextGlyphMetaTexSize, this.textGlyphMetaTextureWidth, this.textGlyphMetaTextureHeight);
+    gl.uniform2i(this.uTextGlyphSegmentTexSize, this.textGlyphSegmentTextureWidth, this.textGlyphSegmentTextureHeight);
+    gl.uniform2f(this.uTextViewport, viewportWidth, viewportHeight);
+    gl.uniform2f(this.uTextCameraCenter, cameraCenterX, cameraCenterY);
+    gl.uniform1f(this.uTextZoom, this.zoom);
+    gl.uniform1f(this.uTextAAScreenPx, 1.25);
+
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.textInstanceCount);
+    return this.textInstanceCount;
   }
 
   private blitPanCache(offsetPxX: number, offsetPxY: number): void {
@@ -841,6 +1415,102 @@ export class GpuFloorplanRenderer {
     this.gl.bufferData(this.gl.ARRAY_BUFFER, slice, this.gl.DYNAMIC_DRAW);
   }
 
+  private uploadFillPaths(scene: VectorScene): {
+    pathMetaTextureWidth: number;
+    pathMetaTextureHeight: number;
+    segmentTextureWidth: number;
+    segmentTextureHeight: number;
+  } {
+    const gl = this.gl;
+    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+
+    const pathDims = chooseTextureDimensions(scene.fillPathCount, maxTextureSize);
+    const segmentDims = chooseTextureDimensions(scene.fillSegmentCount, maxTextureSize);
+
+    this.fillPathMetaTextureWidth = pathDims.width;
+    this.fillPathMetaTextureHeight = pathDims.height;
+    this.fillSegmentTextureWidth = segmentDims.width;
+    this.fillSegmentTextureHeight = segmentDims.height;
+
+    const pathTexelCount = pathDims.width * pathDims.height;
+    const segmentTexelCount = segmentDims.width * segmentDims.height;
+
+    const pathMetaAData = new Float32Array(pathTexelCount * 4);
+    pathMetaAData.set(scene.fillPathMetaA);
+
+    const pathMetaBData = new Float32Array(pathTexelCount * 4);
+    pathMetaBData.set(scene.fillPathMetaB);
+
+    const pathMetaCData = new Float32Array(pathTexelCount * 4);
+    pathMetaCData.set(scene.fillPathMetaC);
+
+    const segmentData = new Float32Array(segmentTexelCount * 4);
+    segmentData.set(scene.fillSegments);
+
+    gl.bindTexture(gl.TEXTURE_2D, this.fillPathMetaTextureA);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.fillPathMetaTextureWidth,
+      this.fillPathMetaTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      pathMetaAData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.fillPathMetaTextureB);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.fillPathMetaTextureWidth,
+      this.fillPathMetaTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      pathMetaBData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.fillPathMetaTextureC);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.fillPathMetaTextureWidth,
+      this.fillPathMetaTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      pathMetaCData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.fillSegmentTexture);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.fillSegmentTextureWidth,
+      this.fillSegmentTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      segmentData
+    );
+
+    return {
+      pathMetaTextureWidth: this.fillPathMetaTextureWidth,
+      pathMetaTextureHeight: this.fillPathMetaTextureHeight,
+      segmentTextureWidth: this.fillSegmentTextureWidth,
+      segmentTextureHeight: this.fillSegmentTextureHeight
+    };
+  }
+
   private uploadSegments(scene: VectorScene): {
     textureWidth: number;
     textureHeight: number;
@@ -900,6 +1570,127 @@ export class GpuFloorplanRenderer {
     };
   }
 
+  private uploadTextData(scene: VectorScene): {
+    instanceTextureWidth: number;
+    instanceTextureHeight: number;
+    glyphMetaTextureWidth: number;
+    glyphMetaTextureHeight: number;
+    glyphSegmentTextureWidth: number;
+    glyphSegmentTextureHeight: number;
+  } {
+    const gl = this.gl;
+    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+
+    const instanceDims = chooseTextureDimensions(scene.textInstanceCount, maxTextureSize);
+    const glyphMetaDims = chooseTextureDimensions(scene.textGlyphCount, maxTextureSize);
+    const glyphSegmentDims = chooseTextureDimensions(scene.textGlyphSegmentCount, maxTextureSize);
+
+    this.textInstanceTextureWidth = instanceDims.width;
+    this.textInstanceTextureHeight = instanceDims.height;
+    this.textGlyphMetaTextureWidth = glyphMetaDims.width;
+    this.textGlyphMetaTextureHeight = glyphMetaDims.height;
+    this.textGlyphSegmentTextureWidth = glyphSegmentDims.width;
+    this.textGlyphSegmentTextureHeight = glyphSegmentDims.height;
+
+    const instanceTexelCount = instanceDims.width * instanceDims.height;
+    const glyphMetaTexelCount = glyphMetaDims.width * glyphMetaDims.height;
+    const glyphSegmentTexelCount = glyphSegmentDims.width * glyphSegmentDims.height;
+
+    const instanceAData = new Float32Array(instanceTexelCount * 4);
+    instanceAData.set(scene.textInstanceA);
+
+    const instanceBData = new Float32Array(instanceTexelCount * 4);
+    instanceBData.set(scene.textInstanceB);
+
+    const glyphMetaAData = new Float32Array(glyphMetaTexelCount * 4);
+    glyphMetaAData.set(scene.textGlyphMetaA);
+
+    const glyphMetaBData = new Float32Array(glyphMetaTexelCount * 4);
+    glyphMetaBData.set(scene.textGlyphMetaB);
+
+    const glyphSegmentData = new Float32Array(glyphSegmentTexelCount * 4);
+    glyphSegmentData.set(scene.textGlyphSegments);
+
+    gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureA);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.textInstanceTextureWidth,
+      this.textInstanceTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      instanceAData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.textInstanceTextureB);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.textInstanceTextureWidth,
+      this.textInstanceTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      instanceBData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureA);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.textGlyphMetaTextureWidth,
+      this.textGlyphMetaTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      glyphMetaAData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphMetaTextureB);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.textGlyphMetaTextureWidth,
+      this.textGlyphMetaTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      glyphMetaBData
+    );
+
+    gl.bindTexture(gl.TEXTURE_2D, this.textGlyphSegmentTexture);
+    configureFloatTexture(gl);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      this.textGlyphSegmentTextureWidth,
+      this.textGlyphSegmentTextureHeight,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      glyphSegmentData
+    );
+
+    return {
+      instanceTextureWidth: this.textInstanceTextureWidth,
+      instanceTextureHeight: this.textInstanceTextureHeight,
+      glyphMetaTextureWidth: this.textGlyphMetaTextureWidth,
+      glyphMetaTextureHeight: this.textGlyphMetaTextureHeight,
+      glyphSegmentTextureWidth: this.textGlyphSegmentTextureWidth,
+      glyphSegmentTextureHeight: this.textGlyphSegmentTextureHeight
+    };
+  }
+
   private buildSegmentBounds(scene: VectorScene): void {
     if (this.segmentMinX.length < this.segmentCount) {
       this.segmentMinX = new Float32Array(this.segmentCount);
@@ -954,6 +1745,28 @@ export class GpuFloorplanRenderer {
     gl.enableVertexAttribArray(1);
     gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 4, 0);
     gl.vertexAttribDivisor(1, 1);
+
+    gl.bindVertexArray(this.fillVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+    gl.vertexAttribDivisor(0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.allFillPathIdBuffer);
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 4, 0);
+    gl.vertexAttribDivisor(3, 1);
+
+    gl.bindVertexArray(this.textVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+    gl.vertexAttribDivisor(0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.allTextInstanceIdBuffer);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 4, 0);
+    gl.vertexAttribDivisor(2, 1);
 
     gl.bindVertexArray(this.blitVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
@@ -1078,6 +1891,19 @@ function configureColorTexture(gl: WebGL2RenderingContext): void {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function chooseTextureDimensions(itemCount: number, maxTextureSize: number): { width: number; height: number } {
+  const safeCount = Math.max(1, itemCount);
+  const preferredWidth = Math.ceil(Math.sqrt(safeCount));
+  const width = clamp(preferredWidth, 1, maxTextureSize);
+  const height = Math.max(1, Math.ceil(safeCount / width));
+
+  if (height > maxTextureSize) {
+    throw new Error("Data texture exceeds GPU limits for this browser/GPU.");
+  }
+
+  return { width, height };
 }
 
 function clamp(value: number, min: number, max: number): number {
