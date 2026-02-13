@@ -35,6 +35,7 @@ const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
 const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-pan-opt");
 const segmentMergeToggle = document.querySelector<HTMLInputElement>("#toggle-segment-merge");
 const invisibleCullToggle = document.querySelector<HTMLInputElement>("#toggle-invisible-cull");
+const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stroke-curves");
 
 if (
   !canvas ||
@@ -62,7 +63,8 @@ if (
   !dropIndicator ||
   !panOptimizationToggle ||
   !segmentMergeToggle ||
-  !invisibleCullToggle
+  !invisibleCullToggle ||
+  !strokeCurveToggle
 ) {
   throw new Error("Required UI elements are missing from index.html.");
 }
@@ -93,10 +95,12 @@ const dropIndicatorElement = dropIndicator;
 const panOptimizationToggleElement = panOptimizationToggle;
 const segmentMergeToggleElement = segmentMergeToggle;
 const invisibleCullToggleElement = invisibleCullToggle;
+const strokeCurveToggleElement = strokeCurveToggle;
 
 const renderer = new GpuFloorplanRenderer(canvasElement);
 renderer.resize();
 renderer.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
+renderer.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
 
 let baseStatus = "Waiting for PDF file...";
 let lastLoadedPdfBytes: Uint8Array | null = null;
@@ -167,6 +171,10 @@ segmentMergeToggleElement.addEventListener("change", () => {
 
 invisibleCullToggleElement.addEventListener("change", () => {
   void reloadLastPdfWithCurrentOptions();
+});
+
+strokeCurveToggleElement.addEventListener("change", () => {
+  renderer.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
 });
 
 let isPanning = false;

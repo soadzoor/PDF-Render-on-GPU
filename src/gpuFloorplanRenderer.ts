@@ -104,6 +104,7 @@ void main() {
 
 const FRAGMENT_SHADER_SOURCE = `#version 300 es
 precision highp float;
+uniform float uStrokeCurveEnabled;
 in vec2 vLocal;
 flat in vec2 vP0;
 flat in vec2 vP1;
@@ -180,7 +181,7 @@ void main() {
     discard;
   }
 
-  float distanceToSegment = vPrimitiveType >= 0.5
+  float distanceToSegment = (uStrokeCurveEnabled >= 0.5 && vPrimitiveType >= 0.5)
     ? distanceToQuadraticBezier(vLocal, vP0, vP1, vP2)
     : distanceToLineSegment(vLocal, vP0, vP2);
 
@@ -519,6 +520,7 @@ uniform sampler2D uTextGlyphSegmentTexA;
 uniform sampler2D uTextGlyphSegmentTexB;
 uniform ivec2 uTextGlyphSegmentTexSize;
 uniform float uTextAAScreenPx;
+uniform float uTextCurveEnabled;
 
 flat in int vSegmentStart;
 flat in int vSegmentCount;
@@ -650,7 +652,7 @@ void main() {
     vec2 p2 = primitiveB.xy;
     float primitiveType = primitiveB.z;
 
-    if (primitiveType >= TEXT_PRIMITIVE_QUADRATIC) {
+    if (uTextCurveEnabled >= 0.5 && primitiveType >= TEXT_PRIMITIVE_QUADRATIC) {
       minDistance = min(minDistance, distanceToQuadraticBezier(vLocal, p0, p1, p2));
       accumulateQuadraticCrossing(p0, p1, p2, vLocal, winding);
     } else {
@@ -825,6 +827,8 @@ export class GpuFloorplanRenderer {
 
   private readonly uAAScreenPx: WebGLUniformLocation;
 
+  private readonly uStrokeCurveEnabled: WebGLUniformLocation;
+
   private readonly uFillPathMetaTexA: WebGLUniformLocation;
 
   private readonly uFillPathMetaTexB: WebGLUniformLocation;
@@ -872,6 +876,8 @@ export class GpuFloorplanRenderer {
   private readonly uTextZoom: WebGLUniformLocation;
 
   private readonly uTextAAScreenPx: WebGLUniformLocation;
+
+  private readonly uTextCurveEnabled: WebGLUniformLocation;
 
   private readonly uCacheTex: WebGLUniformLocation;
 
@@ -983,6 +989,8 @@ export class GpuFloorplanRenderer {
 
   private panOptimizationEnabled = true;
 
+  private strokeCurveEnabled = true;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
 
@@ -1041,6 +1049,7 @@ export class GpuFloorplanRenderer {
     this.uCameraCenter = this.mustGetUniformLocation(this.segmentProgram, "uCameraCenter");
     this.uZoom = this.mustGetUniformLocation(this.segmentProgram, "uZoom");
     this.uAAScreenPx = this.mustGetUniformLocation(this.segmentProgram, "uAAScreenPx");
+    this.uStrokeCurveEnabled = this.mustGetUniformLocation(this.segmentProgram, "uStrokeCurveEnabled");
 
     this.uFillPathMetaTexA = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexA");
     this.uFillPathMetaTexB = this.mustGetUniformLocation(this.fillProgram, "uFillPathMetaTexB");
@@ -1067,6 +1076,7 @@ export class GpuFloorplanRenderer {
     this.uTextCameraCenter = this.mustGetUniformLocation(this.textProgram, "uCameraCenter");
     this.uTextZoom = this.mustGetUniformLocation(this.textProgram, "uZoom");
     this.uTextAAScreenPx = this.mustGetUniformLocation(this.textProgram, "uTextAAScreenPx");
+    this.uTextCurveEnabled = this.mustGetUniformLocation(this.textProgram, "uTextCurveEnabled");
 
     this.uCacheTex = this.mustGetUniformLocation(this.blitProgram, "uCacheTex");
     this.uViewportPx = this.mustGetUniformLocation(this.blitProgram, "uViewportPx");
@@ -1096,6 +1106,15 @@ export class GpuFloorplanRenderer {
     }
 
     this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
+  setStrokeCurveEnabled(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.strokeCurveEnabled === nextEnabled) {
+      return;
+    }
+    this.strokeCurveEnabled = nextEnabled;
     this.requestFrame();
   }
 
@@ -1474,6 +1493,7 @@ export class GpuFloorplanRenderer {
     gl.uniform2f(this.uCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uZoom, this.zoom);
     gl.uniform1f(this.uAAScreenPx, 1);
+    gl.uniform1f(this.uStrokeCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
 
@@ -1521,6 +1541,7 @@ export class GpuFloorplanRenderer {
     gl.uniform2f(this.uTextCameraCenter, cameraCenterX, cameraCenterY);
     gl.uniform1f(this.uTextZoom, this.zoom);
     gl.uniform1f(this.uTextAAScreenPx, 1.25);
+    gl.uniform1f(this.uTextCurveEnabled, this.strokeCurveEnabled ? 1 : 0);
 
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.textInstanceCount);
     return this.textInstanceCount;
