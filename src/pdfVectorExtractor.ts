@@ -455,10 +455,10 @@ function createDefaultState(initialMatrix: Mat2D = IDENTITY_MATRIX): GraphicsSta
 
 function buildPageMatrix(page: {
   rotate: number;
-  getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown };
+  getViewport: (params: { scale: number; rotation?: number; dontFlip?: boolean }) => { transform: unknown; height: number };
 }): Mat2D {
   const rotation = normalizeRotationDegrees(page.rotate);
-  const viewport = page.getViewport({ scale: 1, rotation, dontFlip: true });
+  const viewport = page.getViewport({ scale: 1, rotation, dontFlip: false });
   const transform = viewport.transform;
 
   if (!Array.isArray(transform) || transform.length < 6) {
@@ -476,7 +476,13 @@ function buildPageMatrix(page: {
     return [...IDENTITY_MATRIX];
   }
 
-  return [a, b, c, d, e, f];
+  const viewportHeight = Number(viewport.height);
+  if (!Number.isFinite(viewportHeight)) {
+    return [a, b, c, d, e, f];
+  }
+
+  // PDF.js display viewport is Y-down by default; convert to Y-up world space.
+  return multiplyMatrices([1, 0, 0, -1, 0, viewportHeight], [a, b, c, d, e, f]);
 }
 
 function transformBounds(bounds: Bounds, matrix: Mat2D): Bounds {

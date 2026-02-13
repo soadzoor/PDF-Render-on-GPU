@@ -5,7 +5,7 @@ import { GlobalWorkerOptions } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import { GpuFloorplanRenderer, type SceneStats } from "./gpuFloorplanRenderer";
-import { extractFirstPageVectors, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
+import { extractFirstPageVectors, type Bounds, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -102,9 +102,16 @@ renderer.resize();
 renderer.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
 renderer.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
 
-let baseStatus = "Waiting for PDF file...";
-let lastLoadedPdfBytes: Uint8Array | null = null;
-let lastLoadedPdfLabel: string | null = null;
+let baseStatus = "Waiting for PDF or parsed zip...";
+type LoadedSourceKind = "pdf" | "parsed-zip";
+
+interface LoadedSource {
+  kind: LoadedSourceKind;
+  bytes: Uint8Array;
+  label: string;
+}
+
+let lastLoadedSource: LoadedSource | null = null;
 let lastParsedScene: VectorScene | null = null;
 let lastParsedSceneStats: SceneStats | null = null;
 let lastParsedSceneLabel: string | null = null;
@@ -121,6 +128,44 @@ interface ExportTextureEntry {
   logicalItemCount: number;
   logicalFloatCount: number;
   data: Float32Array;
+}
+
+interface ParsedDataTextureEntry {
+  name?: unknown;
+  file?: unknown;
+  logicalItemCount?: unknown;
+  logicalFloatCount?: unknown;
+}
+
+interface ParsedDataSceneEntry {
+  bounds?: unknown;
+  pageBounds?: unknown;
+  maxHalfWidth?: unknown;
+  operatorCount?: unknown;
+  pathCount?: unknown;
+  sourceSegmentCount?: unknown;
+  mergedSegmentCount?: unknown;
+  segmentCount?: unknown;
+  fillPathCount?: unknown;
+  fillSegmentCount?: unknown;
+  sourceTextCount?: unknown;
+  textInstanceCount?: unknown;
+  textGlyphCount?: unknown;
+  textGlyphPrimitiveCount?: unknown;
+  textGlyphSegmentCount?: unknown;
+  textInPageCount?: unknown;
+  textOutOfPageCount?: unknown;
+  discardedTransparentCount?: unknown;
+  discardedDegenerateCount?: unknown;
+  discardedDuplicateCount?: unknown;
+  discardedContainedCount?: unknown;
+}
+
+interface ParsedDataManifest {
+  formatVersion?: unknown;
+  sourceFile?: unknown;
+  scene?: ParsedDataSceneEntry;
+  textures?: ParsedDataTextureEntry[];
 }
 
 let fpsLastSampleTime = 0;
@@ -157,7 +202,13 @@ fileInputElement.addEventListener("change", async () => {
   if (!file) {
     return;
   }
-  await loadPdfFile(file);
+  if (isPdfFile(file)) {
+    await loadPdfFile(file);
+  } else if (isParsedDataZipFile(file)) {
+    await loadParsedDataZipFile(file);
+  } else {
+    setStatus(`Unsupported file type: ${file.name}`);
+  }
   fileInputElement.value = "";
 });
 
@@ -249,22 +300,48 @@ window.addEventListener("drop", async (event) => {
   dropIndicatorElement.classList.remove("active");
 
   const files = Array.from(event.dataTransfer?.files || []);
-  const pdf = files.find((file) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"));
+  const supported = files.find((file) => isPdfFile(file) || isParsedDataZipFile(file));
 
-  if (!pdf) {
-    setStatus("Dropped file is not a PDF.");
+  if (!supported) {
+    setStatus("Dropped file is not a supported PDF or parsed zip.");
     return;
   }
 
-  await loadPdfFile(pdf);
+  if (isPdfFile(supported)) {
+    await loadPdfFile(supported);
+  } else {
+    await loadParsedDataZipFile(supported);
+  }
 });
+
+function isPdfFile(file: File): boolean {
+  const lowerName = file.name.toLowerCase();
+  return file.type === "application/pdf" || lowerName.endsWith(".pdf");
+}
+
+function isParsedDataZipFile(file: File): boolean {
+  const lowerName = file.name.toLowerCase();
+  return (
+    lowerName.endsWith(".zip") ||
+    file.type === "application/zip" ||
+    file.type === "application/x-zip-compressed"
+  );
+}
 
 async function loadPdfFile(file: File): Promise<void> {
   setStatus(`Reading ${file.name}...`);
   const buffer = await file.arrayBuffer();
-  lastLoadedPdfBytes = clonePdfBytes(buffer);
-  lastLoadedPdfLabel = file.name;
-  await loadPdfBuffer(createParseBuffer(lastLoadedPdfBytes), file.name, { preserveView: false });
+  const bytes = cloneSourceBytes(buffer);
+  lastLoadedSource = { kind: "pdf", bytes, label: file.name };
+  await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
+}
+
+async function loadParsedDataZipFile(file: File): Promise<void> {
+  setStatus(`Reading ${file.name}...`);
+  const buffer = await file.arrayBuffer();
+  const bytes = cloneSourceBytes(buffer);
+  lastLoadedSource = { kind: "parsed-zip", bytes, label: file.name };
+  await loadParsedDataZipBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
 }
 
 async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
@@ -337,10 +414,76 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 }
 
 async function reloadLastPdfWithCurrentOptions(): Promise<void> {
-  if (!lastLoadedPdfBytes || !lastLoadedPdfLabel) {
+  if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
     return;
   }
-  await loadPdfBuffer(createParseBuffer(lastLoadedPdfBytes), lastLoadedPdfLabel, { preserveView: true });
+  await loadPdfBuffer(createParseBuffer(lastLoadedSource.bytes), lastLoadedSource.label, { preserveView: true });
+}
+
+async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
+  const activeLoadToken = ++loadToken;
+
+  try {
+    const parseStart = performance.now();
+    setParsingLoader(true);
+    setStatus(`Loading parsed data from ${label}...`);
+    const scene = await loadSceneFromParsedDataZip(buffer);
+    const parseEnd = performance.now();
+
+    if (activeLoadToken === loadToken) {
+      setParsingLoader(false);
+    }
+
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
+
+    if (scene.segmentCount === 0 && scene.textInstanceCount === 0) {
+      setStatus(`No visible vector geometry was found in ${label}.`);
+      runtimeTextElement.textContent = "";
+      setMetricPlaceholder(label);
+      setDownloadDataButtonState(false);
+      return;
+    }
+
+    setStatus(
+      `Uploading ${scene.segmentCount.toLocaleString()} segments and ${scene.textInstanceCount.toLocaleString()} text instances to GPU...`
+    );
+    const uploadStart = performance.now();
+    const sceneStats = renderer.setScene(scene);
+    if (!options.preserveView) {
+      renderer.fitToBounds(scene.bounds, 64);
+    }
+    const uploadEnd = performance.now();
+
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
+
+    logSegmentMergeStats(label, scene);
+    logInvisibleCullStats(label, scene);
+    logTextVectorStats(label, scene);
+    logTextureSizeStats(label, scene, sceneStats);
+
+    lastParsedScene = scene;
+    lastParsedSceneStats = sceneStats;
+    lastParsedSceneLabel = label;
+    setDownloadDataButtonState(true);
+
+    updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadEnd - uploadStart);
+    baseStatus = `${formatSceneStatus(label, scene)} | source: parsed data zip`;
+    statusTextElement.textContent = baseStatus;
+  } catch (error) {
+    if (activeLoadToken !== loadToken) {
+      return;
+    }
+
+    setParsingLoader(false);
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Failed to load parsed data zip: ${message}`);
+    runtimeTextElement.textContent = "";
+    setMetricPlaceholder(label);
+  }
 }
 
 function getExtractionOptions(): VectorExtractOptions {
@@ -476,6 +619,342 @@ function buildTextureExportEntries(scene: VectorScene, sceneStats: SceneStats): 
     createTextureExportEntry("text-glyph-primitives-a", scene.textGlyphSegmentsA, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount),
     createTextureExportEntry("text-glyph-primitives-b", scene.textGlyphSegmentsB, sceneStats.textSegmentTextureWidth, sceneStats.textSegmentTextureHeight, scene.textGlyphSegmentCount)
   ];
+}
+
+async function loadSceneFromParsedDataZip(buffer: ArrayBuffer): Promise<VectorScene> {
+  const zip = await JSZip.loadAsync(buffer);
+  const manifestFile = zip.file("manifest.json");
+  if (!manifestFile) {
+    throw new Error("Parsed data zip is missing manifest.json.");
+  }
+
+  const manifestJson = await manifestFile.async("string");
+  let manifest: ParsedDataManifest;
+  try {
+    manifest = JSON.parse(manifestJson) as ParsedDataManifest;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid manifest.json: ${message}`);
+  }
+
+  const sceneMeta = typeof manifest.scene === "object" && manifest.scene ? manifest.scene : {};
+  const manifestTextures = Array.isArray(manifest.textures) ? manifest.textures : [];
+
+  const textureByName = new Map<string, ParsedDataTextureEntry>();
+  for (const entry of manifestTextures) {
+    const name = typeof entry.name === "string" ? entry.name : null;
+    if (!name) {
+      continue;
+    }
+    textureByName.set(name, entry);
+  }
+
+  const readTexture = async (
+    candidateNames: string[],
+    required: boolean
+  ): Promise<{ data: Float32Array; logicalItemCount: number } | null> => {
+    for (const candidate of candidateNames) {
+      const entry = textureByName.get(candidate);
+      if (!entry) {
+        continue;
+      }
+
+      const path = typeof entry.file === "string" ? entry.file : `textures/${candidate}.f32`;
+      const zipEntry = zip.file(path);
+      if (!zipEntry) {
+        continue;
+      }
+
+      const fileBuffer = await zipEntry.async("arraybuffer");
+      if (fileBuffer.byteLength % 4 !== 0) {
+        throw new Error(`Texture ${candidate} has invalid byte length (${fileBuffer.byteLength}).`);
+      }
+
+      const raw = new Float32Array(fileBuffer);
+      const logicalFloatCount = readNonNegativeInt(entry.logicalFloatCount, raw.length);
+      if (logicalFloatCount > raw.length) {
+        throw new Error(`Texture ${candidate} logical float count exceeds file length.`);
+      }
+
+      const logicalItemCount = readNonNegativeInt(entry.logicalItemCount, Math.floor(logicalFloatCount / 4));
+      return {
+        data: raw.slice(0, logicalFloatCount),
+        logicalItemCount
+      };
+    }
+
+    if (required) {
+      throw new Error(`Parsed data zip is missing required texture: ${candidateNames[0]}.`);
+    }
+
+    return null;
+  };
+
+  const fillPathMetaAEntry = await readTexture(["fill-path-meta-a"], false);
+  const fillPathMetaBEntry = await readTexture(["fill-path-meta-b"], false);
+  const fillPathMetaCEntry = await readTexture(["fill-path-meta-c"], false);
+  const fillPrimitiveAEntry = await readTexture(["fill-primitives-a", "fill-segments"], false);
+  const fillPrimitiveBEntry = await readTexture(["fill-primitives-b"], false);
+  const strokePrimitiveAEntry = await readTexture(["stroke-primitives-a", "stroke-endpoints"], false);
+  const strokePrimitiveBEntry = await readTexture(["stroke-primitives-b"], false);
+  const strokeStylesEntry = await readTexture(["stroke-styles"], false);
+  const strokePrimitiveBoundsEntry = await readTexture(["stroke-primitive-bounds"], false);
+  const textInstanceAEntry = await readTexture(["text-instance-a"], false);
+  const textInstanceBEntry = await readTexture(["text-instance-b"], false);
+  const textGlyphMetaAEntry = await readTexture(["text-glyph-meta-a"], false);
+  const textGlyphMetaBEntry = await readTexture(["text-glyph-meta-b"], false);
+  const textGlyphPrimitiveAEntry = await readTexture(["text-glyph-primitives-a"], false);
+  const textGlyphPrimitiveBEntry = await readTexture(["text-glyph-primitives-b"], false);
+
+  const fillPathCount = readNonNegativeInt(sceneMeta.fillPathCount, fillPathMetaAEntry?.logicalItemCount ?? 0);
+  const fillSegmentCount = readNonNegativeInt(sceneMeta.fillSegmentCount, fillPrimitiveAEntry?.logicalItemCount ?? 0);
+  const segmentCount = readNonNegativeInt(
+    sceneMeta.segmentCount,
+    strokeStylesEntry?.logicalItemCount ?? strokePrimitiveAEntry?.logicalItemCount ?? 0
+  );
+  const textInstanceCount = readNonNegativeInt(sceneMeta.textInstanceCount, textInstanceAEntry?.logicalItemCount ?? 0);
+  const textGlyphCount = readNonNegativeInt(sceneMeta.textGlyphCount, textGlyphMetaAEntry?.logicalItemCount ?? 0);
+  const textGlyphSegmentCount = readNonNegativeInt(
+    sceneMeta.textGlyphPrimitiveCount,
+    readNonNegativeInt(sceneMeta.textGlyphSegmentCount, textGlyphPrimitiveAEntry?.logicalItemCount ?? 0)
+  );
+
+  if (segmentCount > 0 && (!strokePrimitiveAEntry || !strokeStylesEntry)) {
+    throw new Error("Parsed data zip is missing stroke geometry textures.");
+  }
+
+  const fillPathMetaA = trimTextureForItemCount(fillPathMetaAEntry?.data ?? new Float32Array(0), fillPathCount, "fill-path-meta-a");
+  const fillPathMetaB = trimTextureForItemCount(fillPathMetaBEntry?.data ?? new Float32Array(0), fillPathCount, "fill-path-meta-b");
+  const fillPathMetaC = trimTextureForItemCount(fillPathMetaCEntry?.data ?? new Float32Array(0), fillPathCount, "fill-path-meta-c");
+  const fillSegmentsA = trimTextureForItemCount(fillPrimitiveAEntry?.data ?? new Float32Array(0), fillSegmentCount, "fill-primitives-a");
+  const fillSegmentsB = fillPrimitiveBEntry
+    ? trimTextureForItemCount(fillPrimitiveBEntry.data, fillSegmentCount, "fill-primitives-b")
+    : deriveLinePrimitiveB(fillSegmentsA, fillSegmentCount);
+
+  const endpoints = trimTextureForItemCount(strokePrimitiveAEntry?.data ?? new Float32Array(0), segmentCount, "stroke-primitives-a");
+  const styles = trimTextureForItemCount(strokeStylesEntry?.data ?? new Float32Array(0), segmentCount, "stroke-styles");
+  const primitiveMeta = strokePrimitiveBEntry
+    ? trimTextureForItemCount(strokePrimitiveBEntry.data, segmentCount, "stroke-primitives-b")
+    : deriveLinePrimitiveB(endpoints, segmentCount);
+  const primitiveBounds = strokePrimitiveBoundsEntry
+    ? trimTextureForItemCount(strokePrimitiveBoundsEntry.data, segmentCount, "stroke-primitive-bounds")
+    : derivePrimitiveBounds(endpoints, primitiveMeta, segmentCount);
+
+  const textInstanceA = trimTextureForItemCount(textInstanceAEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-a");
+  const textInstanceB = trimTextureForItemCount(textInstanceBEntry?.data ?? new Float32Array(0), textInstanceCount, "text-instance-b");
+  const textGlyphMetaA = trimTextureForItemCount(textGlyphMetaAEntry?.data ?? new Float32Array(0), textGlyphCount, "text-glyph-meta-a");
+  const textGlyphMetaB = trimTextureForItemCount(textGlyphMetaBEntry?.data ?? new Float32Array(0), textGlyphCount, "text-glyph-meta-b");
+  const textGlyphSegmentsA = trimTextureForItemCount(
+    textGlyphPrimitiveAEntry?.data ?? new Float32Array(0),
+    textGlyphSegmentCount,
+    "text-glyph-primitives-a"
+  );
+  const textGlyphSegmentsB = trimTextureForItemCount(
+    textGlyphPrimitiveBEntry?.data ?? new Float32Array(0),
+    textGlyphSegmentCount,
+    "text-glyph-primitives-b"
+  );
+
+  const sourceSegmentCount = readNonNegativeInt(sceneMeta.sourceSegmentCount, segmentCount);
+  const mergedSegmentCount = readNonNegativeInt(sceneMeta.mergedSegmentCount, segmentCount);
+  const sourceTextCount = readNonNegativeInt(sceneMeta.sourceTextCount, textInstanceCount);
+  const textInPageCount = readNonNegativeInt(sceneMeta.textInPageCount, textInstanceCount);
+  const textOutOfPageCount = readNonNegativeInt(sceneMeta.textOutOfPageCount, Math.max(0, sourceTextCount - textInPageCount));
+  const maxHalfWidth =
+    readFiniteNumber(sceneMeta.maxHalfWidth, Number.NaN) ||
+    computeMaxHalfWidth(styles, segmentCount);
+
+  const parsedBounds = parseBounds(sceneMeta.bounds);
+  const parsedPageBounds = parseBounds(sceneMeta.pageBounds);
+  const fallbackBounds =
+    mergeBounds(
+      boundsFromPrimitiveBounds(primitiveBounds, segmentCount),
+      boundsFromFillPathMeta(fillPathMetaA, fillPathMetaB, fillPathCount)
+    ) ?? { minX: 0, minY: 0, maxX: 1, maxY: 1 };
+  const bounds = parsedBounds ?? fallbackBounds;
+  const pageBounds = parsedPageBounds ?? bounds;
+
+  return {
+    fillPathCount,
+    fillSegmentCount,
+    fillPathMetaA,
+    fillPathMetaB,
+    fillPathMetaC,
+    fillSegmentsA,
+    fillSegmentsB,
+    segmentCount,
+    sourceSegmentCount,
+    mergedSegmentCount,
+    sourceTextCount,
+    textInstanceCount,
+    textGlyphCount,
+    textGlyphSegmentCount,
+    textInPageCount,
+    textOutOfPageCount,
+    textInstanceA,
+    textInstanceB,
+    textGlyphMetaA,
+    textGlyphMetaB,
+    textGlyphSegmentsA,
+    textGlyphSegmentsB,
+    endpoints,
+    primitiveMeta,
+    primitiveBounds,
+    styles,
+    bounds,
+    pageBounds,
+    maxHalfWidth,
+    operatorCount: readNonNegativeInt(sceneMeta.operatorCount, 0),
+    pathCount: readNonNegativeInt(sceneMeta.pathCount, 0),
+    discardedTransparentCount: readNonNegativeInt(sceneMeta.discardedTransparentCount, 0),
+    discardedDegenerateCount: readNonNegativeInt(sceneMeta.discardedDegenerateCount, 0),
+    discardedDuplicateCount: readNonNegativeInt(sceneMeta.discardedDuplicateCount, 0),
+    discardedContainedCount: readNonNegativeInt(sceneMeta.discardedContainedCount, 0)
+  };
+}
+
+function trimTextureForItemCount(source: Float32Array, itemCount: number, label: string): Float32Array {
+  const expectedLength = itemCount * 4;
+  if (expectedLength === 0) {
+    return new Float32Array(0);
+  }
+  if (source.length < expectedLength) {
+    throw new Error(`Texture ${label} has insufficient data (${source.length} < ${expectedLength}).`);
+  }
+  if (source.length === expectedLength) {
+    return source;
+  }
+  return source.slice(0, expectedLength);
+}
+
+function deriveLinePrimitiveB(primitivesA: Float32Array, primitiveCount: number): Float32Array {
+  const out = new Float32Array(primitiveCount * 4);
+  for (let i = 0; i < primitiveCount; i += 1) {
+    const offset = i * 4;
+    out[offset] = primitivesA[offset + 2];
+    out[offset + 1] = primitivesA[offset + 3];
+    out[offset + 2] = 0;
+    out[offset + 3] = 0;
+  }
+  return out;
+}
+
+function derivePrimitiveBounds(primitivesA: Float32Array, primitivesB: Float32Array, primitiveCount: number): Float32Array {
+  const out = new Float32Array(primitiveCount * 4);
+  for (let i = 0; i < primitiveCount; i += 1) {
+    const offset = i * 4;
+    const x0 = primitivesA[offset];
+    const y0 = primitivesA[offset + 1];
+    const x1 = primitivesA[offset + 2];
+    const y1 = primitivesA[offset + 3];
+    const x2 = primitivesB[offset];
+    const y2 = primitivesB[offset + 1];
+
+    out[offset] = Math.min(x0, x1, x2);
+    out[offset + 1] = Math.min(y0, y1, y2);
+    out[offset + 2] = Math.max(x0, x1, x2);
+    out[offset + 3] = Math.max(y0, y1, y2);
+  }
+  return out;
+}
+
+function boundsFromPrimitiveBounds(primitiveBounds: Float32Array, primitiveCount: number): Bounds | null {
+  if (primitiveCount <= 0 || primitiveBounds.length < primitiveCount * 4) {
+    return null;
+  }
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (let i = 0; i < primitiveCount; i += 1) {
+    const offset = i * 4;
+    minX = Math.min(minX, primitiveBounds[offset]);
+    minY = Math.min(minY, primitiveBounds[offset + 1]);
+    maxX = Math.max(maxX, primitiveBounds[offset + 2]);
+    maxY = Math.max(maxY, primitiveBounds[offset + 3]);
+  }
+
+  return { minX, minY, maxX, maxY };
+}
+
+function boundsFromFillPathMeta(metaA: Float32Array, metaB: Float32Array, fillPathCount: number): Bounds | null {
+  if (fillPathCount <= 0 || metaA.length < fillPathCount * 4 || metaB.length < fillPathCount * 4) {
+    return null;
+  }
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (let i = 0; i < fillPathCount; i += 1) {
+    const offset = i * 4;
+    minX = Math.min(minX, metaA[offset + 2]);
+    minY = Math.min(minY, metaA[offset + 3]);
+    maxX = Math.max(maxX, metaB[offset]);
+    maxY = Math.max(maxY, metaB[offset + 1]);
+  }
+
+  return { minX, minY, maxX, maxY };
+}
+
+function mergeBounds(a: Bounds | null, b: Bounds | null): Bounds | null {
+  if (!a && !b) {
+    return null;
+  }
+  if (!a) {
+    return b ? { ...b } : null;
+  }
+  if (!b) {
+    return { ...a };
+  }
+  return {
+    minX: Math.min(a.minX, b.minX),
+    minY: Math.min(a.minY, b.minY),
+    maxX: Math.max(a.maxX, b.maxX),
+    maxY: Math.max(a.maxY, b.maxY)
+  };
+}
+
+function parseBounds(value: unknown): Bounds | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const maybe = value as Record<string, unknown>;
+  const minX = readFiniteNumber(maybe.minX, Number.NaN);
+  const minY = readFiniteNumber(maybe.minY, Number.NaN);
+  const maxX = readFiniteNumber(maybe.maxX, Number.NaN);
+  const maxY = readFiniteNumber(maybe.maxY, Number.NaN);
+
+  if (![minX, minY, maxX, maxY].every(Number.isFinite)) {
+    return null;
+  }
+
+  return { minX, minY, maxX, maxY };
+}
+
+function computeMaxHalfWidth(styles: Float32Array, segmentCount: number): number {
+  let maxHalfWidth = 0;
+  for (let i = 0; i < segmentCount; i += 1) {
+    maxHalfWidth = Math.max(maxHalfWidth, styles[i * 4]);
+  }
+  return maxHalfWidth;
+}
+
+function readFiniteNumber(value: unknown, fallback: number): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function readNonNegativeInt(value: unknown, fallback: number): number {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return Math.max(0, Math.trunc(fallback));
+  }
+  return Math.max(0, Math.trunc(number));
 }
 
 function createTextureExportEntry(
@@ -674,17 +1153,17 @@ async function loadDefaultSample(): Promise<void> {
       throw new Error(`HTTP ${response.status}`);
     }
     const buffer = await response.arrayBuffer();
-    lastLoadedPdfBytes = clonePdfBytes(buffer);
-    lastLoadedPdfLabel = "SimiValleyBehavioralHealth_SR_20180403.pdf";
-    await loadPdfBuffer(createParseBuffer(lastLoadedPdfBytes), "SimiValleyBehavioralHealth_SR_20180403.pdf", { preserveView: false });
+    const bytes = cloneSourceBytes(buffer);
+    lastLoadedSource = { kind: "pdf", bytes, label: "SimiValleyBehavioralHealth_SR_20180403.pdf" };
+    await loadPdfBuffer(createParseBuffer(bytes), "SimiValleyBehavioralHealth_SR_20180403.pdf", { preserveView: false });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Could not load default sample: ${message}`);
-    runtimeTextElement.textContent = "Drag and drop one of the PDFs from ./floorplans.";
+    runtimeTextElement.textContent = "Drag and drop a PDF or parsed zip from ./floorplans.";
   }
 }
 
-function clonePdfBytes(buffer: ArrayBuffer): Uint8Array {
+function cloneSourceBytes(buffer: ArrayBuffer): Uint8Array {
   return new Uint8Array(buffer).slice();
 }
 
