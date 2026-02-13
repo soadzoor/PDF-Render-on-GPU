@@ -346,6 +346,7 @@ out vec4 outColor;
 
 const int MAX_GLYPH_PRIMITIVES = 256;
 const float TEXT_PRIMITIVE_QUADRATIC = 1.0;
+const int QUAD_WINDING_SUBDIVISIONS = 6;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   int x = index % sizeValue.x;
@@ -412,9 +413,15 @@ float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
   return sqrt(max(best, 0.0));
 }
 
-void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding, inout int crossings) {
-  bool crosses = (a.y <= p.y && b.y > p.y) || (b.y <= p.y && a.y > p.y);
-  if (!crosses) {
+vec2 evaluateQuadratic(vec2 a, vec2 b, vec2 c, float t) {
+  float oneMinusT = 1.0 - t;
+  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
+}
+
+void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding) {
+  bool upward = (a.y <= p.y) && (b.y > p.y);
+  bool downward = (a.y > p.y) && (b.y <= p.y);
+  if (!upward && !downward) {
     return;
   }
 
@@ -425,64 +432,18 @@ void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding, inout int
 
   float xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
   if (xCross > p.x) {
-    crossings += 1;
-    winding += (b.y > a.y) ? 1 : -1;
+    winding += upward ? 1 : -1;
   }
 }
 
-void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding, inout int crossings) {
-  float qa = a.y - 2.0 * b.y + c.y;
-  float qb = 2.0 * (b.y - a.y);
-  float qc = a.y - p.y;
-
-  float roots[2];
-  int rootCount = 0;
-
-  if (abs(qa) <= 1e-7) {
-    if (abs(qb) <= 1e-7) {
-      return;
-    }
-    roots[0] = -qc / qb;
-    rootCount = 1;
-  } else {
-    float disc = qb * qb - 4.0 * qa * qc;
-    if (disc < 0.0) {
-      return;
-    }
-    float sqrtDisc = sqrt(max(disc, 0.0));
-    float inv = 0.5 / qa;
-    roots[0] = (-qb - sqrtDisc) * inv;
-    roots[1] = (-qb + sqrtDisc) * inv;
-    rootCount = 2;
-  }
-
-  for (int i = 0; i < 2; i += 1) {
-    if (i >= rootCount) {
-      break;
-    }
-
-    float t = roots[i];
-    if (t <= 1e-5 || t > 1.0) {
-      continue;
-    }
-
-    if (rootCount == 2 && i == 1 && abs(t - roots[0]) <= 1e-5) {
-      continue;
-    }
-
-    float oneMinusT = 1.0 - t;
-    float xCross = oneMinusT * oneMinusT * a.x + 2.0 * oneMinusT * t * b.x + t * t * c.x;
-    if (xCross <= p.x) {
-      continue;
-    }
-
-    crossings += 1;
-    float dy = 2.0 * qa * t + qb;
-    if (dy > 1e-5) {
-      winding += 1;
-    } else if (dy < -1e-5) {
-      winding -= 1;
-    }
+void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding) {
+  // Subdivide for winding crossings to avoid endpoint/tangent root precision seams.
+  vec2 prev = a;
+  for (int i = 1; i <= QUAD_WINDING_SUBDIVISIONS; i += 1) {
+    float t = float(i) / float(QUAD_WINDING_SUBDIVISIONS);
+    vec2 next = evaluateQuadratic(a, b, c, t);
+    accumulateLineCrossing(prev, next, p, winding);
+    prev = next;
   }
 }
 
@@ -493,7 +454,6 @@ void main() {
 
   float minDistance = 1e20;
   int winding = 0;
-  int crossings = 0;
 
   for (int i = 0; i < MAX_GLYPH_PRIMITIVES; i += 1) {
     if (i >= vSegmentCount) {
@@ -509,16 +469,15 @@ void main() {
 
     if (primitiveType >= TEXT_PRIMITIVE_QUADRATIC) {
       minDistance = min(minDistance, distanceToQuadraticBezier(vLocal, p0, p1, p2));
-      accumulateQuadraticCrossing(p0, p1, p2, vLocal, winding, crossings);
+      accumulateQuadraticCrossing(p0, p1, p2, vLocal, winding);
     } else {
       minDistance = min(minDistance, distanceToLineSegment(vLocal, p0, p2));
-      accumulateLineCrossing(p0, p2, vLocal, winding, crossings);
+      accumulateLineCrossing(p0, p2, vLocal, winding);
     }
   }
 
   bool insideWinding = winding != 0;
-  bool insideEvenOdd = (crossings & 1) == 1;
-  bool inside = insideWinding || insideEvenOdd;
+  bool inside = insideWinding;
   float signedDistance = inside ? -minDistance : minDistance;
 
   float pixelToLocalX = length(vec2(dFdx(vLocal.x), dFdy(vLocal.x)));

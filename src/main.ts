@@ -365,7 +365,7 @@ function setParsingLoader(isVisible: boolean): void {
 function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
   downloadDataButtonElement.hidden = !hasParsedData;
   downloadDataButtonElement.disabled = !hasParsedData || isBusy;
-  downloadDataButtonElement.textContent = isBusy ? "preparing zip..." : "download parsed data";
+  downloadDataButtonElement.textContent = isBusy ? "Preparing Zip..." : "Download Parsed Data";
 }
 
 function setHudCollapsed(collapsed: boolean): void {
