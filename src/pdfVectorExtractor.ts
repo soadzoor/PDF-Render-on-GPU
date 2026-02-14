@@ -1,4 +1,13 @@
-import { getDocument, OPS } from "pdfjs-dist";
+const pdfJsModule = (
+  typeof window === "undefined"
+    ? await import("pdfjs-dist/legacy/build/pdf.mjs")
+    : await import("pdfjs-dist")
+) as {
+  getDocument: typeof import("pdfjs-dist").getDocument;
+  OPS: typeof import("pdfjs-dist").OPS;
+};
+
+const { getDocument, OPS } = pdfJsModule;
 
 const DRAW_MOVE_TO = 0;
 const DRAW_LINE_TO = 1;

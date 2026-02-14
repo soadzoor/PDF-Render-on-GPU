@@ -22,6 +22,7 @@ const hudElement = document.querySelector<HTMLDivElement>("#hud");
 const toggleHudButton = document.querySelector<HTMLButtonElement>("#toggle-hud");
 const toggleHudIcon = document.querySelector<HTMLSpanElement>("#toggle-hud-icon");
 const openButton = document.querySelector<HTMLButtonElement>("#open-file");
+const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
 const downloadDataButton = document.querySelector<HTMLButtonElement>("#download-data");
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
@@ -60,6 +61,7 @@ if (
   !toggleHudButton ||
   !toggleHudIcon ||
   !openButton ||
+  !exampleSelect ||
   !downloadDataButton ||
   !fileInput ||
   !statusElement ||
@@ -100,6 +102,7 @@ const hudPanelElement = hudElement;
 const toggleHudButtonElement = toggleHudButton;
 const toggleHudIconElement = toggleHudIcon;
 const openButtonElement = openButton;
+const exampleSelectElement = exampleSelect;
 const downloadDataButtonElement = downloadDataButton;
 const fileInputElement = fileInput;
 const statusTextElement = statusElement;
@@ -295,6 +298,44 @@ interface ParsedDataManifest {
   textures?: ParsedDataTextureEntry[];
 }
 
+interface ExampleAssetManifestEntry {
+  id?: unknown;
+  name?: unknown;
+  pdf?: {
+    path?: unknown;
+    sizeBytes?: unknown;
+  };
+  parsedZip?: {
+    path?: unknown;
+    sizeBytes?: unknown;
+  };
+}
+
+interface ExampleAssetManifest {
+  generatedAt?: unknown;
+  examples?: unknown;
+}
+
+type ExampleSelectionKind = "pdf" | "zip";
+
+interface ExampleSelection {
+  id: string;
+  sourceName: string;
+  kind: ExampleSelectionKind;
+  path: string;
+}
+
+interface NormalizedExampleEntry {
+  id: string;
+  name: string;
+  pdfPath: string;
+  pdfSizeBytes: number;
+  zipPath: string;
+  zipSizeBytes: number;
+}
+
+const exampleSelectionMap = new Map<string, ExampleSelection>();
+
 let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
 
@@ -305,6 +346,7 @@ setDownloadDataButtonState(false);
 maxPagesPerRowInputElement.value = String(readMaxPagesPerRowInput());
 setStatus(baseStatus);
 refreshDropIndicator();
+void loadExampleManifest();
 
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();
@@ -332,6 +374,14 @@ fileInputElement.addEventListener("change", async () => {
     setStatus(`Unsupported file type: ${file.name}`);
   }
   fileInputElement.value = "";
+});
+
+exampleSelectElement.addEventListener("change", () => {
+  const selectedKey = exampleSelectElement.value;
+  if (!selectedKey) {
+    return;
+  }
+  void loadExampleSelection(selectedKey);
 });
 
 panOptimizationToggleElement.addEventListener("change", () => {
@@ -596,6 +646,155 @@ function cloneViewportCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
   clone.width = source.width;
   clone.height = source.height;
   return clone;
+}
+
+async function loadExampleManifest(): Promise<void> {
+  exampleSelectionMap.clear();
+  exampleSelectElement.innerHTML = "";
+  exampleSelectElement.append(new Option("Examples (loading...)", ""));
+  exampleSelectElement.value = "";
+  exampleSelectElement.disabled = true;
+
+  try {
+    const response = await fetch("/examples/manifest.json", { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const manifest = (await response.json()) as ExampleAssetManifest;
+    const entries = normalizeExampleManifestEntries(manifest);
+    if (entries.length === 0) {
+      throw new Error("Manifest does not contain valid examples.");
+    }
+
+    populateExampleSelect(entries);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[Examples] Failed to load manifest: ${message}`);
+    exampleSelectElement.innerHTML = "";
+    exampleSelectElement.append(new Option("Examples unavailable", ""));
+    exampleSelectElement.value = "";
+    exampleSelectElement.disabled = true;
+  }
+}
+
+function normalizeExampleManifestEntries(manifest: ExampleAssetManifest): NormalizedExampleEntry[] {
+  const rawEntries = Array.isArray(manifest.examples)
+    ? (manifest.examples as ExampleAssetManifestEntry[])
+    : [];
+  const out: NormalizedExampleEntry[] = [];
+
+  for (let i = 0; i < rawEntries.length; i += 1) {
+    const raw = rawEntries[i];
+    const name = readNonEmptyString(raw?.name);
+    if (!name) {
+      continue;
+    }
+
+    const idCandidate = readNonEmptyString(raw?.id) ?? `example-${i + 1}`;
+    const pdfPath = readNonEmptyString(raw?.pdf?.path);
+    const zipPath = readNonEmptyString(raw?.parsedZip?.path);
+    if (!pdfPath || !zipPath) {
+      continue;
+    }
+
+    out.push({
+      id: idCandidate,
+      name,
+      pdfPath,
+      pdfSizeBytes: readNonNegativeInt(raw?.pdf?.sizeBytes, 0),
+      zipPath,
+      zipSizeBytes: readNonNegativeInt(raw?.parsedZip?.sizeBytes, 0)
+    });
+  }
+
+  return out;
+}
+
+function populateExampleSelect(entries: NormalizedExampleEntry[]): void {
+  exampleSelectionMap.clear();
+  exampleSelectElement.innerHTML = "";
+  exampleSelectElement.append(new Option("Load example...", ""));
+
+  for (const entry of entries) {
+    const group = document.createElement("optgroup");
+    group.label = entry.name;
+
+    const pdfKey = `${entry.id}:pdf`;
+    const zipKey = `${entry.id}:zip`;
+    const pdfLabel = `Parse PDF (${formatKilobytes(entry.pdfSizeBytes)} kB)`;
+    const zipLabel = `Load Parsed ZIP (${formatKilobytes(entry.zipSizeBytes)} kB)`;
+
+    exampleSelectionMap.set(pdfKey, {
+      id: entry.id,
+      sourceName: entry.name,
+      kind: "pdf",
+      path: entry.pdfPath
+    });
+    exampleSelectionMap.set(zipKey, {
+      id: entry.id,
+      sourceName: entry.name,
+      kind: "zip",
+      path: entry.zipPath
+    });
+
+    group.append(new Option(pdfLabel, pdfKey));
+    group.append(new Option(zipLabel, zipKey));
+    exampleSelectElement.append(group);
+  }
+
+  exampleSelectElement.value = "";
+  exampleSelectElement.disabled = exampleSelectionMap.size === 0;
+}
+
+async function loadExampleSelection(selectionKey: string): Promise<void> {
+  const selection = exampleSelectionMap.get(selectionKey);
+  if (!selection) {
+    exampleSelectElement.value = "";
+    return;
+  }
+
+  exampleSelectElement.disabled = true;
+  try {
+    const modeLabel = selection.kind === "pdf" ? "PDF" : "parsed ZIP";
+    setStatus(`Loading example ${selection.sourceName} (${modeLabel})...`);
+    const response = await fetch(selection.path, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const fileBuffer = await response.arrayBuffer();
+    const bytes = cloneSourceBytes(fileBuffer);
+    parsedPdfPageCache = null;
+
+    if (selection.kind === "pdf") {
+      lastLoadedSource = {
+        kind: "pdf",
+        bytes,
+        label: selection.sourceName
+      };
+      await loadPdfBuffer(createParseBuffer(bytes), selection.sourceName, {
+        preserveView: false,
+        autoMaxPagesPerRow: true
+      });
+    } else {
+      const zipLabel = `${selection.sourceName} (parsed zip)`;
+      lastLoadedSource = {
+        kind: "parsed-zip",
+        bytes,
+        label: zipLabel
+      };
+      await loadParsedDataZipBuffer(createParseBuffer(bytes), zipLabel, {
+        preserveView: false
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Failed to load example: ${message}`);
+  } finally {
+    exampleSelectElement.value = "";
+    exampleSelectElement.disabled = exampleSelectionMap.size === 0;
+  }
 }
 
 function isPdfFile(file: File): boolean {
@@ -1723,6 +1922,19 @@ function readNonNegativeInt(value: unknown, fallback: number): number {
     return Math.max(0, Math.trunc(fallback));
   }
   return Math.max(0, Math.trunc(number));
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function formatKilobytes(sizeBytes: number): string {
+  const safeBytes = Math.max(0, Number(sizeBytes) || 0);
+  return (safeBytes / 1024).toFixed(1);
 }
 
 function createTextureExportEntry(

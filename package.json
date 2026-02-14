@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "examples:generate": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-example-assets.ts"
   },
   "dependencies": {
     "jszip": "3.10.1",
