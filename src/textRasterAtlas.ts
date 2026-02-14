@@ -27,7 +27,7 @@ const GLYPH_TARGET_MAX_DIM_PX = 96;
 const GLYPH_TARGET_MAX_DIM_FALLBACK = [1, 0.85, 0.7, 0.55, 0.4, 0.3];
 const GLYPH_MIN_DIM_PX = 8;
 const GLYPH_MAX_DIM_PX = 256;
-const GLYPH_PADDING_PX = 2;
+const GLYPH_PADDING_PX = 8;
 const CONNECTION_EPSILON = 1e-3;
 
 export function buildTextRasterAtlas(scene: VectorScene, maxTextureSize: number): TextRasterAtlas | null {
@@ -302,4 +302,3 @@ function clamp(value: number, min: number, max: number): number {
   }
   return value;
 }
-

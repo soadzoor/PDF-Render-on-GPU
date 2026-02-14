@@ -733,19 +733,22 @@ fn fsMain(inData : VsOut) -> @location(0) vec4f {
     inData.rasterRect.w > 0.0 &&
     min(ncFwidthX, ncFwidthY) > 2.0
   ) {
-    let uv = vec2f(
+    let uvCenter = vec2f(
       inData.rasterRect.x + inData.normCoord.x * inData.rasterRect.z,
       inData.rasterRect.y + (1.0 - inData.normCoord.y) * inData.rasterRect.w
     );
     let texel = 1.0 / max(atlasDims, vec2f(1.0, 1.0));
+    let uvMin = inData.rasterRect.xy + texel * 0.5;
+    let uvMax = inData.rasterRect.xy + inData.rasterRect.zw - texel * 0.5;
     let dx = dncDx * 0.33 * texel;
     let dy = dncDy * 0.33 * texel;
-    let alphaRaster = (1.0 / 3.0) * textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv).r +
+    let mipBias = -1.25;
+    let alphaRaster = (1.0 / 3.0) * textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter, uvMin, uvMax), mipBias).r +
       (1.0 / 6.0) * (
-        textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv - dx - dy).r +
-        textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv - dx + dy).r +
-        textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv + dx - dy).r +
-        textureSample(uTextRasterAtlasTex, uTextRasterSampler, uv + dx + dy).r
+        textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter - dx - dy, uvMin, uvMax), mipBias).r +
+        textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter - dx + dy, uvMin, uvMax), mipBias).r +
+        textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx - dy, uvMin, uvMax), mipBias).r +
+        textureSampleBias(uTextRasterAtlasTex, uTextRasterSampler, clamp(uvCenter + dx + dy, uvMin, uvMax), mipBias).r
       );
     let alpha = alphaRaster * inData.colorAlpha;
     if (alpha <= 0.001) {

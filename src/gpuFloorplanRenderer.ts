@@ -661,19 +661,22 @@ void main() {
     vec2 atlasPxSize = max(uTextRasterAtlasSize, vec2(1.0));
     vec2 nc = vec2(vNormCoord.x, 1.0 - vNormCoord.y) * (vRasterRect.zw * atlasPxSize);
     if (min(fwidth(nc.x), fwidth(nc.y)) > 2.0) {
-      vec2 uv = vec2(
+      vec2 uvCenter = vec2(
         vRasterRect.x + vNormCoord.x * vRasterRect.z,
         vRasterRect.y + (1.0 - vNormCoord.y) * vRasterRect.w
       );
       vec2 texel = 1.0 / atlasPxSize;
+      vec2 uvMin = vRasterRect.xy + texel * 0.5;
+      vec2 uvMax = vRasterRect.xy + vRasterRect.zw - texel * 0.5;
       vec2 dx = dFdx(nc) * 0.33 * texel;
       vec2 dy = dFdy(nc) * 0.33 * texel;
-      float alpha = (1.0 / 3.0) * texture(uTextRasterAtlasTex, uv).r +
+      float mipBias = -1.25;
+      float alpha = (1.0 / 3.0) * texture(uTextRasterAtlasTex, clamp(uvCenter, uvMin, uvMax), mipBias).r +
         (1.0 / 6.0) * (
-          texture(uTextRasterAtlasTex, uv - dx - dy).r +
-          texture(uTextRasterAtlasTex, uv - dx + dy).r +
-          texture(uTextRasterAtlasTex, uv + dx - dy).r +
-          texture(uTextRasterAtlasTex, uv + dx + dy).r
+          texture(uTextRasterAtlasTex, clamp(uvCenter - dx - dy, uvMin, uvMax), mipBias).r +
+          texture(uTextRasterAtlasTex, clamp(uvCenter - dx + dy, uvMin, uvMax), mipBias).r +
+          texture(uTextRasterAtlasTex, clamp(uvCenter + dx - dy, uvMin, uvMax), mipBias).r +
+          texture(uTextRasterAtlasTex, clamp(uvCenter + dx + dy, uvMin, uvMax), mipBias).r
         );
       alpha *= vColorAlpha;
       if (alpha <= 0.001) {

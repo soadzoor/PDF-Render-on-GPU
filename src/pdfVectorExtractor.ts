@@ -288,6 +288,7 @@ async function extractSinglePageVectors(
   let fillPathCount = 0;
 
   const stateStack: GraphicsState[] = [];
+  const formStateStack: GraphicsState[] = [];
   let currentState: GraphicsState = createDefaultState(pageMatrix);
 
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
@@ -311,6 +312,23 @@ async function extractSinglePageVectors(
       const transform = readTransform(args);
       if (transform) {
         currentState.matrix = multiplyMatrices(currentState.matrix, transform);
+      }
+      continue;
+    }
+
+    if (fn === OPS.paintFormXObjectBegin) {
+      formStateStack.push(cloneState(currentState));
+      const transform = readTransform(args);
+      if (transform) {
+        currentState.matrix = multiplyMatrices(currentState.matrix, transform);
+      }
+      continue;
+    }
+
+    if (fn === OPS.paintFormXObjectEnd) {
+      const restored = formStateStack.pop();
+      if (restored) {
+        currentState = restored;
       }
       continue;
     }
@@ -2260,7 +2278,12 @@ async function extractTextVectorData(
   let outOfPageCount = 0;
 
   const stateStack: TextState[] = [];
+  const formStateStack: TextState[] = [];
+  const clipBoundsStack: Array<Bounds | null> = [];
+  const formClipBoundsStack: Array<Bounds | null> = [];
   let state = createDefaultTextState(pageMatrix);
+  let clipBounds: Bounds | null = null;
+  let pendingClipPathBounds: Bounds | null = null;
 
   const getOrCreateGlyph = (font: FontLike | null, fontRef: string, fontChar: string): { index: number; bounds: Bounds } | null => {
     if (!fontChar) {
@@ -2328,34 +2351,38 @@ async function extractTextVectorData(
       const spacing = (isSpace ? state.wordSpacing : 0) + state.charSpacing;
 
       if (!vertical && !skipGlyphRender && shouldRenderFilledText(state.renderMode) && state.fillAlpha > TEXT_MIN_ALPHA) {
-          const glyphRecord = getOrCreateGlyph(font, state.fontRef, fontChar);
-          if (glyphRecord) {
-            const glyphMatrix = buildTextGlyphTransform(state, x, 0);
+        const glyphRecord = getOrCreateGlyph(font, state.fontRef, fontChar);
+        if (glyphRecord) {
+          const glyphMatrix = buildTextGlyphTransform(state, x, 0);
+          const transformedGlyphBounds = transformBounds(glyphRecord.bounds, glyphMatrix);
+          const visibleByClip = !clipBounds || boundsIntersect(transformedGlyphBounds, clipBounds);
+          if (visibleByClip) {
             textInstanceA.push(glyphMatrix[0], glyphMatrix[1], glyphMatrix[2], glyphMatrix[3]);
             textInstanceB.push(glyphMatrix[4], glyphMatrix[5], glyphRecord.index, 0);
             textInstanceC.push(state.fillR, state.fillG, state.fillB, state.fillAlpha);
             sourceTextCount += 1;
 
-          const transformedGlyphBounds = transformBounds(glyphRecord.bounds, glyphMatrix);
-          if (pageBounds) {
-            if (boundsIntersect(transformedGlyphBounds, pageBounds)) {
-              inPageCount += 1;
-            } else {
-              outOfPageCount += 1;
+            if (pageBounds) {
+              if (boundsIntersect(transformedGlyphBounds, pageBounds)) {
+                inPageCount += 1;
+              } else {
+                outOfPageCount += 1;
+              }
             }
-          }
-          if (!textBounds) {
-            textBounds = {
-              minX: transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON,
-              minY: transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON,
-              maxX: transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON,
-              maxY: transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON
-            };
-          } else {
-            textBounds.minX = Math.min(textBounds.minX, transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON);
-            textBounds.minY = Math.min(textBounds.minY, transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON);
-            textBounds.maxX = Math.max(textBounds.maxX, transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON);
-            textBounds.maxY = Math.max(textBounds.maxY, transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON);
+
+            if (!textBounds) {
+              textBounds = {
+                minX: transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON,
+                minY: transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON,
+                maxX: transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON,
+                maxY: transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON
+              };
+            } else {
+              textBounds.minX = Math.min(textBounds.minX, transformedGlyphBounds.minX - TEXT_BOUNDS_EPSILON);
+              textBounds.minY = Math.min(textBounds.minY, transformedGlyphBounds.minY - TEXT_BOUNDS_EPSILON);
+              textBounds.maxX = Math.max(textBounds.maxX, transformedGlyphBounds.maxX + TEXT_BOUNDS_EPSILON);
+              textBounds.maxY = Math.max(textBounds.maxY, transformedGlyphBounds.maxY + TEXT_BOUNDS_EPSILON);
+            }
           }
         }
       }
@@ -2379,6 +2406,7 @@ async function extractTextVectorData(
 
     if (fn === OPS.save) {
       stateStack.push(cloneTextState(state));
+      clipBoundsStack.push(cloneBoundsOrNull(clipBounds));
       continue;
     }
 
@@ -2387,6 +2415,8 @@ async function extractTextVectorData(
       if (restored) {
         state = restored;
       }
+      clipBounds = clipBoundsStack.pop() ?? null;
+      pendingClipPathBounds = null;
       continue;
     }
 
@@ -2395,6 +2425,50 @@ async function extractTextVectorData(
       if (transform) {
         state.matrix = multiplyMatrices(state.matrix, transform);
       }
+      continue;
+    }
+
+    if (fn === OPS.paintFormXObjectBegin) {
+      formStateStack.push(cloneTextState(state));
+      formClipBoundsStack.push(cloneBoundsOrNull(clipBounds));
+      const transform = readTransform(args);
+      if (transform) {
+        state.matrix = multiplyMatrices(state.matrix, transform);
+      }
+      pendingClipPathBounds = null;
+      continue;
+    }
+
+    if (fn === OPS.paintFormXObjectEnd) {
+      const restoredState = formStateStack.pop();
+      if (restoredState) {
+        state = restoredState;
+      }
+      clipBounds = formClipBoundsStack.pop() ?? clipBounds;
+      pendingClipPathBounds = null;
+      continue;
+    }
+
+    if (fn === OPS.constructPath) {
+      const paintOp = readNumber(args, 0, -1);
+      if (paintOp === OPS.endPath) {
+        const pathData = readPathData(args);
+        pendingClipPathBounds = pathData ? computeTransformedPathBounds(pathData, state.matrix) : null;
+      } else {
+        pendingClipPathBounds = null;
+      }
+      continue;
+    }
+
+    if (fn === OPS.clip || fn === OPS.eoClip) {
+      if (pendingClipPathBounds) {
+        clipBounds = intersectBounds(clipBounds, pendingClipPathBounds);
+      }
+      continue;
+    }
+
+    if (fn === OPS.endPath) {
+      pendingClipPathBounds = null;
       continue;
     }
 
@@ -2508,12 +2582,14 @@ async function extractTextVectorData(
 
     if (fn === OPS.showText || fn === OPS.showSpacedText) {
       emitTextEntries(readTextEntries(readArg(args, 0)));
+      pendingClipPathBounds = null;
       continue;
     }
 
     if (fn === OPS.nextLineShowText) {
       moveText(state, 0, state.leading);
       emitTextEntries(readTextEntries(readArg(args, 0)));
+      pendingClipPathBounds = null;
       continue;
     }
 
@@ -2522,6 +2598,7 @@ async function extractTextVectorData(
       state.charSpacing = readNumber(args, 1, state.charSpacing);
       moveText(state, 0, state.leading);
       emitTextEntries(readTextEntries(readArg(args, 2)));
+      pendingClipPathBounds = null;
       continue;
     }
   }
@@ -2542,6 +2619,139 @@ async function extractTextVectorData(
     glyphSegmentsB: textGlyphSegmentsB.toTypedArray(),
     bounds: textBounds
   };
+}
+
+function cloneBoundsOrNull(bounds: Bounds | null): Bounds | null {
+  if (!bounds) {
+    return null;
+  }
+  return { ...bounds };
+}
+
+function intersectBounds(a: Bounds | null, b: Bounds | null): Bounds | null {
+  if (!a && !b) {
+    return null;
+  }
+  if (!a && b) {
+    return { ...b };
+  }
+  if (a && !b) {
+    return { ...a };
+  }
+
+  const minX = Math.max((a as Bounds).minX, (b as Bounds).minX);
+  const minY = Math.max((a as Bounds).minY, (b as Bounds).minY);
+  const maxX = Math.min((a as Bounds).maxX, (b as Bounds).maxX);
+  const maxY = Math.min((a as Bounds).maxY, (b as Bounds).maxY);
+
+  if (!(minX <= maxX && minY <= maxY)) {
+    return null;
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function computeTransformedPathBounds(pathData: Float32Array, matrix: Mat2D): Bounds | null {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  let hasPoint = false;
+  let cursorX = 0;
+  let cursorY = 0;
+  let startX = 0;
+  let startY = 0;
+  let hasStart = false;
+
+  const includePoint = (x: number, y: number): void => {
+    const [tx, ty] = applyMatrix(matrix, x, y);
+    minX = Math.min(minX, tx);
+    minY = Math.min(minY, ty);
+    maxX = Math.max(maxX, tx);
+    maxY = Math.max(maxY, ty);
+    hasPoint = true;
+  };
+
+  for (let i = 0; i < pathData.length; ) {
+    const op = pathData[i++];
+
+    if (op === DRAW_MOVE_TO) {
+      if (i + 1 >= pathData.length) {
+        break;
+      }
+      cursorX = pathData[i++];
+      cursorY = pathData[i++];
+      startX = cursorX;
+      startY = cursorY;
+      hasStart = true;
+      includePoint(cursorX, cursorY);
+      continue;
+    }
+
+    if (op === DRAW_LINE_TO) {
+      if (i + 1 >= pathData.length) {
+        break;
+      }
+      const x = pathData[i++];
+      const y = pathData[i++];
+      includePoint(cursorX, cursorY);
+      includePoint(x, y);
+      cursorX = x;
+      cursorY = y;
+      continue;
+    }
+
+    if (op === DRAW_CURVE_TO) {
+      if (i + 5 >= pathData.length) {
+        break;
+      }
+      const x1 = pathData[i++];
+      const y1 = pathData[i++];
+      const x2 = pathData[i++];
+      const y2 = pathData[i++];
+      const x3 = pathData[i++];
+      const y3 = pathData[i++];
+      includePoint(cursorX, cursorY);
+      includePoint(x1, y1);
+      includePoint(x2, y2);
+      includePoint(x3, y3);
+      cursorX = x3;
+      cursorY = y3;
+      continue;
+    }
+
+    if (op === DRAW_QUAD_TO) {
+      if (i + 3 >= pathData.length) {
+        break;
+      }
+      const cx = pathData[i++];
+      const cy = pathData[i++];
+      const x = pathData[i++];
+      const y = pathData[i++];
+      includePoint(cursorX, cursorY);
+      includePoint(cx, cy);
+      includePoint(x, y);
+      cursorX = x;
+      cursorY = y;
+      continue;
+    }
+
+    if (op === DRAW_CLOSE) {
+      if (hasStart) {
+        includePoint(cursorX, cursorY);
+        includePoint(startX, startY);
+        cursorX = startX;
+        cursorY = startY;
+      }
+      continue;
+    }
+
+    break;
+  }
+
+  if (!hasPoint) {
+    return null;
+  }
+  return { minX, minY, maxX, maxY };
 }
 
 function createEmptyTextExtractResult(): TextExtractResult {
