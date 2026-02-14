@@ -784,7 +784,8 @@ fn vsMain(@builtin(vertex_index) vertexIndex : u32) -> VsOut {
 @fragment
 fn fsMain(@builtin(position) fragPos : vec4f) -> @location(0) vec4f {
   let base = 0.5 * (uBlit.cacheSizePx - uBlit.viewportPx);
-  let samplePx = fragPos.xy + base + uBlit.offsetPx;
+  let offsetPx = vec2f(uBlit.offsetPx.x, -uBlit.offsetPx.y);
+  let samplePx = fragPos.xy + base + offsetPx;
   let uv = samplePx / uBlit.cacheSizePx;
 
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
