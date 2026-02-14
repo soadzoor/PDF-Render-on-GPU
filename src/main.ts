@@ -203,7 +203,7 @@ async function createWebGpuRenderer(targetCanvas: HTMLCanvasElement): Promise<Re
 
 let renderer: RendererApi = createWebGlRenderer(canvasElement);
 
-let baseStatus = "Waiting for PDF or parsed zip...";
+let baseStatus = "Waiting for PDF or parsed ZIP...";
 type LoadedSourceKind = "pdf" | "parsed-zip";
 
 interface LoadedSource {
@@ -217,6 +217,7 @@ let lastParsedScene: VectorScene | null = null;
 let lastParsedSceneStats: SceneStats | null = null;
 let lastParsedSceneLabel: string | null = null;
 let loadToken = 0;
+let isDropDragActive = false;
 
 interface ParsedPdfPageCache {
   sourceBytes: Uint8Array;
@@ -302,6 +303,8 @@ setMetricPlaceholder();
 setHudCollapsed(false);
 setDownloadDataButtonState(false);
 maxPagesPerRowInputElement.value = String(readMaxPagesPerRowInput());
+setStatus(baseStatus);
+refreshDropIndicator();
 
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();
@@ -454,22 +457,29 @@ function attachCanvasInteractionListeners(targetCanvas: HTMLCanvasElement): void
 
 window.addEventListener("dragenter", (event) => {
   event.preventDefault();
-  dropIndicatorElement.classList.add("active");
+  isDropDragActive = true;
+  refreshDropIndicator();
 });
 
 window.addEventListener("dragover", (event) => {
   event.preventDefault();
+  if (!isDropDragActive) {
+    isDropDragActive = true;
+    refreshDropIndicator();
+  }
 });
 
 window.addEventListener("dragleave", (event) => {
   if (event.target === document.documentElement || event.target === document.body) {
-    dropIndicatorElement.classList.remove("active");
+    isDropDragActive = false;
+    refreshDropIndicator();
   }
 });
 
 window.addEventListener("drop", async (event) => {
   event.preventDefault();
-  dropIndicatorElement.classList.remove("active");
+  isDropDragActive = false;
+  refreshDropIndicator();
 
   const files = Array.from(event.dataTransfer?.files || []);
   const supported = files.find((file) => isPdfFile(file) || isParsedDataZipFile(file));
@@ -489,6 +499,12 @@ window.addEventListener("drop", async (event) => {
 function isWebGpuSupported(): boolean {
   const nav = navigator as Navigator & { gpu?: unknown };
   return typeof nav.gpu !== "undefined";
+}
+
+function refreshDropIndicator(): void {
+  const shouldShow = isDropDragActive || !lastParsedScene;
+  dropIndicatorElement.classList.toggle("active", shouldShow);
+  dropIndicatorElement.classList.toggle("dragging", isDropDragActive);
 }
 
 function initializeBackendToggleState(): void {
@@ -705,6 +721,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     lastParsedScene = scene;
     lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
+    refreshDropIndicator();
     setDownloadDataButtonState(true);
 
     updateMetricsPanel(label, scene, sceneStats, parseMs, uploadEnd - uploadStart);
@@ -780,6 +797,7 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     lastParsedScene = scene;
     lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
+    refreshDropIndicator();
     setDownloadDataButtonState(true);
 
     updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadEnd - uploadStart);
@@ -1912,29 +1930,6 @@ function logTextVectorStats(label: string, scene: VectorScene): void {
   );
 }
 
-async function loadDefaultSample(): Promise<void> {
-  const defaultUrl = "/floorplans/SimiValleyBehavioralHealth_SR_20180403.pdf";
-
-  try {
-    setStatus("Loading sample floorplan from /floorplans...");
-    const response = await fetch(defaultUrl);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    const buffer = await response.arrayBuffer();
-    const bytes = cloneSourceBytes(buffer);
-    lastLoadedSource = { kind: "pdf", bytes, label: "SimiValleyBehavioralHealth_SR_20180403.pdf" };
-    await loadPdfBuffer(createParseBuffer(bytes), "SimiValleyBehavioralHealth_SR_20180403.pdf", {
-      preserveView: false,
-      autoMaxPagesPerRow: true
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    setStatus(`Could not load default sample: ${message}`);
-    runtimeTextElement.textContent = "Drag and drop a PDF or parsed zip from ./floorplans.";
-  }
-}
-
 function cloneSourceBytes(buffer: ArrayBuffer): Uint8Array {
   return new Uint8Array(buffer).slice();
 }
@@ -1957,5 +1952,3 @@ function computeAutoPagesPerRow(pageCount: number): number {
   const safePageCount = Math.max(1, Math.trunc(pageCount));
   return clamp(Math.ceil(Math.sqrt(safePageCount)), 1, 100);
 }
-
-void loadDefaultSample();

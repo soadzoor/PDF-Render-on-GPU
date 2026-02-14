@@ -273,7 +273,7 @@ button:hover {
   place-items: center;
   pointer-events: none;
   opacity: 0;
-  background: rgba(10, 22, 40, 0.18);
+  background: transparent;
   color: #0f172a;
   font-size: clamp(1.1rem, 2.2vw, 1.6rem);
   font-weight: 600;
@@ -282,4 +282,8 @@ button:hover {
 
 .drop-indicator.active {
   opacity: 1;
+}
+
+.drop-indicator.dragging {
+  background: rgba(10, 22, 40, 0.18);
 }
