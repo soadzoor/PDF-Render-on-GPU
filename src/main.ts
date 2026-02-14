@@ -4,7 +4,8 @@ import JSZip from "jszip";
 import { GlobalWorkerOptions } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
-import { GpuFloorplanRenderer, type SceneStats } from "./gpuFloorplanRenderer";
+import { GpuFloorplanRenderer, type DrawStats, type SceneStats, type ViewState } from "./gpuFloorplanRenderer";
+import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 import { extractFirstPageVectors, type Bounds, type VectorExtractOptions, type VectorScene } from "./pdfVectorExtractor";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -36,6 +37,7 @@ const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-
 const segmentMergeToggle = document.querySelector<HTMLInputElement>("#toggle-segment-merge");
 const invisibleCullToggle = document.querySelector<HTMLInputElement>("#toggle-invisible-cull");
 const strokeCurveToggle = document.querySelector<HTMLInputElement>("#toggle-stroke-curves");
+const webGpuToggle = document.querySelector<HTMLInputElement>("#toggle-webgpu");
 
 if (
   !canvas ||
@@ -64,12 +66,13 @@ if (
   !panOptimizationToggle ||
   !segmentMergeToggle ||
   !invisibleCullToggle ||
-  !strokeCurveToggle
+  !strokeCurveToggle ||
+  !webGpuToggle
 ) {
   throw new Error("Required UI elements are missing from index.html.");
 }
 
-const canvasElement = canvas;
+let canvasElement = canvas;
 const hudPanelElement = hudElement;
 const toggleHudButtonElement = toggleHudButton;
 const toggleHudIconElement = toggleHudIcon;
@@ -96,11 +99,60 @@ const panOptimizationToggleElement = panOptimizationToggle;
 const segmentMergeToggleElement = segmentMergeToggle;
 const invisibleCullToggleElement = invisibleCullToggle;
 const strokeCurveToggleElement = strokeCurveToggle;
+const webGpuToggleElement = webGpuToggle;
 
-const renderer = new GpuFloorplanRenderer(canvasElement);
-renderer.resize();
-renderer.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
-renderer.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
+type RendererBackend = "webgl" | "webgpu";
+const webGpuSupported = isWebGpuSupported();
+let activeRendererBackend: RendererBackend = "webgl";
+let backendSwitchInFlight = false;
+
+interface RendererApi {
+  setFrameListener(listener: ((stats: DrawStats) => void) | null): void;
+  setPanOptimizationEnabled(enabled: boolean): void;
+  setStrokeCurveEnabled(enabled: boolean): void;
+  beginPanInteraction(): void;
+  endPanInteraction(): void;
+  resize(): void;
+  setScene(scene: VectorScene): SceneStats;
+  getSceneStats(): SceneStats | null;
+  fitToBounds(bounds: Bounds, paddingPixels?: number): void;
+  panByPixels(deltaX: number, deltaY: number): void;
+  zoomAtClientPoint(clientX: number, clientY: number, zoomFactor: number): void;
+  getViewState(): ViewState;
+  setViewState(viewState: ViewState): void;
+  dispose(): void;
+}
+
+function onRendererFrame(stats: DrawStats): void {
+  updateFpsMetric();
+
+  const rendered = stats.renderedSegments.toLocaleString();
+  const total = stats.totalSegments.toLocaleString();
+  const mode = stats.usedCulling ? "culled" : "full";
+  runtimeTextElement.textContent =
+    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeRendererBackend.toUpperCase()}`;
+}
+
+function initializeRendererCommon(rendererApi: RendererApi): void {
+  rendererApi.resize();
+  rendererApi.setPanOptimizationEnabled(panOptimizationToggleElement.checked);
+  rendererApi.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
+  rendererApi.setFrameListener(onRendererFrame);
+}
+
+function createWebGlRenderer(targetCanvas: HTMLCanvasElement): RendererApi {
+  const next = new GpuFloorplanRenderer(targetCanvas);
+  initializeRendererCommon(next);
+  return next;
+}
+
+async function createWebGpuRenderer(targetCanvas: HTMLCanvasElement): Promise<RendererApi> {
+  const next = await WebGpuFloorplanRenderer.create(targetCanvas);
+  initializeRendererCommon(next);
+  return next;
+}
+
+let renderer: RendererApi = createWebGlRenderer(canvasElement);
 
 let baseStatus = "Waiting for PDF or parsed zip...";
 type LoadedSourceKind = "pdf" | "parsed-zip";
@@ -171,18 +223,10 @@ interface ParsedDataManifest {
 let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
 
+initializeBackendToggleState();
 setMetricPlaceholder();
 setHudCollapsed(false);
 setDownloadDataButtonState(false);
-
-renderer.setFrameListener((stats) => {
-  updateFpsMetric();
-
-  const rendered = stats.renderedSegments.toLocaleString();
-  const total = stats.totalSegments.toLocaleString();
-  const mode = stats.usedCulling ? "culled" : "full";
-  runtimeTextElement.textContent = `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x`;
-});
 
 openButtonElement.addEventListener("click", () => {
   fileInputElement.click();
@@ -228,57 +272,65 @@ strokeCurveToggleElement.addEventListener("change", () => {
   renderer.setStrokeCurveEnabled(strokeCurveToggleElement.checked);
 });
 
+webGpuToggleElement.addEventListener("change", () => {
+  void applyBackendPreference(webGpuToggleElement.checked);
+});
+
 let isPanning = false;
 let previousX = 0;
 let previousY = 0;
 
-canvasElement.addEventListener("pointerdown", (event) => {
-  isPanning = true;
-  renderer.beginPanInteraction();
-  previousX = event.clientX;
-  previousY = event.clientY;
-  canvasElement.setPointerCapture(event.pointerId);
-});
-
-canvasElement.addEventListener("pointermove", (event) => {
-  if (!isPanning) {
-    return;
-  }
-
-  const deltaX = event.clientX - previousX;
-  const deltaY = event.clientY - previousY;
-
-  previousX = event.clientX;
-  previousY = event.clientY;
-
-  renderer.panByPixels(deltaX, deltaY);
-});
-
-canvasElement.addEventListener("pointerup", (event) => {
-  isPanning = false;
-  renderer.endPanInteraction();
-  canvasElement.releasePointerCapture(event.pointerId);
-});
-
-canvasElement.addEventListener("pointercancel", (event) => {
-  isPanning = false;
-  renderer.endPanInteraction();
-  canvasElement.releasePointerCapture(event.pointerId);
-});
-
-canvasElement.addEventListener(
-  "wheel",
-  (event) => {
-    event.preventDefault();
-    const zoomFactor = Math.exp(-event.deltaY * 0.0013);
-    renderer.zoomAtClientPoint(event.clientX, event.clientY, zoomFactor);
-  },
-  { passive: false }
-);
+attachCanvasInteractionListeners(canvasElement);
 
 window.addEventListener("resize", () => {
   renderer.resize();
 });
+
+function attachCanvasInteractionListeners(targetCanvas: HTMLCanvasElement): void {
+  targetCanvas.addEventListener("pointerdown", (event) => {
+    isPanning = true;
+    renderer.beginPanInteraction();
+    previousX = event.clientX;
+    previousY = event.clientY;
+    targetCanvas.setPointerCapture(event.pointerId);
+  });
+
+  targetCanvas.addEventListener("pointermove", (event) => {
+    if (!isPanning) {
+      return;
+    }
+
+    const deltaX = event.clientX - previousX;
+    const deltaY = event.clientY - previousY;
+
+    previousX = event.clientX;
+    previousY = event.clientY;
+
+    renderer.panByPixels(deltaX, deltaY);
+  });
+
+  targetCanvas.addEventListener("pointerup", (event) => {
+    isPanning = false;
+    renderer.endPanInteraction();
+    targetCanvas.releasePointerCapture(event.pointerId);
+  });
+
+  targetCanvas.addEventListener("pointercancel", (event) => {
+    isPanning = false;
+    renderer.endPanInteraction();
+    targetCanvas.releasePointerCapture(event.pointerId);
+  });
+
+  targetCanvas.addEventListener(
+    "wheel",
+    (event) => {
+      event.preventDefault();
+      const zoomFactor = Math.exp(-event.deltaY * 0.0013);
+      renderer.zoomAtClientPoint(event.clientX, event.clientY, zoomFactor);
+    },
+    { passive: false }
+  );
+}
 
 window.addEventListener("dragenter", (event) => {
   event.preventDefault();
@@ -313,6 +365,102 @@ window.addEventListener("drop", async (event) => {
     await loadParsedDataZipFile(supported);
   }
 });
+
+function isWebGpuSupported(): boolean {
+  const nav = navigator as Navigator & { gpu?: unknown };
+  return typeof nav.gpu !== "undefined";
+}
+
+function initializeBackendToggleState(): void {
+  if (!webGpuSupported) {
+    webGpuToggleElement.checked = false;
+    webGpuToggleElement.disabled = true;
+    webGpuToggleElement.title = "WebGPU is not available in this browser/GPU.";
+    return;
+  }
+
+  webGpuToggleElement.disabled = false;
+  webGpuToggleElement.title = "Experimental WebGPU backend.";
+}
+
+async function applyBackendPreference(useWebGpu: boolean): Promise<void> {
+  const targetBackend: RendererBackend = useWebGpu ? "webgpu" : "webgl";
+  if (targetBackend === activeRendererBackend || backendSwitchInFlight) {
+    return;
+  }
+
+  if (targetBackend === "webgpu" && !webGpuSupported) {
+    webGpuToggleElement.checked = false;
+    setStatus("WebGPU is not supported in this browser/GPU. Using WebGL.");
+    return;
+  }
+
+  backendSwitchInFlight = true;
+  const previousRenderer = renderer;
+  const previousViewState = previousRenderer.getViewState();
+  const currentScene = lastParsedScene;
+  const currentLabel = lastParsedSceneLabel;
+  const previousCanvas = canvasElement;
+  const replacementCanvas = cloneViewportCanvas(previousCanvas);
+
+  setStatus(`Switching renderer backend to ${targetBackend.toUpperCase()}...`);
+
+  try {
+    previousCanvas.replaceWith(replacementCanvas);
+    canvasElement = replacementCanvas;
+    attachCanvasInteractionListeners(canvasElement);
+
+    const nextRenderer =
+      targetBackend === "webgpu"
+        ? await createWebGpuRenderer(canvasElement)
+        : createWebGlRenderer(canvasElement);
+
+    renderer = nextRenderer;
+    activeRendererBackend = targetBackend;
+    webGpuToggleElement.checked = targetBackend === "webgpu";
+    isPanning = false;
+
+    previousRenderer.setFrameListener(null);
+    previousRenderer.dispose();
+
+    if (currentScene && currentLabel) {
+      const nextSceneStats = renderer.setScene(currentScene);
+      lastParsedSceneStats = nextSceneStats;
+      renderer.setViewState(previousViewState);
+      updateMetricsPanel(currentLabel, currentScene, nextSceneStats, 0, 0);
+      metricTimesTextElement.textContent = "parse -, upload - (backend switch)";
+
+      const sourceSuffix = lastLoadedSource?.kind === "parsed-zip" ? " | source: parsed data zip" : "";
+      baseStatus = `${formatSceneStatus(currentLabel, currentScene)}${sourceSuffix}`;
+      statusTextElement.textContent =
+        targetBackend === "webgpu"
+          ? `${baseStatus} | backend: WebGPU (preview)`
+          : `${baseStatus} | backend: WebGL`;
+    } else {
+      renderer.setViewState(previousViewState);
+      setStatus(`Switched to ${targetBackend.toUpperCase()} backend.`);
+    }
+  } catch (error) {
+    if (canvasElement === replacementCanvas) {
+      replacementCanvas.replaceWith(previousCanvas);
+      canvasElement = previousCanvas;
+      isPanning = false;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    webGpuToggleElement.checked = activeRendererBackend === "webgpu";
+    setStatus(`Failed to switch backend: ${message}`);
+  } finally {
+    backendSwitchInFlight = false;
+  }
+}
+
+function cloneViewportCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
+  const clone = source.cloneNode(false) as HTMLCanvasElement;
+  clone.width = source.width;
+  clone.height = source.height;
+  return clone;
+}
 
 function isPdfFile(file: File): boolean {
   const lowerName = file.name.toLowerCase();

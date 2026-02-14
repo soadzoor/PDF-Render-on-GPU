@@ -746,6 +746,12 @@ export interface SceneStats {
   textSegmentTextureHeight: number;
 }
 
+export interface ViewState {
+  cameraCenterX: number;
+  cameraCenterY: number;
+  zoom: number;
+}
+
 type FrameListener = (stats: DrawStats) => void;
 
 export class GpuFloorplanRenderer {
@@ -1229,6 +1235,31 @@ export class GpuFloorplanRenderer {
     return this.sceneStats;
   }
 
+  getViewState(): ViewState {
+    return {
+      cameraCenterX: this.cameraCenterX,
+      cameraCenterY: this.cameraCenterY,
+      zoom: this.zoom
+    };
+  }
+
+  setViewState(viewState: ViewState): void {
+    const nextCenterX = Number(viewState.cameraCenterX);
+    const nextCenterY = Number(viewState.cameraCenterY);
+    const nextZoom = Number(viewState.zoom);
+    if (!Number.isFinite(nextCenterX) || !Number.isFinite(nextCenterY) || !Number.isFinite(nextZoom)) {
+      return;
+    }
+
+    this.cameraCenterX = nextCenterX;
+    this.cameraCenterY = nextCenterY;
+    this.zoom = clamp(nextZoom, this.minZoom, this.maxZoom);
+    this.isPanInteracting = false;
+    this.panCacheValid = false;
+    this.needsVisibleSetUpdate = true;
+    this.requestFrame();
+  }
+
   fitToBounds(bounds: Bounds, paddingPixels = 64): void {
     const width = Math.max(bounds.maxX - bounds.minX, 1e-4);
     const height = Math.max(bounds.maxY - bounds.minY, 1e-4);
@@ -1246,6 +1277,15 @@ export class GpuFloorplanRenderer {
     this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
+  }
+
+  dispose(): void {
+    if (this.rafHandle !== 0) {
+      cancelAnimationFrame(this.rafHandle);
+      this.rafHandle = 0;
+    }
+    this.frameListener = null;
+    this.destroyPanCacheResources();
   }
 
   panByPixels(deltaX: number, deltaY: number): void {
