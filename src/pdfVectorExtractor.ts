@@ -132,12 +132,16 @@ const COVER_DIRECTION_SCALE = 2_000;
 const COVER_OFFSET_SCALE = 200;
 const COVER_INTERVAL_EPSILON = 0.05;
 const COVER_HALF_WIDTH_EPSILON = 1e-4;
-const TEXT_CUBIC_TO_QUAD_ERROR = 0.05;
-const MAX_TEXT_CUBIC_TO_QUAD_DEPTH = 10;
+const TEXT_CUBIC_TO_QUAD_ERROR = 0.015;
+const MAX_TEXT_CUBIC_TO_QUAD_DEPTH = 12;
 const TEXT_BOUNDS_EPSILON = 1e-4;
 const FONT_MATRIX_FALLBACK = 0.001;
 const TEXT_MIN_ALPHA = 1e-3;
 const FILL_MIN_ALPHA = 1e-3;
+const RASTER_TARGET_SCALE_PER_DPR = 3;
+const RASTER_MAX_SCALE = 4;
+const RASTER_MAX_DIMENSION = 4096;
+const RASTER_MAX_PIXELS = RASTER_MAX_DIMENSION * RASTER_MAX_DIMENSION;
 
 const FILL_RULE_NONZERO = 0;
 const FILL_RULE_EVEN_ODD = 1;
@@ -579,6 +583,30 @@ function resolveStandardFontDataUrl(): string | undefined {
     return undefined;
   }
   return new URL("pdfjs-standard-fonts/", window.location.href).toString();
+}
+
+function chooseRasterExtractionScale(baseWidth: number, baseHeight: number): number {
+  if (!Number.isFinite(baseWidth) || !Number.isFinite(baseHeight) || baseWidth <= 0 || baseHeight <= 0) {
+    return 1;
+  }
+
+  const dpr = typeof window === "undefined" ? 1 : Math.max(1, Number(window.devicePixelRatio) || 1);
+  let scale = Math.max(1, Math.min(RASTER_MAX_SCALE, dpr * RASTER_TARGET_SCALE_PER_DPR));
+
+  while (scale > 1) {
+    const width = Math.max(1, Math.ceil(baseWidth * scale));
+    const height = Math.max(1, Math.ceil(baseHeight * scale));
+    if (width <= RASTER_MAX_DIMENSION && height <= RASTER_MAX_DIMENSION && width * height <= RASTER_MAX_PIXELS) {
+      return scale;
+    }
+
+    scale *= 0.85;
+    if (scale < 1.05) {
+      return 1;
+    }
+  }
+
+  return 1;
 }
 
 function cloneState(state: GraphicsState): GraphicsState {
@@ -2257,17 +2285,22 @@ async function extractRasterLayerData(
     return createEmptyRasterLayerResult();
   }
 
-  const rawPageWidth = Math.max(1, Math.abs(pageLike.view[2] - pageLike.view[0]));
-  const rawPageHeight = Math.max(1, Math.abs(pageLike.view[3] - pageLike.view[1]));
-  const maxPageDim = Math.max(rawPageWidth, rawPageHeight);
-  const maxRasterDim = 4096;
-  const scale = maxPageDim > maxRasterDim ? maxRasterDim / maxPageDim : 1;
-
-  const viewport = pageLike.getViewport({
-    scale,
+  const baseViewport = pageLike.getViewport({
+    scale: 1,
     rotation: normalizeRotationDegrees(pageLike.rotate),
     dontFlip: false
   });
+  const rasterScale = chooseRasterExtractionScale(
+    Math.max(1, Math.ceil(baseViewport.width)),
+    Math.max(1, Math.ceil(baseViewport.height))
+  );
+  const viewport = rasterScale === 1
+    ? baseViewport
+    : pageLike.getViewport({
+      scale: rasterScale,
+      rotation: normalizeRotationDegrees(pageLike.rotate),
+      dontFlip: false
+    });
 
   const width = Math.max(1, Math.ceil(viewport.width));
   const height = Math.max(1, Math.ceil(viewport.height));
