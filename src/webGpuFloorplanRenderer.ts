@@ -1,5 +1,5 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
-import type { DrawStats, SceneStats, ViewState } from "./gpuFloorplanRenderer";
+import type { DrawStats, SceneStats, ViewState } from "./webGlFloorplanRenderer";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
 

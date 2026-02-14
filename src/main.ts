@@ -4,7 +4,7 @@ import JSZip from "jszip";
 import { GlobalWorkerOptions } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
-import { GpuFloorplanRenderer, type DrawStats, type SceneStats, type ViewState } from "./gpuFloorplanRenderer";
+import { WebGlFloorplanRenderer, type DrawStats, type SceneStats, type ViewState } from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 import {
   composeVectorScenesInGrid,
@@ -190,7 +190,7 @@ function initializeRendererCommon(rendererApi: RendererApi): void {
 }
 
 function createWebGlRenderer(targetCanvas: HTMLCanvasElement): RendererApi {
-  const next = new GpuFloorplanRenderer(targetCanvas);
+  const next = new WebGlFloorplanRenderer(targetCanvas);
   initializeRendererCommon(next);
   return next;
 }

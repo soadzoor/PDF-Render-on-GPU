@@ -902,7 +902,7 @@ interface RasterLayerGpu {
   matrix: Float32Array;
 }
 
-export class GpuFloorplanRenderer {
+export class WebGlFloorplanRenderer {
   private readonly canvas: HTMLCanvasElement;
 
   private readonly gl: WebGL2RenderingContext;
