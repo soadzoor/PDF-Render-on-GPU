@@ -1443,7 +1443,7 @@ export class WebGpuFloorplanRenderer {
         {
           binding: 0,
           visibility: gpuShaderStage.FRAGMENT,
-          sampler: { type: "non-filtering" }
+          sampler: { type: "filtering" }
         },
         {
           binding: 1,
@@ -1511,8 +1511,8 @@ export class WebGpuFloorplanRenderer {
     );
 
     this.panCacheSampler = this.gpuDevice.createSampler({
-      magFilter: "nearest",
-      minFilter: "nearest",
+      magFilter: "linear",
+      minFilter: "linear",
       mipmapFilter: "nearest",
       addressModeU: "clamp-to-edge",
       addressModeV: "clamp-to-edge"
@@ -2271,7 +2271,12 @@ export class WebGpuFloorplanRenderer {
   }
 
   private renderDirectToScreen(): void {
-    const useVectorMinify = this.shouldUseVectorMinifyPath() && this.ensureVectorMinifyResources();
+    let useVectorMinify = this.shouldUseVectorMinifyPath() && this.ensureVectorMinifyResources();
+    // Keep still/moving appearance consistent on large pan-optimized scenes.
+    // Pan-cache path renders vectors directly; matching that avoids thickness shifts while camera moves.
+    if (this.panOptimizationEnabled && this.segmentCount >= PAN_CACHE_MIN_SEGMENTS) {
+      useVectorMinify = false;
+    }
 
     if (this.needsVisibleSetUpdate) {
       if (useVectorMinify) {

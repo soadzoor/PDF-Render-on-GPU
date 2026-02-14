@@ -1791,6 +1791,11 @@ export class WebGlFloorplanRenderer {
   private renderDirectToScreen(): void {
     const gl = this.gl;
     let useVectorMinify = this.shouldUseVectorMinifyPath() && this.ensureVectorMinifyResources();
+    // Keep still/moving appearance consistent on large pan-optimized scenes.
+    // Pan-cache path renders vectors directly; matching that avoids thickness shifts while camera moves.
+    if (this.panOptimizationEnabled && this.segmentCount >= PAN_CACHE_MIN_SEGMENTS) {
+      useVectorMinify = false;
+    }
 
     // WebGL drivers can produce a transient thin/missing first composite frame
     // right after creating the minify target. Warm up with one direct frame.
@@ -3331,8 +3336,8 @@ function configureFloatTexture(gl: WebGL2RenderingContext): void {
 }
 
 function configureColorTexture(gl: WebGL2RenderingContext): void {
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 }
