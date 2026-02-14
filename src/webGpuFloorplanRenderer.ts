@@ -17,6 +17,14 @@ const PAN_CACHE_MIN_SEGMENTS = 300_000;
 const PAN_CACHE_OVERSCAN_FACTOR = 1.8;
 const PAN_CACHE_BORDER_PX = 96;
 const PAN_CACHE_ZOOM_EPSILON = 1e-5;
+const CAMERA_DAMPING_POSITION_RATE = 24;
+const CAMERA_DAMPING_ZOOM_RATE = 24;
+const CAMERA_DAMPING_POSITION_EPSILON = 1e-4;
+const CAMERA_DAMPING_ZOOM_EPSILON = 1e-5;
+const CAMERA_DAMPING_MAX_DT_MS = 64;
+const PAN_INERTIA_MIN_SPEED_WORLD_PER_SEC = 5;
+const PAN_MAX_SPEED_WORLD_PER_SEC = 20_000;
+const PAN_INERTIA_VELOCITY_STALE_MS = 120;
 const CLEAR_COLOR = {
   r: 160 / 255,
   g: 169 / 255,
@@ -1074,6 +1082,36 @@ export class WebGpuFloorplanRenderer {
 
   private zoom = 1;
 
+  private targetCameraCenterX = 0;
+
+  private targetCameraCenterY = 0;
+
+  private targetZoom = 1;
+
+  private lastCameraAnimationTimeMs = 0;
+
+  private hasZoomAnchor = false;
+
+  private zoomAnchorClientX = 0;
+
+  private zoomAnchorClientY = 0;
+
+  private zoomAnchorWorldX = 0;
+
+  private zoomAnchorWorldY = 0;
+
+  private panVelocityWorldX = 0;
+
+  private panVelocityWorldY = 0;
+
+  private lastPanVelocityUpdateTimeMs = 0;
+
+  private lastPanFrameCameraX = 0;
+
+  private lastPanFrameCameraY = 0;
+
+  private lastPanFrameTimeMs = 0;
+
   private minZoom = 0.01;
 
   private maxZoom = 8_192;
@@ -1505,12 +1543,36 @@ export class WebGpuFloorplanRenderer {
   }
 
   beginPanInteraction(): void {
+    this.syncCameraTargetsToCurrent();
+    this.panVelocityWorldX = 0;
+    this.panVelocityWorldY = 0;
+    this.lastPanVelocityUpdateTimeMs = 0;
+    this.lastPanFrameCameraX = this.cameraCenterX;
+    this.lastPanFrameCameraY = this.cameraCenterY;
+    this.lastPanFrameTimeMs = 0;
     this.isPanInteracting = true;
     this.markInteraction();
   }
 
   endPanInteraction(): void {
     this.isPanInteracting = false;
+    const now = performance.now();
+    const velocityIsFresh =
+      this.lastPanVelocityUpdateTimeMs > 0 &&
+      now - this.lastPanVelocityUpdateTimeMs <= PAN_INERTIA_VELOCITY_STALE_MS;
+    const speed = velocityIsFresh ? Math.hypot(this.panVelocityWorldX, this.panVelocityWorldY) : 0;
+    if (Number.isFinite(speed) && speed >= PAN_INERTIA_MIN_SPEED_WORLD_PER_SEC) {
+      this.targetCameraCenterX = this.cameraCenterX + this.panVelocityWorldX / CAMERA_DAMPING_POSITION_RATE;
+      this.targetCameraCenterY = this.cameraCenterY + this.panVelocityWorldY / CAMERA_DAMPING_POSITION_RATE;
+      this.lastCameraAnimationTimeMs = 0;
+    } else {
+      this.targetCameraCenterX = this.cameraCenterX;
+      this.targetCameraCenterY = this.cameraCenterY;
+    }
+    this.panVelocityWorldX = 0;
+    this.panVelocityWorldY = 0;
+    this.lastPanVelocityUpdateTimeMs = 0;
+    this.lastPanFrameTimeMs = 0;
     this.markInteraction();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
@@ -1790,6 +1852,7 @@ export class WebGpuFloorplanRenderer {
 
     this.minZoom = 0.01;
     this.maxZoom = 8_192;
+    this.syncCameraTargetsToCurrent();
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
 
@@ -1818,7 +1881,13 @@ export class WebGpuFloorplanRenderer {
 
     this.cameraCenterX = nextCenterX;
     this.cameraCenterY = nextCenterY;
-    this.zoom = clamp(nextZoom, this.minZoom, this.maxZoom);
+    const resolvedZoom = clamp(nextZoom, this.minZoom, this.maxZoom);
+    this.zoom = resolvedZoom;
+    this.targetCameraCenterX = nextCenterX;
+    this.targetCameraCenterY = nextCenterY;
+    this.targetZoom = resolvedZoom;
+    this.lastCameraAnimationTimeMs = 0;
+    this.hasZoomAnchor = false;
     this.isPanInteracting = false;
     this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
@@ -1832,11 +1901,17 @@ export class WebGpuFloorplanRenderer {
     const viewWidth = Math.max(1, this.canvas.width - paddingPixels * 2);
     const viewHeight = Math.max(1, this.canvas.height - paddingPixels * 2);
 
-    this.zoom = Math.min(viewWidth / width, viewHeight / height);
-    this.zoom = clamp(this.zoom, this.minZoom, this.maxZoom);
-
-    this.cameraCenterX = (bounds.minX + bounds.maxX) * 0.5;
-    this.cameraCenterY = (bounds.minY + bounds.maxY) * 0.5;
+    const nextZoom = clamp(Math.min(viewWidth / width, viewHeight / height), this.minZoom, this.maxZoom);
+    const nextCenterX = (bounds.minX + bounds.maxX) * 0.5;
+    const nextCenterY = (bounds.minY + bounds.maxY) * 0.5;
+    this.zoom = nextZoom;
+    this.cameraCenterX = nextCenterX;
+    this.cameraCenterY = nextCenterY;
+    this.targetZoom = nextZoom;
+    this.targetCameraCenterX = nextCenterX;
+    this.targetCameraCenterY = nextCenterY;
+    this.lastCameraAnimationTimeMs = 0;
+    this.hasZoomAnchor = false;
     this.isPanInteracting = false;
 
     this.panCacheValid = false;
@@ -1850,8 +1925,15 @@ export class WebGpuFloorplanRenderer {
     }
 
     this.markInteraction();
-    this.cameraCenterX -= deltaX / this.zoom;
-    this.cameraCenterY += deltaY / this.zoom;
+    this.hasZoomAnchor = false;
+    const worldDeltaX = -deltaX / this.zoom;
+    const worldDeltaY = deltaY / this.zoom;
+
+    // While dragging, camera should follow pointer immediately.
+    this.cameraCenterX += worldDeltaX;
+    this.cameraCenterY += worldDeltaY;
+    this.targetCameraCenterX = this.cameraCenterX;
+    this.targetCameraCenterY = this.cameraCenterY;
 
     this.needsVisibleSetUpdate = true;
     this.requestFrame();
@@ -1861,18 +1943,30 @@ export class WebGpuFloorplanRenderer {
     const clampedFactor = clamp(zoomFactor, 0.1, 10);
     this.isPanInteracting = false;
     this.markInteraction();
-    const before = this.clientToWorld(clientX, clientY);
-
-    const nextZoom = clamp(this.zoom * clampedFactor, this.minZoom, this.maxZoom);
-    this.zoom = nextZoom;
-
-    const after = this.clientToWorld(clientX, clientY);
-
-    this.cameraCenterX += before.x - after.x;
-    this.cameraCenterY += before.y - after.y;
+    const anchorWorld = this.clientToWorld(clientX, clientY);
+    const nextZoom = clamp(this.targetZoom * clampedFactor, this.minZoom, this.maxZoom);
+    this.hasZoomAnchor = true;
+    this.zoomAnchorClientX = clientX;
+    this.zoomAnchorClientY = clientY;
+    this.zoomAnchorWorldX = anchorWorld.x;
+    this.zoomAnchorWorldY = anchorWorld.y;
+    this.targetZoom = nextZoom;
+    const targetCenter = this.computeCameraCenterForAnchor(
+      this.zoomAnchorClientX,
+      this.zoomAnchorClientY,
+      this.zoomAnchorWorldX,
+      this.zoomAnchorWorldY,
+      nextZoom
+    );
+    this.targetCameraCenterX = targetCenter.x;
+    this.targetCameraCenterY = targetCenter.y;
 
     this.panCacheValid = false;
     this.needsVisibleSetUpdate = true;
+    this.panVelocityWorldX = 0;
+    this.panVelocityWorldY = 0;
+    this.lastPanVelocityUpdateTimeMs = 0;
+    this.lastPanFrameTimeMs = 0;
     this.requestFrame();
   }
 
@@ -1995,13 +2089,15 @@ export class WebGpuFloorplanRenderer {
       return;
     }
 
-    this.rafHandle = requestAnimationFrame(() => {
+    this.rafHandle = requestAnimationFrame((timestamp) => {
       this.rafHandle = 0;
-      this.render();
+      this.render(timestamp);
     });
   }
 
-  private render(): void {
+  private render(timestamp: number = performance.now()): void {
+    const isCameraAnimating = this.updateCameraWithDamping(timestamp);
+    this.updatePanReleaseVelocitySample(timestamp);
     if (
       !this.scene ||
       (this.segmentCount === 0 &&
@@ -2017,19 +2113,35 @@ export class WebGpuFloorplanRenderer {
         usedCulling: false,
         zoom: this.zoom
       });
+      if (isCameraAnimating) {
+        this.requestFrame();
+      }
       return;
     }
 
-    if (this.shouldUsePanCache()) {
+    if (this.shouldUsePanCache(isCameraAnimating)) {
       this.renderWithPanCache();
-      return;
+    } else {
+      this.renderDirectToScreen();
     }
 
-    this.renderDirectToScreen();
+    if (isCameraAnimating) {
+      this.requestFrame();
+    }
   }
 
-  private shouldUsePanCache(): boolean {
-    return this.panOptimizationEnabled && this.isPanInteracting && this.segmentCount >= PAN_CACHE_MIN_SEGMENTS;
+  private shouldUsePanCache(isCameraAnimating: boolean): boolean {
+    if (!this.panOptimizationEnabled || this.segmentCount < PAN_CACHE_MIN_SEGMENTS) {
+      return false;
+    }
+    if (this.isPanInteracting) {
+      return true;
+    }
+    if (!isCameraAnimating) {
+      return false;
+    }
+    // Keep cache active through pan damping tail; avoid zoom damping where cache refreshes each frame.
+    return Math.abs(this.targetZoom - this.zoom) <= CAMERA_DAMPING_ZOOM_EPSILON;
   }
 
   private renderDirectToScreen(): void {
@@ -2807,6 +2919,16 @@ export class WebGpuFloorplanRenderer {
   }
 
   private clientToWorld(clientX: number, clientY: number): { x: number; y: number } {
+    return this.clientToWorldAt(clientX, clientY, this.cameraCenterX, this.cameraCenterY, this.zoom);
+  }
+
+  private clientToWorldAt(
+    clientX: number,
+    clientY: number,
+    cameraCenterX: number,
+    cameraCenterY: number,
+    zoom: number
+  ): { x: number; y: number } {
     const rect = this.canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
 
@@ -2814,8 +2936,142 @@ export class WebGpuFloorplanRenderer {
     const pixelY = (rect.bottom - clientY) * dpr;
 
     return {
-      x: (pixelX - this.canvas.width * 0.5) / this.zoom + this.cameraCenterX,
-      y: (pixelY - this.canvas.height * 0.5) / this.zoom + this.cameraCenterY
+      x: (pixelX - this.canvas.width * 0.5) / zoom + cameraCenterX,
+      y: (pixelY - this.canvas.height * 0.5) / zoom + cameraCenterY
+    };
+  }
+
+  private syncCameraTargetsToCurrent(): void {
+    this.targetCameraCenterX = this.cameraCenterX;
+    this.targetCameraCenterY = this.cameraCenterY;
+    this.targetZoom = this.zoom;
+    this.lastCameraAnimationTimeMs = 0;
+    this.hasZoomAnchor = false;
+  }
+
+  private updatePanReleaseVelocitySample(timestamp: number): void {
+    if (!this.isPanInteracting) {
+      this.lastPanFrameTimeMs = 0;
+      return;
+    }
+
+    if (this.lastPanFrameTimeMs > 0) {
+      const deltaMs = timestamp - this.lastPanFrameTimeMs;
+      if (deltaMs > 0.1) {
+        const deltaX = this.cameraCenterX - this.lastPanFrameCameraX;
+        const deltaY = this.cameraCenterY - this.lastPanFrameCameraY;
+        let velocityX = (deltaX * 1000) / deltaMs;
+        let velocityY = (deltaY * 1000) / deltaMs;
+        const speed = Math.hypot(velocityX, velocityY);
+        if (Number.isFinite(speed) && speed >= PAN_INERTIA_MIN_SPEED_WORLD_PER_SEC) {
+          if (speed > PAN_MAX_SPEED_WORLD_PER_SEC) {
+            const scale = PAN_MAX_SPEED_WORLD_PER_SEC / speed;
+            velocityX *= scale;
+            velocityY *= scale;
+          }
+          this.panVelocityWorldX = velocityX;
+          this.panVelocityWorldY = velocityY;
+          this.lastPanVelocityUpdateTimeMs = timestamp;
+        }
+      }
+    }
+
+    this.lastPanFrameCameraX = this.cameraCenterX;
+    this.lastPanFrameCameraY = this.cameraCenterY;
+    this.lastPanFrameTimeMs = timestamp;
+  }
+
+  private updateCameraWithDamping(timestamp: number): boolean {
+    let needsPosition =
+      Math.abs(this.targetCameraCenterX - this.cameraCenterX) > CAMERA_DAMPING_POSITION_EPSILON ||
+      Math.abs(this.targetCameraCenterY - this.cameraCenterY) > CAMERA_DAMPING_POSITION_EPSILON;
+    let needsZoom = Math.abs(this.targetZoom - this.zoom) > CAMERA_DAMPING_ZOOM_EPSILON;
+    if (!needsPosition && !needsZoom) {
+      this.hasZoomAnchor = false;
+      this.lastCameraAnimationTimeMs = timestamp;
+      return false;
+    }
+
+    if (this.lastCameraAnimationTimeMs <= 0) {
+      this.lastCameraAnimationTimeMs = timestamp - 16;
+    }
+
+    const dtMs = clamp(timestamp - this.lastCameraAnimationTimeMs, 0, CAMERA_DAMPING_MAX_DT_MS);
+    this.lastCameraAnimationTimeMs = timestamp;
+    const dtSeconds = dtMs / 1000;
+    const positionLerp = 1 - Math.exp(-CAMERA_DAMPING_POSITION_RATE * dtSeconds);
+    const zoomLerp = 1 - Math.exp(-CAMERA_DAMPING_ZOOM_RATE * dtSeconds);
+
+    if (needsZoom) {
+      this.zoom += (this.targetZoom - this.zoom) * zoomLerp;
+      if (Math.abs(this.targetZoom - this.zoom) <= CAMERA_DAMPING_ZOOM_EPSILON) {
+        this.zoom = this.targetZoom;
+      }
+    }
+
+    if (this.hasZoomAnchor) {
+      // Compute center from the post-zoom value so the world point under cursor stays fixed every frame.
+      const anchoredCurrent = this.computeCameraCenterForAnchor(
+        this.zoomAnchorClientX,
+        this.zoomAnchorClientY,
+        this.zoomAnchorWorldX,
+        this.zoomAnchorWorldY,
+        this.zoom
+      );
+      const anchoredTarget = this.computeCameraCenterForAnchor(
+        this.zoomAnchorClientX,
+        this.zoomAnchorClientY,
+        this.zoomAnchorWorldX,
+        this.zoomAnchorWorldY,
+        this.targetZoom
+      );
+      this.cameraCenterX = anchoredCurrent.x;
+      this.cameraCenterY = anchoredCurrent.y;
+      this.targetCameraCenterX = anchoredTarget.x;
+      this.targetCameraCenterY = anchoredTarget.y;
+      if (!needsZoom) {
+        this.hasZoomAnchor = false;
+      }
+      needsPosition = false;
+    } else if (needsPosition) {
+      this.cameraCenterX += (this.targetCameraCenterX - this.cameraCenterX) * positionLerp;
+      this.cameraCenterY += (this.targetCameraCenterY - this.cameraCenterY) * positionLerp;
+      if (Math.abs(this.targetCameraCenterX - this.cameraCenterX) <= CAMERA_DAMPING_POSITION_EPSILON) {
+        this.cameraCenterX = this.targetCameraCenterX;
+      }
+      if (Math.abs(this.targetCameraCenterY - this.cameraCenterY) <= CAMERA_DAMPING_POSITION_EPSILON) {
+        this.cameraCenterY = this.targetCameraCenterY;
+      }
+    }
+
+    this.markInteraction();
+    this.needsVisibleSetUpdate = true;
+
+    needsPosition =
+      Math.abs(this.targetCameraCenterX - this.cameraCenterX) > CAMERA_DAMPING_POSITION_EPSILON ||
+      Math.abs(this.targetCameraCenterY - this.cameraCenterY) > CAMERA_DAMPING_POSITION_EPSILON;
+    needsZoom = Math.abs(this.targetZoom - this.zoom) > CAMERA_DAMPING_ZOOM_EPSILON;
+
+    return (
+      needsPosition ||
+      needsZoom
+    );
+  }
+
+  private computeCameraCenterForAnchor(
+    clientX: number,
+    clientY: number,
+    worldX: number,
+    worldY: number,
+    zoom: number
+  ): { x: number; y: number } {
+    const rect = this.canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const pixelX = (clientX - rect.left) * dpr;
+    const pixelY = (rect.bottom - clientY) * dpr;
+    return {
+      x: worldX - (pixelX - this.canvas.width * 0.5) / zoom,
+      y: worldY - (pixelY - this.canvas.height * 0.5) / zoom
     };
   }
 }
