@@ -229,6 +229,7 @@ let parsedPdfPageCache: ParsedPdfPageCache | null = null;
 
 interface LoadPdfOptions {
   preserveView?: boolean;
+  autoMaxPagesPerRow?: boolean;
 }
 
 interface ExportTextureEntry {
@@ -601,7 +602,7 @@ async function loadPdfFile(file: File): Promise<void> {
   const bytes = cloneSourceBytes(buffer);
   lastLoadedSource = { kind: "pdf", bytes, label: file.name };
   parsedPdfPageCache = null;
-  await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
+  await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false, autoMaxPagesPerRow: true });
 }
 
 async function loadParsedDataZipFile(file: File): Promise<void> {
@@ -622,24 +623,28 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
   try {
     let scene: VectorScene;
     let parseMs = 0;
-    const requestedPagesPerRow = readMaxPagesPerRowInput();
+    let pagesPerRow = readMaxPagesPerRowInput();
 
     if (cachedPageScenes) {
+      if (options.autoMaxPagesPerRow) {
+        pagesPerRow = computeAutoPagesPerRow(cachedPageScenes.length);
+        maxPagesPerRowInputElement.value = String(pagesPerRow);
+      }
       const composeStart = performance.now();
       setParsingLoader(false);
       setStatus(
-        `Rearranging ${label}... (pages/row ${requestedPagesPerRow}, using cached parsed pages)`
+        `Rearranging ${label}... (pages/row ${pagesPerRow}, using cached parsed pages)`
       );
-      scene = composeVectorScenesInGrid(cachedPageScenes, requestedPagesPerRow);
+      scene = composeVectorScenesInGrid(cachedPageScenes, pagesPerRow);
       parseMs = performance.now() - composeStart;
       console.log(
-        `[Page grid] ${label}: recomposed ${cachedPageScenes.length.toLocaleString()} cached page scenes at ${requestedPagesPerRow.toLocaleString()} pages/row in ${parseMs.toFixed(1)} ms`
+        `[Page grid] ${label}: recomposed ${cachedPageScenes.length.toLocaleString()} cached page scenes at ${pagesPerRow.toLocaleString()} pages/row in ${parseMs.toFixed(1)} ms`
       );
     } else {
       const parseStart = performance.now();
       setParsingLoader(true);
       setStatus(
-        `Parsing ${label} with PDF.js... (pages/row ${requestedPagesPerRow}, merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
+        `Parsing ${label} with PDF.js... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
       const pageScenes = await extractPdfPageScenes(buffer, extractionOptions);
       parseMs = performance.now() - parseStart;
@@ -652,10 +657,15 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
         return;
       }
 
-      scene = composeVectorScenesInGrid(pageScenes, requestedPagesPerRow);
+      if (options.autoMaxPagesPerRow) {
+        pagesPerRow = computeAutoPagesPerRow(pageScenes.length);
+        maxPagesPerRowInputElement.value = String(pagesPerRow);
+      }
+
+      scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
       storeCachedPdfPageScenes(label, pageSceneOptionsKey, pageScenes);
       console.log(
-        `[Page grid] ${label}: parsed ${pageScenes.length.toLocaleString()} pages in ${parseMs.toFixed(1)} ms, arranged ${requestedPagesPerRow.toLocaleString()}/row`
+        `[Page grid] ${label}: parsed ${pageScenes.length.toLocaleString()} pages in ${parseMs.toFixed(1)} ms, arranged ${pagesPerRow.toLocaleString()}/row`
       );
     }
 
@@ -791,20 +801,14 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
 function getExtractionOptions(): VectorExtractOptions {
   return {
     enableSegmentMerge: segmentMergeToggleElement.checked,
-    enableInvisibleCull: invisibleCullToggleElement.checked,
-    maxPagesPerRow: readMaxPagesPerRowInput()
+    enableInvisibleCull: invisibleCullToggleElement.checked
   };
 }
 
 function buildPdfPageCacheKey(options: VectorExtractOptions): string {
   const mergeEnabled = options.enableSegmentMerge !== false;
   const invisibleCullEnabled = options.enableInvisibleCull !== false;
-  const rawMaxPages = Math.trunc(Number(options.maxPages));
-  const maxPages =
-    Number.isFinite(rawMaxPages) && rawMaxPages >= 1
-      ? rawMaxPages
-      : Number.MAX_SAFE_INTEGER;
-  return `merge:${mergeEnabled ? 1 : 0}|cull:${invisibleCullEnabled ? 1 : 0}|maxPages:${maxPages}`;
+  return `merge:${mergeEnabled ? 1 : 0}|cull:${invisibleCullEnabled ? 1 : 0}`;
 }
 
 function getCachedPdfPageScenes(label: string, optionsKey: string): VectorScene[] | null {
@@ -1920,7 +1924,10 @@ async function loadDefaultSample(): Promise<void> {
     const buffer = await response.arrayBuffer();
     const bytes = cloneSourceBytes(buffer);
     lastLoadedSource = { kind: "pdf", bytes, label: "SimiValleyBehavioralHealth_SR_20180403.pdf" };
-    await loadPdfBuffer(createParseBuffer(bytes), "SimiValleyBehavioralHealth_SR_20180403.pdf", { preserveView: false });
+    await loadPdfBuffer(createParseBuffer(bytes), "SimiValleyBehavioralHealth_SR_20180403.pdf", {
+      preserveView: false,
+      autoMaxPagesPerRow: true
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Could not load default sample: ${message}`);
@@ -1944,6 +1951,11 @@ function clamp(value: number, min: number, max: number): number {
     return max;
   }
   return value;
+}
+
+function computeAutoPagesPerRow(pageCount: number): number {
+  const safePageCount = Math.max(1, Math.trunc(pageCount));
+  return clamp(Math.ceil(Math.sqrt(safePageCount)), 1, 100);
 }
 
 void loadDefaultSample();
