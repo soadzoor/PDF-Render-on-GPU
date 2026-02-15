@@ -472,6 +472,24 @@ webGpuToggleElement.addEventListener("change", () => {
 let isPanning = false;
 let previousX = 0;
 let previousY = 0;
+const activeTouchPointers = new Map<number, { x: number; y: number }>();
+let touchPanPointerId: number | null = null;
+let touchPinchActive = false;
+let touchPreviousDistance = 0;
+let touchPreviousCenterX = 0;
+let touchPreviousCenterY = 0;
+
+function resetGlobalPointerInteractionState(): void {
+  isPanning = false;
+  previousX = 0;
+  previousY = 0;
+  activeTouchPointers.clear();
+  touchPanPointerId = null;
+  touchPinchActive = false;
+  touchPreviousDistance = 0;
+  touchPreviousCenterX = 0;
+  touchPreviousCenterY = 0;
+}
 
 attachCanvasInteractionListeners(canvasElement);
 
@@ -480,15 +498,200 @@ window.addEventListener("resize", () => {
 });
 
 function attachCanvasInteractionListeners(targetCanvas: HTMLCanvasElement): void {
-  targetCanvas.addEventListener("pointerdown", (event) => {
-    isPanning = true;
-    renderer.beginPanInteraction();
+  function resetTouchGestureState(): void {
+    activeTouchPointers.clear();
+    touchPanPointerId = null;
+    touchPinchActive = false;
+    touchPreviousDistance = 0;
+    touchPreviousCenterX = 0;
+    touchPreviousCenterY = 0;
+  }
+
+  function resetPointerGestureState(endPan: boolean): void {
+    if (endPan && isPanning) {
+      renderer.endPanInteraction();
+    }
+    resetTouchGestureState();
+    resetGlobalPointerInteractionState();
+  }
+
+  function getTouchPinchInfo(): { distance: number; centerX: number; centerY: number } | null {
+    if (activeTouchPointers.size < 2) {
+      return null;
+    }
+    const iter = activeTouchPointers.values();
+    const first = iter.next().value as { x: number; y: number } | undefined;
+    const second = iter.next().value as { x: number; y: number } | undefined;
+    if (!first || !second) {
+      return null;
+    }
+
+    const dx = second.x - first.x;
+    const dy = second.y - first.y;
+    return {
+      distance: Math.hypot(dx, dy),
+      centerX: (first.x + second.x) * 0.5,
+      centerY: (first.y + second.y) * 0.5
+    };
+  }
+
+  function releasePointerCaptureIfHeld(pointerId: number): void {
+    if (!targetCanvas.hasPointerCapture(pointerId)) {
+      return;
+    }
+    try {
+      targetCanvas.releasePointerCapture(pointerId);
+    } catch {
+      // Ignore release failures when pointer capture is already gone.
+    }
+  }
+
+  function handleTouchPointerMove(event: PointerEvent): void {
+    if (!activeTouchPointers.has(event.pointerId) || !isPanning) {
+      return;
+    }
+
+    activeTouchPointers.set(event.pointerId, {
+      x: event.clientX,
+      y: event.clientY
+    });
+
+    if (activeTouchPointers.size >= 2) {
+      const pinchInfo = getTouchPinchInfo();
+      if (!pinchInfo) {
+        return;
+      }
+
+      if (!touchPinchActive) {
+        touchPinchActive = true;
+        touchPanPointerId = null;
+        touchPreviousDistance = Math.max(pinchInfo.distance, 1e-3);
+        touchPreviousCenterX = pinchInfo.centerX;
+        touchPreviousCenterY = pinchInfo.centerY;
+        return;
+      }
+
+      const previousDistance = Math.max(touchPreviousDistance, 1e-3);
+      const nextDistance = Math.max(pinchInfo.distance, 1e-3);
+      const zoomFactor = nextDistance / previousDistance;
+
+      const centerDeltaX = pinchInfo.centerX - touchPreviousCenterX;
+      const centerDeltaY = pinchInfo.centerY - touchPreviousCenterY;
+      if (centerDeltaX !== 0 || centerDeltaY !== 0) {
+        renderer.panByPixels(centerDeltaX, centerDeltaY);
+      }
+
+      if (Number.isFinite(zoomFactor) && Math.abs(zoomFactor - 1) > 1e-4) {
+        renderer.zoomAtClientPoint(pinchInfo.centerX, pinchInfo.centerY, zoomFactor);
+      }
+
+      touchPreviousDistance = nextDistance;
+      touchPreviousCenterX = pinchInfo.centerX;
+      touchPreviousCenterY = pinchInfo.centerY;
+      return;
+    }
+
+    if (touchPanPointerId === null) {
+      touchPanPointerId = event.pointerId;
+      previousX = event.clientX;
+      previousY = event.clientY;
+      touchPinchActive = false;
+      touchPreviousDistance = 0;
+      return;
+    }
+
+    if (event.pointerId !== touchPanPointerId) {
+      return;
+    }
+
+    const deltaX = event.clientX - previousX;
+    const deltaY = event.clientY - previousY;
+
     previousX = event.clientX;
     previousY = event.clientY;
+
+    renderer.panByPixels(deltaX, deltaY);
+  }
+
+  function handleTouchPointerEnd(event: PointerEvent): void {
+    activeTouchPointers.delete(event.pointerId);
+    releasePointerCaptureIfHeld(event.pointerId);
+
+    if (activeTouchPointers.size >= 2) {
+      const pinchInfo = getTouchPinchInfo();
+      if (pinchInfo) {
+        touchPinchActive = true;
+        touchPanPointerId = null;
+        touchPreviousDistance = Math.max(pinchInfo.distance, 1e-3);
+        touchPreviousCenterX = pinchInfo.centerX;
+        touchPreviousCenterY = pinchInfo.centerY;
+      }
+      return;
+    }
+
+    if (activeTouchPointers.size === 1) {
+      const remaining = activeTouchPointers.entries().next().value as [number, { x: number; y: number }] | undefined;
+      if (remaining) {
+        touchPanPointerId = remaining[0];
+        previousX = remaining[1].x;
+        previousY = remaining[1].y;
+      } else {
+        touchPanPointerId = null;
+      }
+      touchPinchActive = false;
+      touchPreviousDistance = 0;
+      touchPreviousCenterX = 0;
+      touchPreviousCenterY = 0;
+      return;
+    }
+
+    resetPointerGestureState(true);
+  }
+
+  targetCanvas.addEventListener("pointerdown", (event) => {
+    if (!isPanning) {
+      isPanning = true;
+      renderer.beginPanInteraction();
+    }
+
+    if (event.pointerType === "touch") {
+      activeTouchPointers.set(event.pointerId, {
+        x: event.clientX,
+        y: event.clientY
+      });
+
+      if (activeTouchPointers.size === 1) {
+        touchPanPointerId = event.pointerId;
+        touchPinchActive = false;
+        touchPreviousDistance = 0;
+        touchPreviousCenterX = event.clientX;
+        touchPreviousCenterY = event.clientY;
+        previousX = event.clientX;
+        previousY = event.clientY;
+      } else {
+        const pinchInfo = getTouchPinchInfo();
+        if (pinchInfo) {
+          touchPinchActive = true;
+          touchPanPointerId = null;
+          touchPreviousDistance = Math.max(pinchInfo.distance, 1e-3);
+          touchPreviousCenterX = pinchInfo.centerX;
+          touchPreviousCenterY = pinchInfo.centerY;
+        }
+      }
+    } else {
+      previousX = event.clientX;
+      previousY = event.clientY;
+    }
+
     targetCanvas.setPointerCapture(event.pointerId);
   });
 
   targetCanvas.addEventListener("pointermove", (event) => {
+    if (event.pointerType === "touch") {
+      handleTouchPointerMove(event);
+      return;
+    }
+
     if (!isPanning) {
       return;
     }
@@ -503,15 +706,39 @@ function attachCanvasInteractionListeners(targetCanvas: HTMLCanvasElement): void
   });
 
   targetCanvas.addEventListener("pointerup", (event) => {
-    isPanning = false;
-    renderer.endPanInteraction();
-    targetCanvas.releasePointerCapture(event.pointerId);
+    if (event.pointerType === "touch") {
+      handleTouchPointerEnd(event);
+      return;
+    }
+
+    resetPointerGestureState(true);
+    releasePointerCaptureIfHeld(event.pointerId);
   });
 
   targetCanvas.addEventListener("pointercancel", (event) => {
-    isPanning = false;
-    renderer.endPanInteraction();
-    targetCanvas.releasePointerCapture(event.pointerId);
+    if (event.pointerType === "touch") {
+      handleTouchPointerEnd(event);
+      return;
+    }
+
+    resetPointerGestureState(true);
+    releasePointerCaptureIfHeld(event.pointerId);
+  });
+
+  targetCanvas.addEventListener("lostpointercapture", (event) => {
+    if (event.pointerType === "touch") {
+      if (activeTouchPointers.has(event.pointerId)) {
+        activeTouchPointers.delete(event.pointerId);
+      }
+      if (activeTouchPointers.size === 0) {
+        resetPointerGestureState(true);
+      }
+      return;
+    }
+
+    if (isPanning) {
+      resetPointerGestureState(true);
+    }
   });
 
   targetCanvas.addEventListener(
@@ -624,7 +851,7 @@ async function applyBackendPreference(useWebGpu: boolean): Promise<void> {
     renderer = nextRenderer;
     activeRendererBackend = targetBackend;
     webGpuToggleElement.checked = targetBackend === "webgpu";
-    isPanning = false;
+    resetGlobalPointerInteractionState();
 
     previousRenderer.setFrameListener(null);
     previousRenderer.dispose();
@@ -650,7 +877,7 @@ async function applyBackendPreference(useWebGpu: boolean): Promise<void> {
     if (canvasElement === replacementCanvas) {
       replacementCanvas.replaceWith(previousCanvas);
       canvasElement = previousCanvas;
-      isPanning = false;
+      resetGlobalPointerInteractionState();
     }
 
     const message = error instanceof Error ? error.message : String(error);
