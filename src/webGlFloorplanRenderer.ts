@@ -647,14 +647,62 @@ void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding) {
   }
 }
 
+void accumulateQuadraticCrossingRoot(
+  vec2 a,
+  vec2 b,
+  vec2 c,
+  vec2 p,
+  float ay,
+  float by,
+  float t,
+  inout int winding
+) {
+  const float ROOT_EPS = 1e-5;
+  if (t < -ROOT_EPS || t >= 1.0 - ROOT_EPS) {
+    return;
+  }
+
+  float tc = clamp(t, 0.0, 1.0);
+  float oneMinusT = 1.0 - tc;
+  float xCross = oneMinusT * oneMinusT * a.x + 2.0 * oneMinusT * tc * b.x + tc * tc * c.x;
+  if (xCross <= p.x) {
+    return;
+  }
+
+  float dy = by + 2.0 * ay * tc;
+  if (abs(dy) <= 1e-6) {
+    return;
+  }
+
+  winding += dy > 0.0 ? 1 : -1;
+}
+
 void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding) {
-  // Subdivide for winding crossings to avoid endpoint/tangent root precision seams.
-  vec2 prev = a;
-  for (int i = 1; i <= QUAD_WINDING_SUBDIVISIONS; i += 1) {
-    float t = float(i) / float(QUAD_WINDING_SUBDIVISIONS);
-    vec2 next = evaluateQuadratic(a, b, c, t);
-    accumulateLineCrossing(prev, next, p, winding);
-    prev = next;
+  float ay = a.y - 2.0 * b.y + c.y;
+  float by = 2.0 * (b.y - a.y);
+  float cy = a.y - p.y;
+
+  if (abs(ay) <= 1e-8) {
+    if (abs(by) <= 1e-8) {
+      return;
+    }
+    float t = -cy / by;
+    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t, winding);
+    return;
+  }
+
+  float discriminant = by * by - 4.0 * ay * cy;
+  if (discriminant < 0.0) {
+    return;
+  }
+
+  float sqrtDiscriminant = sqrt(max(discriminant, 0.0));
+  float invDen = 0.5 / ay;
+  float t0 = (-by - sqrtDiscriminant) * invDen;
+  float t1 = (-by + sqrtDiscriminant) * invDen;
+  accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t0, winding);
+  if (abs(t1 - t0) > 1e-5) {
+    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t1, winding);
   }
 }
 

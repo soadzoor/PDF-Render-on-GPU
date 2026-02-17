@@ -670,13 +670,62 @@ fn accumulateLineCrossing(a : vec2f, b : vec2f, p : vec2f, winding : ptr<functio
   }
 }
 
+fn accumulateQuadraticCrossingRoot(
+  a : vec2f,
+  b : vec2f,
+  c : vec2f,
+  p : vec2f,
+  ay : f32,
+  by : f32,
+  t : f32,
+  winding : ptr<function, i32>
+) {
+  let rootEps = 1e-5;
+  if (t < -rootEps || t >= 1.0 - rootEps) {
+    return;
+  }
+
+  let tc = clamp(t, 0.0, 1.0);
+  let oneMinusT = 1.0 - tc;
+  let xCross = oneMinusT * oneMinusT * a.x + 2.0 * oneMinusT * tc * b.x + tc * tc * c.x;
+  if (xCross <= p.x) {
+    return;
+  }
+
+  let dy = by + 2.0 * ay * tc;
+  if (abs(dy) <= 1e-6) {
+    return;
+  }
+
+  *winding = *winding + select(-1, 1, dy > 0.0);
+}
+
 fn accumulateQuadraticCrossing(a : vec2f, b : vec2f, c : vec2f, p : vec2f, winding : ptr<function, i32>) {
-  var prev = a;
-  for (var i = 1; i <= QUAD_WINDING_SUBDIVISIONS; i = i + 1) {
-    let t = f32(i) / f32(QUAD_WINDING_SUBDIVISIONS);
-    let next = evaluateQuadratic(a, b, c, t);
-    accumulateLineCrossing(prev, next, p, winding);
-    prev = next;
+  let ay = a.y - 2.0 * b.y + c.y;
+  let by = 2.0 * (b.y - a.y);
+  let cy = a.y - p.y;
+
+  if (abs(ay) <= 1e-8) {
+    if (abs(by) <= 1e-8) {
+      return;
+    }
+    let t = -cy / by;
+    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t, winding);
+    return;
+  }
+
+  let discriminant = by * by - 4.0 * ay * cy;
+  if (discriminant < 0.0) {
+    return;
+  }
+
+  let sqrtDiscriminant = sqrt(max(discriminant, 0.0));
+  let invDen = 0.5 / ay;
+  let t0 = (-by - sqrtDiscriminant) * invDen;
+  let t1 = (-by + sqrtDiscriminant) * invDen;
+  accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t0, winding);
+  if (abs(t1 - t0) > 1e-5) {
+    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t1, winding);
   }
 }
 
