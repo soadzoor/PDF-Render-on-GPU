@@ -256,6 +256,11 @@ interface ExportTextureEntry {
 
 type TextureLayout = "interleaved" | "channel-major";
 
+const EXPORT_TEXTURE_LAYOUT: TextureLayout = "interleaved";
+const EXPORT_ZIP_COMPRESSION: "STORE" | "DEFLATE" = "DEFLATE";
+const EXPORT_ZIP_DEFLATE_LEVEL = 9;
+const EXPORT_ENCODE_RASTER_IMAGES = true;
+
 interface ParsedDataTextureEntry {
   name?: unknown;
   file?: unknown;
@@ -1523,17 +1528,21 @@ async function downloadParsedDataZip(): Promise<void> {
   const previousStatusText = statusTextElement.textContent;
 
   setDownloadDataButtonState(true, true);
-  statusTextElement.textContent = "Preparing parsed texture data zip...";
+  statusTextElement.textContent = "Preparing parsed texture data zip (fast export)...";
 
   try {
-    const interleavedZip = await buildParsedDataZipBlobForLayout(scene, sceneStats, label, sourcePdfBytes, "interleaved");
-    const channelMajorZip = await buildParsedDataZipBlobForLayout(scene, sceneStats, label, sourcePdfBytes, "channel-major");
-    const selectedZip = channelMajorZip.byteLength < interleavedZip.byteLength ? channelMajorZip : interleavedZip;
+    const selectedZip = await buildParsedDataZipBlobForLayout(
+      scene,
+      sceneStats,
+      label,
+      sourcePdfBytes,
+      EXPORT_TEXTURE_LAYOUT
+    );
 
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
     triggerBlobDownload(selectedZip.blob, zipFileName);
     console.log(
-      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, interleaved ${formatKilobytes(interleavedZip.byteLength)} kB, channel-major ${formatKilobytes(channelMajorZip.byteLength)} kB)`
+      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
     );
     statusTextElement.textContent = previousStatusText || baseStatus;
   } catch (error) {
@@ -1595,13 +1604,15 @@ async function buildParsedDataZipBlobForLayout(
     let filePath = `raster/layer-${i}.rgba`;
     let encoding: "webp" | "png" | "rgba" = "rgba";
     let layerBytes: Uint8Array = rasterBytes;
-    const encodedImage = await encodeRasterLayerAsBestImage(layer.width, layer.height, rasterBytes);
-    if (encodedImage) {
-      filePath = `raster/layer-${i}.${encodedImage.extension}`;
-      encoding = encodedImage.encoding;
-      layerBytes = encodedImage.bytes;
+    if (EXPORT_ENCODE_RASTER_IMAGES) {
+      const encodedImage = await encodeRasterLayerAsBestImage(layer.width, layer.height, rasterBytes);
+      if (encodedImage) {
+        filePath = `raster/layer-${i}.${encodedImage.extension}`;
+        encoding = encodedImage.encoding;
+        layerBytes = encodedImage.bytes;
+      }
     }
-    zip.file(filePath, layerBytes, encoding === "rgba" ? undefined : { compression: "STORE" });
+    zip.file(filePath, layerBytes, { compression: "STORE" });
     serializedRasterLayers.push({
       width: layer.width,
       height: layer.height,
@@ -1658,12 +1669,19 @@ async function buildParsedDataZipBlobForLayout(
   };
 
   zip.file("manifest.json", JSON.stringify(manifest, null, 2));
+  const zipGenerateOptions =
+    EXPORT_ZIP_COMPRESSION === "DEFLATE"
+      ? {
+          type: "blob" as const,
+          compression: "DEFLATE" as const,
+          compressionOptions: { level: EXPORT_ZIP_DEFLATE_LEVEL }
+        }
+      : {
+          type: "blob" as const,
+          compression: "STORE" as const
+        };
 
-  const zipBlob = await zip.generateAsync({
-    type: "blob",
-    compression: "DEFLATE",
-    compressionOptions: { level: 9 }
-  });
+  const zipBlob = await zip.generateAsync(zipGenerateOptions);
 
   return {
     blob: zipBlob,
@@ -2542,7 +2560,7 @@ function createTextureExportEntry(
     height,
     logicalItemCount,
     logicalFloatCount,
-    data: source.slice(0, logicalFloatCount),
+    data: source.subarray(0, logicalFloatCount),
     layout: textureLayout
   };
 }
