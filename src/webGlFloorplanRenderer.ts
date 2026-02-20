@@ -1906,6 +1906,7 @@ export class WebGlFloorplanRenderer {
     const isCameraAnimating = this.updateCameraWithDamping(timestamp);
     this.updatePanReleaseVelocitySample(timestamp);
     const gl = this.gl;
+    this.ensureRenderState();
 
     if (
       !this.scene ||
@@ -3264,11 +3265,17 @@ export class WebGlFloorplanRenderer {
   }
 
   private initializeState(): void {
-    const gl = this.gl;
+    this.ensureRenderState();
+  }
 
+  private ensureRenderState(): void {
+    const gl = this.gl;
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.CULL_FACE);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.colorMask(true, true, true, true);
     gl.enable(gl.BLEND);
+    gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD);
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 

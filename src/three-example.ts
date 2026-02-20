@@ -40,6 +40,7 @@ const renderer = new THREE.WebGLRenderer({
   powerPreference: "high-performance"
 });
 renderer.toneMapping = THREE.NoToneMapping;
+renderer.setClearColor(new THREE.Color(160 / 255, 169 / 255, 175 / 255), 1);
 renderer.setPixelRatio(window.devicePixelRatio || 1);
 renderer.setSize(canvasElement.clientWidth, canvasElement.clientHeight, false);
 
@@ -49,6 +50,7 @@ camera.position.set(0, 0, 10);
 camera.lookAt(0, 0, 0);
 
 let currentPdfObject: HeprThreePdfObject | null = null;
+let lastLoadedSource: File | string | null = null;
 let animationFrameId = 0;
 const exampleSelectionMap = new Map<string, ExampleSelection>();
 
@@ -110,6 +112,15 @@ fileInputElement.addEventListener("change", () => {
   fileInputElement.value = "";
 }, { signal: lifetimeSignal });
 
+backendSelectElement.addEventListener("change", () => {
+  if (!lastLoadedSource) {
+    const backend = backendSelectElement.value === "webgpu" ? "WebGPU" : "WebGL";
+    setStatus(`Backend switched to ${backend}. Load a source to render.`);
+    return;
+  }
+  void loadSource(lastLoadedSource);
+}, { signal: lifetimeSignal });
+
 void loadExampleManifest();
 
 window.addEventListener("beforeunload", () => {
@@ -138,6 +149,7 @@ function disposeExample(): void {
 
 async function loadSource(source: File | string): Promise<void> {
   const backend = backendSelectElement.value === "webgpu" ? "webgpu" : "webgl";
+  const useWebGpuMaterialPipeline = backend === "webgpu";
   const sourceLabel = typeof source === "string" ? source : source.name;
   setStatus(`Loading ${sourceLabel} with ${backend.toUpperCase()}...`);
   loadSourceButtonElement.disabled = true;
@@ -150,16 +162,17 @@ async function loadSource(source: File | string): Promise<void> {
         segmentMerge: true,
         invisibleCull: true,
         curveStrokes: true,
-        experimentalMaterialRasters: true,
-        experimentalMaterialFills: true,
-        experimentalMaterialStrokes: true,
-        experimentalMaterialTexts: true,
+        experimentalMaterialRasters: useWebGpuMaterialPipeline,
+        experimentalMaterialFills: useWebGpuMaterialPipeline,
+        experimentalMaterialStrokes: useWebGpuMaterialPipeline,
+        experimentalMaterialTexts: useWebGpuMaterialPipeline,
         pageBackground: 0xffffff
       },
       backend as HeprRendererType
     );
 
     replacePdfObject(nextObject);
+    lastLoadedSource = source;
     setStatus(`Loaded ${nextObject.sourceLabel} (${nextObject.sourceKind}) via ${backend.toUpperCase()}.`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

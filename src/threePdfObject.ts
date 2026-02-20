@@ -233,6 +233,10 @@ export class HeprThreePdfObject extends THREE.Group {
       this.pendingInitialFit = false;
     }
 
+    if (this.rendererType === "webgpu") {
+      this.renderer.renderExternalFrame?.(performance.now());
+    }
+
     if (this.directHostRendering && renderer.getRenderTarget() === null) {
       renderer.resetState();
       this.renderer.renderExternalFrame?.(performance.now());
@@ -566,6 +570,9 @@ export async function createThreePdfObject(
   const rendererConfig = normalizeRendererConfig(options);
   const nativeRenderer = await createNativeRenderer(rendererType, renderCanvas);
   applyRendererConfig(nativeRenderer, rendererConfig);
+  if (rendererType === "webgpu") {
+    nativeRenderer.setExternalFrameDriver?.(true);
+  }
   nativeRenderer.setScene(loadedScene.scene);
   const initialFitPaddingPixels = normalizePadding(options.fitPadding);
 
@@ -639,7 +646,7 @@ export async function createThreePdfObject(
 
   const material = new THREE.MeshBasicMaterial({
     map: renderTexture,
-    transparent: true,
+    transparent: false,
     side: THREE.DoubleSide,
     depthWrite: false,
     toneMapped: false

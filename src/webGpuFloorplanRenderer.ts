@@ -1201,6 +1201,8 @@ export class WebGpuFloorplanRenderer {
   private presentedFrameSerial = 0;
 
   private rafHandle = 0;
+  private externalFrameDriver = false;
+  private externalFramePending = false;
 
   private cameraCenterX = 0;
 
@@ -1605,7 +1607,7 @@ export class WebGpuFloorplanRenderer {
   static async create(canvas: HTMLCanvasElement): Promise<WebGpuFloorplanRenderer> {
     const nav = navigator as Navigator & {
       gpu?: {
-        requestAdapter: () => Promise<any>;
+        requestAdapter: (options?: { powerPreference?: "low-power" | "high-performance" }) => Promise<any>;
         getPreferredCanvasFormat?: () => string;
       };
     };
@@ -1614,7 +1616,8 @@ export class WebGpuFloorplanRenderer {
       throw new Error("WebGPU is not available in this browser.");
     }
 
-    const adapter = await nav.gpu.requestAdapter();
+    const adapter = await nav.gpu.requestAdapter({ powerPreference: "high-performance" })
+      ?? await nav.gpu.requestAdapter();
     if (!adapter) {
       throw new Error("Failed to acquire a WebGPU adapter.");
     }
@@ -1637,6 +1640,36 @@ export class WebGpuFloorplanRenderer {
 
   setFrameListener(listener: FrameListener | null): void {
     this.frameListener = listener;
+  }
+
+  setExternalFrameDriver(enabled: boolean): void {
+    const nextEnabled = Boolean(enabled);
+    if (this.externalFrameDriver === nextEnabled) {
+      return;
+    }
+
+    this.externalFrameDriver = nextEnabled;
+    if (this.externalFrameDriver) {
+      this.externalFramePending = true;
+      if (this.rafHandle !== 0) {
+        cancelAnimationFrame(this.rafHandle);
+        this.rafHandle = 0;
+      }
+      return;
+    }
+
+    if (this.externalFramePending) {
+      this.externalFramePending = false;
+      this.requestFrame();
+    }
+  }
+
+  renderExternalFrame(timestamp: number = performance.now()): void {
+    if (this.externalFrameDriver && !this.externalFramePending) {
+      return;
+    }
+    this.externalFramePending = false;
+    this.render(timestamp);
   }
 
   setPanOptimizationEnabled(enabled: boolean): void {
@@ -2351,6 +2384,11 @@ export class WebGpuFloorplanRenderer {
   }
 
   private requestFrame(): void {
+    if (this.externalFrameDriver) {
+      this.externalFramePending = true;
+      return;
+    }
+
     if (this.rafHandle !== 0) {
       return;
     }
@@ -2386,6 +2424,20 @@ export class WebGpuFloorplanRenderer {
       return;
     }
 
+    if (!this.hasNativeRenderingEnabled()) {
+      this.capturePresentedFrameState();
+      this.frameListener?.({
+        renderedSegments: 0,
+        totalSegments: this.segmentCount,
+        usedCulling: false,
+        zoom: this.zoom
+      });
+      if (isCameraAnimating) {
+        this.requestFrame();
+      }
+      return;
+    }
+
     if (this.shouldUsePanCache(isCameraAnimating)) {
       this.renderWithPanCache();
     } else {
@@ -2396,6 +2448,15 @@ export class WebGpuFloorplanRenderer {
     if (isCameraAnimating) {
       this.requestFrame();
     }
+  }
+
+  private hasNativeRenderingEnabled(): boolean {
+    return (
+      this.rasterRenderingEnabled ||
+      this.fillRenderingEnabled ||
+      this.strokeRenderingEnabled ||
+      this.textRenderingEnabled
+    );
   }
 
   private capturePresentedFrameState(): void {
