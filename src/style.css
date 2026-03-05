@@ -73,6 +73,10 @@ body {
   display: none;
 }
 
+#download-all-data {
+  display: none;
+}
+
 .chevron-button {
   display: inline-flex;
   align-items: center;

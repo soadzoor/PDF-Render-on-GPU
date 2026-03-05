@@ -5,9 +5,15 @@ const pdfJsModule = (
 ) as {
   getDocument: typeof import("pdfjs-dist").getDocument;
   OPS: typeof import("pdfjs-dist").OPS;
+  VerbosityLevel?: {
+    ERRORS: number;
+  };
+  setVerbosityLevel?: (level: number) => void;
 };
 
-const { getDocument, OPS } = pdfJsModule;
+const { getDocument, OPS, VerbosityLevel, setVerbosityLevel } = pdfJsModule;
+const PDFJS_VERBOSITY_ERRORS = VerbosityLevel?.ERRORS ?? 0;
+setVerbosityLevel?.(PDFJS_VERBOSITY_ERRORS);
 
 const DRAW_MOVE_TO = 0;
 const DRAW_LINE_TO = 1;
@@ -220,6 +226,7 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
     data: new Uint8Array(pdfData),
     disableFontFace: true,
     fontExtraProperties: true,
+    verbosity: PDFJS_VERBOSITY_ERRORS,
     ...(standardFontDataUrl ? { standardFontDataUrl } : {})
   });
   const pdf = await loadingTask.promise;
@@ -265,6 +272,7 @@ export async function extractPdfRasterPageScenes(
     data: new Uint8Array(pdfData),
     disableFontFace: true,
     fontExtraProperties: true,
+    verbosity: PDFJS_VERBOSITY_ERRORS,
     ...(standardFontDataUrl ? { standardFontDataUrl } : {})
   });
   const pdf = await loadingTask.promise;
