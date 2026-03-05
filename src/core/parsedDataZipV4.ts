@@ -1,6 +1,14 @@
 import JSZip from "jszip";
 
 import type { Bounds } from "../pdfVectorExtractor";
+import {
+  decodeByteShuffledFloat32,
+  decodeChannelMajorFloat32,
+  decodeXorDeltaByteShuffledFloat32,
+  encodeByteShuffledFloat32,
+  encodeChannelMajorFloat32,
+  encodeXorDeltaByteShuffledFloat32
+} from "../parsedDataEncoding";
 import type { CompiledPageInfo, CompiledPdfDocument, CompiledRasterLayer } from "./types";
 
 const PARSED_DATA_KIND = "hepr.compiled-pdf-document";
@@ -24,11 +32,17 @@ const REQUIRED_TEXTURE_NAMES = [
 ] as const;
 
 type RequiredTextureName = (typeof REQUIRED_TEXTURE_NAMES)[number];
+type TextureLayout = "interleaved" | "channel-major";
+type TexturePredictor = "none" | "xor-delta-u32";
 
 export interface BuildParsedDataZipV4Options {
   sourceFile?: string;
   zipCompression?: "STORE" | "DEFLATE";
   zipDeflateLevel?: number;
+  textureLayout?: TextureLayout;
+  textureByteShuffle?: boolean;
+  texturePredictor?: TexturePredictor;
+  encodeRasterImages?: boolean;
 }
 
 export interface ParsedDataZipV4BlobResult {
@@ -42,6 +56,9 @@ interface ManifestTextureEntry {
   name?: unknown;
   file?: unknown;
   componentType?: unknown;
+  layout?: unknown;
+  byteShuffle?: unknown;
+  predictor?: unknown;
   logicalItemCount?: unknown;
   logicalFloatCount?: unknown;
 }
@@ -53,6 +70,12 @@ interface ManifestRasterLayerEntry {
   matrix?: unknown;
   file?: unknown;
   encoding?: unknown;
+}
+
+interface EncodedRasterImage {
+  bytes: Uint8Array;
+  encoding: "webp" | "png";
+  extension: "webp" | "png";
 }
 
 interface ManifestPageEntry {
@@ -106,6 +129,9 @@ interface ParsedDataZipManifest {
 interface BuiltTextureEntry {
   name: RequiredTextureName;
   file: string;
+  layout: TextureLayout;
+  byteShuffle: boolean;
+  predictor: "none" | "xor-delta-u32";
   logicalItemCount: number;
   logicalFloatCount: number;
 }
@@ -116,36 +142,67 @@ export async function buildParsedDataZipV4Blob(
 ): Promise<ParsedDataZipV4BlobResult> {
   const zipCompression = options.zipCompression ?? "DEFLATE";
   const zipDeflateLevel = options.zipDeflateLevel ?? 9;
+  const textureLayout = options.textureLayout ?? "interleaved";
+  const textureByteShuffle =
+    textureLayout === "interleaved" ? (options.textureByteShuffle ?? true) : false;
+  const texturePredictor =
+    textureLayout === "interleaved"
+      ? (options.texturePredictor ?? (textureByteShuffle ? "xor-delta-u32" : "none"))
+      : "none";
+  const encodeRasterImages = options.encodeRasterImages ?? true;
   const zip = new JSZip();
 
   const textureEntries: BuiltTextureEntry[] = [];
 
-  addTexture(zip, textureEntries, "endpoints", document.endpoints, document.segmentCount);
-  addTexture(zip, textureEntries, "primitiveMeta", document.primitiveMeta, document.segmentCount);
-  addTexture(zip, textureEntries, "primitiveBounds", document.primitiveBounds, document.segmentCount);
-  addTexture(zip, textureEntries, "styles", document.styles, document.segmentCount);
+  addTexture(zip, textureEntries, "endpoints", document.endpoints, document.segmentCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "primitiveMeta", document.primitiveMeta, document.segmentCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "primitiveBounds", document.primitiveBounds, document.segmentCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "styles", document.styles, document.segmentCount, textureLayout, textureByteShuffle, texturePredictor);
 
-  addTexture(zip, textureEntries, "fillPathMetaA", document.fillPathMetaA, document.fillPathCount);
-  addTexture(zip, textureEntries, "fillPathMetaB", document.fillPathMetaB, document.fillPathCount);
-  addTexture(zip, textureEntries, "fillPathMetaC", document.fillPathMetaC, document.fillPathCount);
-  addTexture(zip, textureEntries, "fillSegmentsA", document.fillSegmentsA, document.fillSegmentCount);
-  addTexture(zip, textureEntries, "fillSegmentsB", document.fillSegmentsB, document.fillSegmentCount);
+  addTexture(zip, textureEntries, "fillPathMetaA", document.fillPathMetaA, document.fillPathCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "fillPathMetaB", document.fillPathMetaB, document.fillPathCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "fillPathMetaC", document.fillPathMetaC, document.fillPathCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "fillSegmentsA", document.fillSegmentsA, document.fillSegmentCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "fillSegmentsB", document.fillSegmentsB, document.fillSegmentCount, textureLayout, textureByteShuffle, texturePredictor);
 
-  addTexture(zip, textureEntries, "textInstanceA", document.textInstanceA, document.textInstanceCount);
-  addTexture(zip, textureEntries, "textInstanceB", document.textInstanceB, document.textInstanceCount);
-  addTexture(zip, textureEntries, "textInstanceC", document.textInstanceC, document.textInstanceCount);
-  addTexture(zip, textureEntries, "textGlyphMetaA", document.textGlyphMetaA, document.textGlyphCount);
-  addTexture(zip, textureEntries, "textGlyphMetaB", document.textGlyphMetaB, document.textGlyphCount);
-  addTexture(zip, textureEntries, "textGlyphSegmentsA", document.textGlyphSegmentsA, document.textGlyphSegmentCount);
-  addTexture(zip, textureEntries, "textGlyphSegmentsB", document.textGlyphSegmentsB, document.textGlyphSegmentCount);
+  addTexture(zip, textureEntries, "textInstanceA", document.textInstanceA, document.textInstanceCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "textInstanceB", document.textInstanceB, document.textInstanceCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "textInstanceC", document.textInstanceC, document.textInstanceCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "textGlyphMetaA", document.textGlyphMetaA, document.textGlyphCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "textGlyphMetaB", document.textGlyphMetaB, document.textGlyphCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "textGlyphSegmentsA", document.textGlyphSegmentsA, document.textGlyphSegmentCount, textureLayout, textureByteShuffle, texturePredictor);
+  addTexture(zip, textureEntries, "textGlyphSegmentsB", document.textGlyphSegmentsB, document.textGlyphSegmentCount, textureLayout, textureByteShuffle, texturePredictor);
 
-  const rasterLayers = document.rasterLayers.map((layer, index) => {
-    const file = `raster/layer-${index}.rgba`;
+  const rasterLayers: Array<{
+    pageIndex: number;
+    width: number;
+    height: number;
+    matrix: [number, number, number, number, number, number];
+    file: string;
+    encoding: "rgba" | "webp" | "png";
+  }> = [];
+  for (let index = 0; index < document.rasterLayers.length; index += 1) {
+    const layer = document.rasterLayers[index];
     const expectedLength = Math.max(0, Math.trunc(layer.width) * Math.trunc(layer.height) * 4);
-    const data = expectedLength > 0 ? layer.data.subarray(0, expectedLength) : new Uint8Array(0);
-    zip.file(file, data, { compression: "STORE" });
+    const rgba = expectedLength > 0 ? layer.data.subarray(0, expectedLength) : new Uint8Array(0);
 
-    return {
+    let file = `raster/layer-${index}.rgba`;
+    let encoding: "rgba" | "webp" | "png" = "rgba";
+    let payload = rgba;
+    let compressionOptions: JSZip.JSZipFileOptions | undefined;
+
+    if (encodeRasterImages) {
+      const encoded = await encodeRasterLayerAsBestImage(layer.width, layer.height, rgba);
+      if (encoded) {
+        file = `raster/layer-${index}.${encoded.extension}`;
+        encoding = encoded.encoding;
+        payload = encoded.bytes;
+        compressionOptions = { compression: "STORE" };
+      }
+    }
+
+    zip.file(file, payload, compressionOptions);
+    rasterLayers.push({
       pageIndex: Math.max(0, Math.trunc(layer.pageIndex)),
       width: Math.max(0, Math.trunc(layer.width)),
       height: Math.max(0, Math.trunc(layer.height)),
@@ -158,9 +215,9 @@ export async function buildParsedDataZipV4Blob(
         Number(layer.matrix[5] ?? 0)
       ],
       file,
-      encoding: "rgba" as const
-    };
-  });
+      encoding
+    });
+  }
 
   const manifest = {
     formatVersion: 4,
@@ -186,6 +243,9 @@ export async function buildParsedDataZipV4Blob(
       name: entry.name,
       file: entry.file,
       componentType: "float32",
+      layout: entry.layout,
+      byteShuffle: entry.byteShuffle,
+      predictor: entry.predictor,
       logicalItemCount: entry.logicalItemCount,
       logicalFloatCount: entry.logicalFloatCount
     }))
@@ -324,16 +384,46 @@ function addTexture(
   entries: BuiltTextureEntry[],
   name: RequiredTextureName,
   data: Float32Array,
-  logicalItemCount: number
+  logicalItemCount: number,
+  layout: TextureLayout,
+  byteShuffle: boolean,
+  predictor: TexturePredictor
 ): void {
-  const file = `textures/${name}.f32`;
-  const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  zip.file(file, bytes, { compression: "STORE" });
+  const logicalFloatCount = logicalItemCount * 4;
+  if (logicalFloatCount > data.length) {
+    throw new Error(`Texture ${name} has insufficient data (${data.length} < ${logicalFloatCount}).`);
+  }
+
+  const payload = data.subarray(0, logicalFloatCount);
+  const useByteShuffle = layout === "interleaved" && byteShuffle;
+  const effectivePredictor: TexturePredictor = useByteShuffle ? predictor : "none";
+  if (effectivePredictor === "xor-delta-u32" && !useByteShuffle) {
+    throw new Error(`Texture ${name} predictor ${effectivePredictor} requires byteShuffle.`);
+  }
+
+  let file = `textures/${name}.f32`;
+  let bytes: Uint8Array;
+  if (layout === "channel-major") {
+    file = `textures/${name}.f32cm`;
+    bytes = encodeChannelMajorFloat32(payload);
+  } else if (useByteShuffle) {
+    file = `textures/${name}.f32bs`;
+    bytes = effectivePredictor === "xor-delta-u32"
+      ? encodeXorDeltaByteShuffledFloat32(payload)
+      : encodeByteShuffledFloat32(payload);
+  } else {
+    bytes = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+  }
+
+  zip.file(file, bytes);
   entries.push({
     name,
     file,
+    layout,
+    byteShuffle: useByteShuffle,
+    predictor: effectivePredictor,
     logicalItemCount,
-    logicalFloatCount: logicalItemCount * 4
+    logicalFloatCount
   });
 }
 
@@ -353,18 +443,14 @@ async function readRequiredTexture(
     throw new Error(`Texture ${name} has unsupported componentType ${componentType ?? "unknown"}.`);
   }
 
-  const filePath = readNonEmptyString(entry.file) ?? `textures/${name}.f32`;
-  const file = zip.file(filePath);
+  const filePath = readNonEmptyString(entry.file) ?? inferTexturePath(name, entry);
+  const file = zip.file(filePath) ?? zip.file(inferTexturePath(name, entry));
   if (!file) {
     throw new Error(`Parsed data zip is missing texture payload ${filePath}.`);
   }
 
   const fileBuffer = await file.async("arraybuffer");
-  if (fileBuffer.byteLength % 4 !== 0) {
-    throw new Error(`Texture ${name} byte length is not float32 aligned.`);
-  }
-
-  const raw = new Float32Array(fileBuffer);
+  const raw = readTexturePayloadAsFloat32(fileBuffer, entry, name);
   const logicalFloatCountFromManifest = readNonNegativeInt(entry.logicalFloatCount, raw.length);
   if (logicalFloatCountFromManifest > raw.length) {
     throw new Error(`Texture ${name} logicalFloatCount exceeds payload size.`);
@@ -383,6 +469,59 @@ async function readRequiredTexture(
   return raw.slice(0, expectedFloatCount);
 }
 
+function inferTexturePath(name: RequiredTextureName, entry: ManifestTextureEntry): string {
+  const layout = readTextureLayout(entry);
+  if (layout === "channel-major") {
+    return `textures/${name}.f32cm`;
+  }
+  return entry.byteShuffle === true
+    ? `textures/${name}.f32bs`
+    : `textures/${name}.f32`;
+}
+
+function readTextureLayout(entry: ManifestTextureEntry): TextureLayout {
+  const rawLayout = readNonEmptyString(entry.layout);
+  if (!rawLayout || rawLayout === "interleaved") {
+    return "interleaved";
+  }
+  if (rawLayout === "channel-major") {
+    return "channel-major";
+  }
+  throw new Error(`Texture has unsupported layout ${rawLayout}.`);
+}
+
+function readTexturePayloadAsFloat32(
+  fileBuffer: ArrayBuffer,
+  entry: ManifestTextureEntry,
+  textureName: RequiredTextureName
+): Float32Array {
+  const layout = readTextureLayout(entry);
+  if (layout === "channel-major") {
+    return decodeChannelMajorFloat32(new Uint8Array(fileBuffer));
+  }
+
+  const byteShuffle = entry.byteShuffle === true;
+  const predictor = readNonEmptyString(entry.predictor) ?? "none";
+  if (predictor !== "none" && predictor !== "xor-delta-u32") {
+    throw new Error(`Texture ${textureName} has unsupported predictor ${predictor}.`);
+  }
+
+  if (byteShuffle) {
+    if (predictor === "xor-delta-u32") {
+      return decodeXorDeltaByteShuffledFloat32(new Uint8Array(fileBuffer));
+    }
+    return decodeByteShuffledFloat32(new Uint8Array(fileBuffer));
+  }
+
+  if (predictor !== "none") {
+    throw new Error(`Texture ${textureName} declares predictor ${predictor} without byteShuffle.`);
+  }
+  if (fileBuffer.byteLength % 4 !== 0) {
+    throw new Error(`Texture ${textureName} byte length is not float32 aligned.`);
+  }
+  return new Float32Array(fileBuffer);
+}
+
 async function readRasterLayers(
   zip: JSZip,
   source: ManifestRasterLayerEntry[]
@@ -397,8 +536,8 @@ async function readRasterLayers(
       throw new Error(`Raster layer ${i} has invalid dimensions.`);
     }
 
-    const encoding = readNonEmptyString(entry.encoding);
-    if (encoding !== "rgba") {
+    const encoding = readNonEmptyString(entry.encoding) ?? "rgba";
+    if (encoding !== "rgba" && encoding !== "png" && encoding !== "webp") {
       throw new Error(`Raster layer ${i} has unsupported encoding ${encoding ?? "unknown"}.`);
     }
 
@@ -416,9 +555,25 @@ async function readRasterLayers(
 
     const buffer = await file.async("arraybuffer");
     const bytes = new Uint8Array(buffer);
-    const expectedLength = width * height * 4;
-    if (bytes.length < expectedLength) {
-      throw new Error(`Raster layer ${i} payload is truncated (${bytes.length} < ${expectedLength}).`);
+    let rgba: Uint8Array;
+
+    if (encoding === "rgba") {
+      const expectedLength = width * height * 4;
+      if (bytes.length < expectedLength) {
+        throw new Error(`Raster layer ${i} payload is truncated (${bytes.length} < ${expectedLength}).`);
+      }
+      rgba = bytes.length === expectedLength ? bytes : bytes.slice(0, expectedLength);
+    } else {
+      const decoded = await decodeRasterImageToRgba(filePath, bytes);
+      if (!decoded) {
+        throw new Error(`Raster layer ${i} could not be decoded from ${encoding} payload.`);
+      }
+      if (decoded.width !== width || decoded.height !== height) {
+        throw new Error(
+          `Raster layer ${i} dimensions mismatch (${decoded.width}x${decoded.height} != ${width}x${height}).`
+        );
+      }
+      rgba = decoded.data;
     }
 
     out.push({
@@ -426,7 +581,7 @@ async function readRasterLayers(
       width,
       height,
       matrix,
-      data: bytes.length === expectedLength ? bytes : bytes.slice(0, expectedLength)
+      data: rgba
     });
   }
 
@@ -593,6 +748,168 @@ function readNonEmptyString(value: unknown): string | null {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+async function encodeRasterLayerAsBestImage(
+  width: number,
+  height: number,
+  rgba: Uint8Array
+): Promise<EncodedRasterImage | null> {
+  const [webp, png] = await Promise.all([
+    encodeRasterLayerAsImage(width, height, rgba, "image/webp"),
+    encodeRasterLayerAsImage(width, height, rgba, "image/png")
+  ]);
+
+  if (!webp && !png) {
+    return null;
+  }
+  if (webp && !png) {
+    return { bytes: webp, encoding: "webp", extension: "webp" };
+  }
+  if (png && !webp) {
+    return { bytes: png, encoding: "png", extension: "png" };
+  }
+
+  if (!webp || !png) {
+    return null;
+  }
+  return webp.byteLength <= png.byteLength
+    ? { bytes: webp, encoding: "webp", extension: "webp" }
+    : { bytes: png, encoding: "png", extension: "png" };
+}
+
+async function encodeRasterLayerAsImage(
+  width: number,
+  height: number,
+  rgba: Uint8Array,
+  mimeType: "image/png" | "image/webp"
+): Promise<Uint8Array | null> {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  const expectedBytes = width * height * 4;
+  if (width <= 0 || height <= 0 || rgba.length < expectedBytes) {
+    return null;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d", { alpha: true });
+  if (!context) {
+    canvas.width = 0;
+    canvas.height = 0;
+    return null;
+  }
+
+  const imageData = createImageDataFromRgba(width, height, rgba);
+  if (!imageData) {
+    canvas.width = 0;
+    canvas.height = 0;
+    return null;
+  }
+
+  context.putImageData(imageData, 0, 0);
+  const blob = await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, mimeType);
+  });
+  canvas.width = 0;
+  canvas.height = 0;
+  if (!blob) {
+    return null;
+  }
+
+  const buffer = await blob.arrayBuffer();
+  return new Uint8Array(buffer);
+}
+
+function createImageDataFromRgba(width: number, height: number, rgba: Uint8Array): ImageData | null {
+  const expectedBytes = width * height * 4;
+  if (rgba.length < expectedBytes) {
+    return null;
+  }
+
+  try {
+    const clamped = new Uint8ClampedArray(expectedBytes);
+    clamped.set(rgba.subarray(0, expectedBytes));
+    return new ImageData(clamped, width, height);
+  } catch {
+    return null;
+  }
+}
+
+function getMimeTypeForRasterPath(path: string): "image/png" | "image/webp" | null {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".png")) {
+    return "image/png";
+  }
+  if (lower.endsWith(".webp")) {
+    return "image/webp";
+  }
+  return null;
+}
+
+async function decodeRasterImageToRgba(
+  path: string,
+  encoded: Uint8Array
+): Promise<{ width: number; height: number; data: Uint8Array } | null> {
+  const mimeType = getMimeTypeForRasterPath(path);
+  if (!mimeType || typeof createImageBitmap !== "function") {
+    return null;
+  }
+
+  const encodedCopy = new Uint8Array(encoded.length);
+  encodedCopy.set(encoded);
+  const blob = new Blob([encodedCopy], { type: mimeType });
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(blob);
+  } catch {
+    return null;
+  }
+  try {
+    const width = bitmap.width;
+    const height = bitmap.height;
+    if (width <= 0 || height <= 0) {
+      return null;
+    }
+
+    if (typeof OffscreenCanvas !== "undefined") {
+      const canvas = new OffscreenCanvas(width, height);
+      const context = canvas.getContext("2d", { alpha: true, willReadFrequently: true });
+      if (!context) {
+        return null;
+      }
+      context.drawImage(bitmap, 0, 0);
+      const imageData = context.getImageData(0, 0, width, height);
+      return { width, height, data: new Uint8Array(imageData.data) };
+    }
+
+    if (typeof document !== "undefined") {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { alpha: true, willReadFrequently: true });
+      if (!context) {
+        canvas.width = 0;
+        canvas.height = 0;
+        return null;
+      }
+
+      context.drawImage(bitmap, 0, 0);
+      const imageData = context.getImageData(0, 0, width, height);
+      const rgba = new Uint8Array(imageData.data);
+      canvas.width = 0;
+      canvas.height = 0;
+      return { width, height, data: rgba };
+    }
+  } finally {
+    bitmap.close();
+  }
+
+  return null;
 }
 
 export function isParsedDataZipV4Manifest(value: unknown): boolean {

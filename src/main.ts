@@ -36,6 +36,7 @@ const toggleHudIcon = document.querySelector<HTMLSpanElement>("#toggle-hud-icon"
 const openButton = document.querySelector<HTMLButtonElement>("#open-file");
 const exampleSelect = document.querySelector<HTMLSelectElement>("#example-select");
 const downloadDataButton = document.querySelector<HTMLButtonElement>("#download-data");
+const downloadAllDataButton = document.querySelector<HTMLButtonElement>("#download-all-data");
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
 const parseLoaderElement = document.querySelector<HTMLDivElement>("#parse-loader");
@@ -75,6 +76,7 @@ if (
   !openButton ||
   !exampleSelect ||
   !downloadDataButton ||
+  !downloadAllDataButton ||
   !fileInput ||
   !statusElement ||
   !parseLoaderElement ||
@@ -116,6 +118,7 @@ const toggleHudIconElement = toggleHudIcon;
 const openButtonElement = openButton;
 const exampleSelectElement = exampleSelect;
 const downloadDataButtonElement = downloadDataButton;
+const downloadAllDataButtonElement = downloadAllDataButton;
 const fileInputElement = fileInput;
 const statusTextElement = statusElement;
 const parsingLoaderElement = parseLoaderElement;
@@ -261,6 +264,8 @@ interface ExampleSelection {
 }
 
 const exampleSelectionMap = new Map<string, ExampleSelection>();
+let exampleManifestEntries: NormalizedExampleEntry[] = [];
+let isBatchExampleExportRunning = false;
 
 let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
@@ -311,6 +316,7 @@ backendSwitcher.initializeToggleState();
 setMetricPlaceholder();
 setHudCollapsed(false);
 setDownloadDataButtonState(false);
+setDownloadAllDataButtonState(false);
 uiControlManager.syncMaxPagesPerRowInputValue();
 setStatus(baseStatus);
 refreshDropIndicator();
@@ -322,6 +328,10 @@ openButtonElement.addEventListener("click", () => {
 
 downloadDataButtonElement.addEventListener("click", () => {
   void downloadParsedDataZip();
+});
+
+downloadAllDataButtonElement.addEventListener("click", () => {
+  void downloadAllExampleParsedZips();
 });
 
 toggleHudButtonElement.addEventListener("click", () => {
@@ -428,10 +438,12 @@ function refreshDropIndicator(): void {
 
 async function loadExampleManifest(): Promise<void> {
   exampleSelectionMap.clear();
+  exampleManifestEntries = [];
   exampleSelectElement.innerHTML = "";
   exampleSelectElement.append(new Option("Examples (loading...)", ""));
   exampleSelectElement.value = "";
   exampleSelectElement.disabled = true;
+  setDownloadAllDataButtonState(false);
 
   try {
     const manifestUrl = resolveAppAssetUrl("examples/manifest.json");
@@ -450,14 +462,17 @@ async function loadExampleManifest(): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[Examples] Failed to load manifest: ${message}`);
+    exampleManifestEntries = [];
     exampleSelectElement.innerHTML = "";
     exampleSelectElement.append(new Option("Examples unavailable", ""));
     exampleSelectElement.value = "";
     exampleSelectElement.disabled = true;
+    setDownloadAllDataButtonState(false);
   }
 }
 
 function populateExampleSelect(entries: NormalizedExampleEntry[]): void {
+  exampleManifestEntries = [...entries];
   exampleSelectionMap.clear();
   exampleSelectElement.innerHTML = "";
   exampleSelectElement.append(new Option("Load example...", ""));
@@ -491,6 +506,7 @@ function populateExampleSelect(entries: NormalizedExampleEntry[]): void {
 
   exampleSelectElement.value = "";
   exampleSelectElement.disabled = exampleSelectionMap.size === 0;
+  setDownloadAllDataButtonState(exampleManifestEntries.length > 0);
 }
 
 async function loadExampleSelection(selectionKey: string): Promise<void> {
@@ -855,8 +871,22 @@ function setParsingLoader(isVisible: boolean): void {
 
 function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
   downloadDataButtonElement.hidden = !hasParsedData;
-  downloadDataButtonElement.disabled = !hasParsedData || isBusy;
+  downloadDataButtonElement.disabled = !hasParsedData || isBusy || isBatchExampleExportRunning;
   downloadDataButtonElement.textContent = isBusy ? "Preparing ZIP..." : "Download Parsed Data";
+}
+
+function setDownloadAllDataButtonState(hasExamples: boolean, isBusy = false, progressText?: string): void {
+  downloadAllDataButtonElement.hidden = false;
+  downloadAllDataButtonElement.disabled = !hasExamples || isBusy;
+  downloadAllDataButtonElement.textContent = isBusy
+    ? progressText ?? "Exporting Example ZIPs..."
+    : "Download All Example ZIPs";
+}
+
+function setPrimaryLoadControlsEnabled(isEnabled: boolean): void {
+  openButtonElement.disabled = !isEnabled;
+  fileInputElement.disabled = !isEnabled;
+  exampleSelectElement.disabled = !isEnabled || exampleSelectionMap.size === 0;
 }
 
 function setHudCollapsed(collapsed: boolean): void {
@@ -864,6 +894,62 @@ function setHudCollapsed(collapsed: boolean): void {
   toggleHudButtonElement.setAttribute("aria-expanded", String(!collapsed));
   toggleHudButtonElement.title = collapsed ? "Expand panel" : "Collapse panel";
   toggleHudIconElement.textContent = collapsed ? "▸" : "▾";
+}
+
+async function downloadAllExampleParsedZips(): Promise<void> {
+  if (isBatchExampleExportRunning) {
+    return;
+  }
+
+  const pdfEntries = exampleManifestEntries;
+  if (pdfEntries.length === 0) {
+    setStatus("No example PDFs available for batch export.");
+    return;
+  }
+
+  isBatchExampleExportRunning = true;
+  setPrimaryLoadControlsEnabled(false);
+  setDownloadDataButtonState(Boolean(lastCompiledDocument), false);
+  setDownloadAllDataButtonState(true, true, `Exporting 0/${pdfEntries.length}...`);
+
+  try {
+    for (let index = 0; index < pdfEntries.length; index += 1) {
+      const entry = pdfEntries[index];
+      const step = index + 1;
+      setDownloadAllDataButtonState(true, true, `Exporting ${step}/${pdfEntries.length}...`);
+      setStatus(`Batch ${step}/${pdfEntries.length}: loading ${entry.name}...`);
+      const response = await fetch(entry.pdfPath, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`${entry.name} (HTTP ${response.status})`);
+      }
+
+      const fileBuffer = await response.arrayBuffer();
+      const bytes = cloneSourceBytes(fileBuffer);
+      lastLoadedSource = { kind: "pdf", bytes, label: entry.name };
+      parsedPdfPageCache = null;
+      lastCompiledDocument = null;
+      lastParsedSceneLabel = null;
+
+      await loadPdfBuffer(createParseBuffer(bytes), entry.name, { preserveView: false, autoMaxPagesPerRow: true });
+      if (!lastCompiledDocument || lastParsedSceneLabel !== entry.name) {
+        throw new Error(`${entry.name}: parsed data not available after load`);
+      }
+
+      setStatus(`Batch ${step}/${pdfEntries.length}: downloading ${entry.name} parsed ZIP...`);
+      await downloadParsedDataZip();
+      await delayMilliseconds(200);
+    }
+
+    setStatus(`Batch export complete: ${pdfEntries.length.toLocaleString()} parsed ZIP files downloaded.`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Batch export failed: ${message}`);
+  } finally {
+    isBatchExampleExportRunning = false;
+    setPrimaryLoadControlsEnabled(true);
+    setDownloadDataButtonState(Boolean(lastCompiledDocument), false);
+    setDownloadAllDataButtonState(exampleManifestEntries.length > 0, false);
+  }
 }
 
 async function downloadParsedDataZip(): Promise<void> {
@@ -882,7 +968,11 @@ async function downloadParsedDataZip(): Promise<void> {
     const selectedZip = await buildParsedDataZipV4Blob(lastCompiledDocument, {
       sourceFile: label,
       zipCompression: EXPORT_ZIP_COMPRESSION,
-      zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
+      zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL,
+      textureLayout: "channel-major",
+      textureByteShuffle: false,
+      texturePredictor: "none",
+      encodeRasterImages: true
     });
 
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
@@ -1087,6 +1177,12 @@ function cloneSourceBytes(buffer: ArrayBuffer): Uint8Array {
 
 function createParseBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.slice().buffer;
+}
+
+function delayMilliseconds(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, Math.max(0, ms));
+  });
 }
 
 function clamp(value: number, min: number, max: number): number {
