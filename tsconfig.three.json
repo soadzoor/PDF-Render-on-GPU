@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "declarationMap": false,
+    "outDir": "dist/three",
+    "rootDir": "src"
+  },
+  "include": [
+    "src/vite-env.d.ts",
+    "src/three/**/*.ts",
+    "src/core/**/*.ts",
+    "src/pdfVectorExtractor.ts",
+    "src/textRasterAtlas.ts"
+  ]
+}

@@ -10,6 +10,9 @@ GPU-first PDF renderer for large technical documents, floorplans, and general mi
 - [`demo/demo.gif`](demo/demo.gif)
 - <https://youtu.be/HDMntIG-1e4>
 
+Three.js usage demo page (local):
+- [`three-example.html`](three-example.html)
+
 
 The project started from vector-texture ideas inspired by:
 - <https://wdobbie.com/post/gpu-text-rendering-with-vector-textures/>
@@ -42,8 +45,8 @@ It has since evolved beyond a floorplan-only proof of concept into a broader PDF
   - `Curve strokes`
   - `Vector only`
 - Export/import:
-  - `Download Parsed Data` exports current scene into ZIP
-  - ZIP can be reloaded directly (skips fresh PDF vector extraction)
+  - `Download Parsed Data` exports current scene into parsed ZIP **v4**
+  - Parsed ZIP v4 can be reloaded directly (skips fresh PDF vector extraction)
 - Diagnostics:
   - FPS + parse/upload timing
   - segment/fill/text counts
@@ -79,11 +82,13 @@ Both renderers use texture-driven scene data and camera uniforms (`center + zoom
 
 The exported ZIP contains:
 - `manifest.json` (scene metadata + texture descriptors)
-- vector textures (`textures/*.f32` or channel-major variants)
-- optional raster layers (`raster/layer-*.webp|png|rgba`)
-- optional source PDF fallback (`source/source.pdf`) when needed
+- vector textures (`textures/*.f32`)
+- raster layers (`raster/layer-*.rgba`)
+- compiled document metadata (page ranges + global counts) used by both app and `hepr/three`
 
-On load, the app reconstructs the scene from ZIP. If raster layers are missing but source PDF is embedded, raster data is restored from that source PDF.
+Compatibility note:
+- parsed ZIP **v3 is no longer supported** in the runtime loader
+- old example ZIPs must be regenerated to v4 before loading
 
 ## Example Assets
 

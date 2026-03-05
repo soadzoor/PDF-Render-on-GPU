@@ -1276,6 +1276,13 @@ function resolveStandardFontDataUrl(): string | undefined {
     return new URL("pdfjs-standard-fonts/", window.location.href).toString();
   }
 
+  if (typeof self !== "undefined" && "location" in self) {
+    const workerLocation = (self as { location?: Location }).location;
+    if (workerLocation && typeof workerLocation.href === "string") {
+      return new URL("pdfjs-standard-fonts/", workerLocation.href).toString();
+    }
+  }
+
   if (typeof window === "undefined") {
     // Node-side extraction (example ZIP generation) needs an explicit local font directory.
     const nodeFontUrl = new URL(

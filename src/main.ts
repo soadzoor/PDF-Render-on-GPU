@@ -13,13 +13,11 @@ import {
 } from "./pdfVectorExtractor";
 import { createCanvasInteractionController } from "./canvasInteractions";
 import { createBackendSwitcher } from "./backendSwitcher";
-import {
-  buildParsedDataZipBlobForLayout,
-  listSceneRasterLayers,
-  loadSceneFromParsedDataZip,
-  tryReadSourcePdfBytesFromExistingParsedZip,
-  type TextureLayout
-} from "./parsedDataZip";
+import { listSceneRasterLayers } from "./parsedDataZip";
+import { compilePdfPageScenes } from "./core/documentCompile";
+import { buildParsedDataZipV4Blob, loadCompiledDocumentFromParsedDataZipV4 } from "./core/parsedDataZipV4";
+import { compiledDocumentToVectorScene } from "./core/compiledDocumentToVectorScene";
+import type { CompiledPdfDocument } from "./core/types";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
 import {
@@ -232,6 +230,7 @@ let lastLoadedSource: LoadedSource | null = null;
 let lastParsedScene: VectorScene | null = null;
 let lastParsedSceneStats: SceneStats | null = null;
 let lastParsedSceneLabel: string | null = null;
+let lastCompiledDocument: CompiledPdfDocument | null = null;
 let loadToken = 0;
 let isDropDragActive = false;
 
@@ -249,10 +248,8 @@ interface LoadPdfOptions {
   autoMaxPagesPerRow?: boolean;
 }
 
-const EXPORT_TEXTURE_LAYOUT: TextureLayout = "interleaved";
 const EXPORT_ZIP_COMPRESSION: "STORE" | "DEFLATE" = "DEFLATE";
 const EXPORT_ZIP_DEFLATE_LEVEL = 9;
-const EXPORT_ENCODE_RASTER_IMAGES = true;
 
 type ExampleSelectionKind = "pdf" | "zip";
 
@@ -586,6 +583,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
 
   try {
     let scene: VectorScene;
+    let pageScenesForCompile: VectorScene[];
     let parseMs = 0;
     let pagesPerRow = uiControlManager.readMaxPagesPerRowInput();
 
@@ -600,6 +598,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
         `Rearranging ${label}... (pages/row ${pagesPerRow}, using cached parsed pages)`
       );
       scene = composeVectorScenesInGrid(cachedPageScenes, pagesPerRow);
+      pageScenesForCompile = cachedPageScenes;
       parseMs = performance.now() - composeStart;
       console.log(
         `[Page grid] ${label}: recomposed ${cachedPageScenes.length.toLocaleString()} cached page scenes at ${pagesPerRow.toLocaleString()} pages/row in ${parseMs.toFixed(1)} ms`
@@ -627,6 +626,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
       }
 
       scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
+      pageScenesForCompile = pageScenes;
       storeCachedPdfPageScenes(label, pageSceneOptionsKey, pageScenes);
       console.log(
         `[Page grid] ${label}: parsed ${pageScenes.length.toLocaleString()} pages in ${parseMs.toFixed(1)} ms, arranged ${pagesPerRow.toLocaleString()}/row`
@@ -636,6 +636,8 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     if (activeLoadToken !== loadToken) {
       return;
     }
+
+    const compiledDocument = compilePdfPageScenes(pageScenesForCompile);
 
     const rasterLayerCount = listSceneRasterLayers(scene).length;
     const hasRasterLayer = rasterLayerCount > 0;
@@ -669,6 +671,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     lastParsedScene = scene;
     lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
+    lastCompiledDocument = compiledDocument;
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
@@ -683,6 +686,7 @@ async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPd
     setParsingLoader(false);
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to render PDF: ${message}`);
+    lastCompiledDocument = null;
     runtimeTextElement.textContent = "";
     setMetricPlaceholder(label);
   }
@@ -702,7 +706,9 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     const parseStart = performance.now();
     setParsingLoader(true);
     setStatus(`Loading parsed data from ${label}...`);
-    const scene = await loadSceneFromParsedDataZip(buffer);
+    const compiledDocument = await loadCompiledDocumentFromParsedDataZipV4(buffer);
+    const pagesPerRow = uiControlManager.readMaxPagesPerRowInput();
+    const scene = compiledDocumentToVectorScene(compiledDocument, pagesPerRow);
     const parseEnd = performance.now();
 
     if (activeLoadToken === loadToken) {
@@ -745,6 +751,7 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     lastParsedScene = scene;
     lastParsedSceneStats = sceneStats;
     lastParsedSceneLabel = label;
+    lastCompiledDocument = compiledDocument;
     refreshDropIndicator();
     setDownloadDataButtonState(true);
 
@@ -759,6 +766,7 @@ async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, optio
     setParsingLoader(false);
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to load parsed data zip: ${message}`);
+    lastCompiledDocument = null;
     runtimeTextElement.textContent = "";
     setMetricPlaceholder(label);
   }
@@ -859,46 +867,28 @@ function setHudCollapsed(collapsed: boolean): void {
 }
 
 async function downloadParsedDataZip(): Promise<void> {
-  if (!lastParsedScene || !lastParsedSceneStats || !lastParsedSceneLabel) {
+  if (!lastCompiledDocument || !lastParsedSceneLabel) {
     setStatus("No parsed floorplan data available to export.");
     return;
   }
 
-  const scene = lastParsedScene;
-  const sceneStats = lastParsedSceneStats;
   const label = lastParsedSceneLabel;
-  let sourcePdfBytes = lastLoadedSource?.kind === "pdf" ? lastLoadedSource.bytes : null;
-  if (scene.imagePaintOpCount <= 0) {
-    sourcePdfBytes = null;
-  }
-  if (!sourcePdfBytes && lastLoadedSource?.kind === "parsed-zip") {
-    sourcePdfBytes = await tryReadSourcePdfBytesFromExistingParsedZip(lastLoadedSource.bytes);
-  }
   const previousStatusText = statusTextElement.textContent;
 
   setDownloadDataButtonState(true, true);
-  statusTextElement.textContent = "Preparing parsed texture data zip (fast export)...";
+  statusTextElement.textContent = "Preparing parsed ZIP (v4)...";
 
   try {
-    const sceneRasterLayers = listSceneRasterLayers(scene);
-    const selectedZip = await buildParsedDataZipBlobForLayout(
-      scene,
-      sceneStats,
-      label,
-      sourcePdfBytes,
-      EXPORT_TEXTURE_LAYOUT,
-      sceneRasterLayers,
-      {
-        encodeRasterImages: EXPORT_ENCODE_RASTER_IMAGES,
-        zipCompression: EXPORT_ZIP_COMPRESSION,
-        zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
-      }
-    );
+    const selectedZip = await buildParsedDataZipV4Blob(lastCompiledDocument, {
+      sourceFile: label,
+      zipCompression: EXPORT_ZIP_COMPRESSION,
+      zipDeflateLevel: EXPORT_ZIP_DEFLATE_LEVEL
+    });
 
     const zipFileName = `${sanitizeDownloadName(label)}-parsed-data.zip`;
     triggerBlobDownload(selectedZip.blob, zipFileName);
     console.log(
-      `[Parsed data export] ${label}: wrote ${selectedZip.textureCount.toLocaleString()} vector textures + ${selectedZip.rasterLayerCount.toLocaleString()} raster layers to ${zipFileName} using ${selectedZip.layout} layout (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()}, raster=${EXPORT_ENCODE_RASTER_IMAGES ? "encoded" : "raw-rgba"})`
+      `[Parsed data export] ${label}: wrote v4 ZIP (${selectedZip.textureCount.toLocaleString()} textures, ${selectedZip.rasterLayerCount.toLocaleString()} raster layers) to ${zipFileName} (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()})`
     );
     statusTextElement.textContent = previousStatusText || baseStatus;
   } catch (error) {

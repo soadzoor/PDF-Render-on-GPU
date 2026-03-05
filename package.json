@@ -1,19 +1,32 @@
 {
-  "name": "pdf-render-on-gpu",
-  "private": true,
+  "name": "hepr",
+  "private": false,
   "version": "0.1.0",
   "type": "module",
+  "exports": {
+    "./three": {
+      "types": "./dist/three/three/index.d.ts",
+      "import": "./dist/three/index.js"
+    }
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:three": "vite build --mode three-lib && tsc -p tsconfig.three.json",
+    "build:all": "npm run build && npm run build:three",
     "preview": "vite preview",
     "examples:generate": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-example-assets.ts"
+  },
+  "peerDependencies": {
+    "three": "0.183.0"
   },
   "dependencies": {
     "jszip": "3.10.1",
     "pdfjs-dist": "5.4.624"
   },
   "devDependencies": {
+    "@types/three": "0.183.0",
+    "three": "0.183.0",
     "typescript": "5.9.3",
     "vite": "7.3.1"
   }

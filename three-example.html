@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HEPR Three Example</title>
+    <style>
+      :root {
+        color-scheme: light;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        background: #f3f5f8;
+      }
+
+      #app {
+        position: relative;
+        width: 100%;
+        height: 100%;
+      }
+
+      #viewport {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      #hud {
+        position: absolute;
+        top: 16px;
+        left: 16px;
+        width: min(420px, calc(100vw - 32px));
+        background: rgba(255, 255, 255, 0.94);
+        border: 1px solid rgba(12, 19, 32, 0.16);
+        border-radius: 12px;
+        padding: 12px;
+        backdrop-filter: blur(4px);
+      }
+
+      .toolbar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      button,
+      select,
+      input {
+        font: inherit;
+      }
+
+      button,
+      select {
+        min-height: 34px;
+        border-radius: 8px;
+        border: 1px solid #c3cad6;
+        background: #ffffff;
+        color: #111827;
+        padding: 0 10px;
+      }
+
+      button:hover,
+      select:hover {
+        border-color: #9aa6bb;
+      }
+
+      .rows {
+        margin-top: 10px;
+        display: grid;
+        gap: 8px;
+      }
+
+      .toggle {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .color-row {
+        display: grid;
+        grid-template-columns: 130px 1fr;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .color-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .color-controls input[type="range"] {
+        width: 120px;
+      }
+
+      #status {
+        margin-top: 10px;
+        font-size: 13px;
+        color: #293446;
+      }
+
+      #drop-indicator {
+        position: absolute;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(16, 47, 96, 0.18);
+        color: #0b2d63;
+        font-size: 22px;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+        pointer-events: none;
+      }
+
+      #drop-indicator.active {
+        display: flex;
+      }
+
+      @media (max-width: 640px) {
+        #hud {
+          width: calc(100vw - 24px);
+          left: 12px;
+          top: 12px;
+          padding: 10px;
+        }
+
+        .color-row {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="viewport"></canvas>
+      <div id="hud">
+        <div class="toolbar">
+          <button id="open-file" type="button">Open PDF / ZIP</button>
+          <select id="example-select" aria-label="Load example PDF or parsed ZIP" disabled>
+            <option value="">Examples (loading...)</option>
+          </select>
+          <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" hidden />
+        </div>
+        <div class="rows">
+          <label class="toggle">
+            <input id="toggle-stroke-curves" type="checkbox" checked />
+            <span>Curve strokes</span>
+          </label>
+          <label class="toggle">
+            <input id="toggle-vector-text-only" type="checkbox" />
+            <span>Vector only</span>
+          </label>
+          <div class="color-row">
+            <label for="page-bg-color">Page Background</label>
+            <div class="color-controls">
+              <input id="page-bg-color" type="color" value="#ffffff" />
+              <input id="page-bg-opacity" type="range" min="0" max="100" step="1" value="100" />
+              <span id="page-bg-opacity-value">100%</span>
+            </div>
+          </div>
+          <div class="color-row">
+            <label for="vector-color">Vector Override</label>
+            <div class="color-controls">
+              <input id="vector-color" type="color" value="#000000" />
+              <input id="vector-opacity" type="range" min="0" max="100" step="1" value="0" />
+              <span id="vector-opacity-value">0%</span>
+            </div>
+          </div>
+        </div>
+        <div id="status">Waiting for PDF or parsed ZIP...</div>
+      </div>
+      <div id="drop-indicator" class="active">Drop PDF or parsed ZIP to render</div>
+    </div>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { MapControls } from "three/examples/jsm/controls/MapControls.js";
+      import { LoadPDFObject } from "hepr/three";
+
+      const canvas = document.querySelector("#viewport");
+      const openButton = document.querySelector("#open-file");
+      const fileInput = document.querySelector("#file-input");
+      const exampleSelect = document.querySelector("#example-select");
+      const statusElement = document.querySelector("#status");
+      const dropIndicator = document.querySelector("#drop-indicator");
+      const strokeCurveToggle = document.querySelector("#toggle-stroke-curves");
+      const vectorOnlyToggle = document.querySelector("#toggle-vector-text-only");
+      const pageBgColorInput = document.querySelector("#page-bg-color");
+      const pageBgOpacityInput = document.querySelector("#page-bg-opacity");
+      const pageBgOpacityValue = document.querySelector("#page-bg-opacity-value");
+      const vectorColorInput = document.querySelector("#vector-color");
+      const vectorOpacityInput = document.querySelector("#vector-opacity");
+      const vectorOpacityValue = document.querySelector("#vector-opacity-value");
+
+      if (
+        !canvas ||
+        !openButton ||
+        !fileInput ||
+        !exampleSelect ||
+        !statusElement ||
+        !dropIndicator ||
+        !strokeCurveToggle ||
+        !vectorOnlyToggle ||
+        !pageBgColorInput ||
+        !pageBgOpacityInput ||
+        !pageBgOpacityValue ||
+        !vectorColorInput ||
+        !vectorOpacityInput ||
+        !vectorOpacityValue
+      ) {
+        throw new Error("Required UI elements are missing from three-example.html.");
+      }
+
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color("#f3f5f8");
+
+      const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -2000, 2000);
+      camera.position.set(0, 0, 100);
+
+      const controls = new MapControls(camera, renderer.domElement);
+      controls.enableRotate = false;
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.zoomSpeed = 1.15;
+      controls.panSpeed = 0.85;
+      controls.screenSpacePanning = true;
+
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.95);
+      scene.add(ambientLight);
+
+      const rootGroup = new THREE.Group();
+      scene.add(rootGroup);
+
+      let pdfObject = null;
+      let isDragActive = false;
+      const exampleSelectionMap = new Map();
+
+      const WORLD_UNITS_PER_POINT = 0.01;
+
+      function setStatus(message) {
+        statusElement.textContent = message;
+      }
+
+      function formatPercent(value) {
+        return `${Math.max(0, Math.min(100, Math.trunc(value)))}%`;
+      }
+
+      function readMaterialOptions() {
+        const bgOpacity = Math.max(0, Math.min(1, Number(pageBgOpacityInput.value) / 100));
+        const vectorOpacity = Math.max(0, Math.min(1, Number(vectorOpacityInput.value) / 100));
+
+        return {
+          strokeCurveEnabled: strokeCurveToggle.checked,
+          textVectorOnly: vectorOnlyToggle.checked,
+          pageBackgroundColor: pageBgColorInput.value,
+          pageBackgroundOpacity: bgOpacity,
+          vectorColorOverride: vectorOpacity > 0 ? vectorColorInput.value : null,
+          vectorOpacityOverride: vectorOpacity
+        };
+      }
+
+      function applyMaterialOptions() {
+        pageBgOpacityValue.textContent = formatPercent(pageBgOpacityInput.value);
+        vectorOpacityValue.textContent = formatPercent(vectorOpacityInput.value);
+        if (!pdfObject) {
+          return;
+        }
+
+        pdfObject.setMaterialOptions(readMaterialOptions());
+      }
+
+      function refreshDropIndicator() {
+        const shouldShow = isDragActive || !pdfObject;
+        dropIndicator.classList.toggle("active", shouldShow);
+      }
+
+      function disposeCurrentPdfObject() {
+        if (!pdfObject) {
+          return;
+        }
+
+        rootGroup.remove(pdfObject);
+        pdfObject.dispose();
+        pdfObject = null;
+      }
+
+      function layoutPages(pageMeshes) {
+        if (pageMeshes.length === 0) {
+          return;
+        }
+
+        const pagesPerRow = Math.max(1, Math.ceil(Math.sqrt(pageMeshes.length)));
+        let maxWidth = 0;
+        let maxHeight = 0;
+
+        for (const page of pageMeshes) {
+          maxWidth = Math.max(maxWidth, page.pageWidthPt * WORLD_UNITS_PER_POINT);
+          maxHeight = Math.max(maxHeight, page.pageHeightPt * WORLD_UNITS_PER_POINT);
+        }
+
+        const gap = Math.max(0.2, Math.min(maxWidth, maxHeight) * 0.08);
+
+        for (let i = 0; i < pageMeshes.length; i += 1) {
+          const page = pageMeshes[i];
+          const col = i % pagesPerRow;
+          const row = Math.floor(i / pagesPerRow);
+          const x = col * (maxWidth + gap);
+          const y = -row * (maxHeight + gap);
+          page.position.set(x, y, 0);
+          page.rotation.set(0, 0, 0);
+          page.scale.set(1, 1, 1);
+        }
+
+        const rows = Math.ceil(pageMeshes.length / pagesPerRow);
+        const width = pagesPerRow * maxWidth + (pagesPerRow - 1) * gap;
+        const height = rows * maxHeight + (rows - 1) * gap;
+
+        for (const page of pageMeshes) {
+          page.position.x -= width * 0.5 - maxWidth * 0.5;
+          page.position.y += height * 0.5 - maxHeight * 0.5;
+        }
+      }
+
+      function fitCameraToObject(object3d) {
+        const bounds = new THREE.Box3().setFromObject(object3d);
+        if (bounds.isEmpty()) {
+          return;
+        }
+
+        const size = bounds.getSize(new THREE.Vector3());
+        const center = bounds.getCenter(new THREE.Vector3());
+        const safeWidth = Math.max(size.x, 0.1);
+        const safeHeight = Math.max(size.y, 0.1);
+
+        const aspect = Math.max(window.innerWidth / Math.max(window.innerHeight, 1), 1e-6);
+        const padding = 1.08;
+
+        let halfWidth;
+        let halfHeight;
+        if (safeWidth / safeHeight > aspect) {
+          halfWidth = (safeWidth * padding) * 0.5;
+          halfHeight = halfWidth / aspect;
+        } else {
+          halfHeight = (safeHeight * padding) * 0.5;
+          halfWidth = halfHeight * aspect;
+        }
+
+        camera.left = -halfWidth;
+        camera.right = halfWidth;
+        camera.top = halfHeight;
+        camera.bottom = -halfHeight;
+        camera.position.set(center.x, center.y, 100);
+        camera.updateProjectionMatrix();
+
+        controls.target.copy(center);
+        controls.update();
+      }
+
+      function isPdfFile(file) {
+        const lower = file.name.toLowerCase();
+        return file.type === "application/pdf" || lower.endsWith(".pdf");
+      }
+
+      function isZipFile(file) {
+        const lower = file.name.toLowerCase();
+        return (
+          lower.endsWith(".zip") ||
+          file.type === "application/zip" ||
+          file.type === "application/x-zip-compressed"
+        );
+      }
+
+      async function loadSource(source, label) {
+        setStatus(`Loading ${label}...`);
+
+        disposeCurrentPdfObject();
+        refreshDropIndicator();
+
+        try {
+          const next = await LoadPDFObject(source, {
+            worker: "auto",
+            page: {
+              worldUnitsPerPoint: WORLD_UNITS_PER_POINT,
+              depthWrite: false,
+              side: THREE.DoubleSide
+            },
+            material: readMaterialOptions()
+          });
+
+          pdfObject = next;
+          layoutPages(pdfObject.pages);
+          rootGroup.add(pdfObject);
+          fitCameraToObject(pdfObject);
+          refreshDropIndicator();
+
+          setStatus(
+            `${label} loaded | pages ${pdfObject.pageCount.toLocaleString()} | drag to pan, wheel to zoom`
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message.includes("v3 is unsupported")) {
+            setStatus(`Failed to load ${label}: ${message}`);
+          } else {
+            setStatus(`Failed to load ${label}: ${message}`);
+          }
+        }
+      }
+
+      async function loadFile(file) {
+        if (!isPdfFile(file) && !isZipFile(file)) {
+          setStatus(`Unsupported file type: ${file.name}`);
+          return;
+        }
+
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        await loadSource(bytes, file.name);
+      }
+
+      function resolveAppAssetUrl(inputPath) {
+        const trimmed = inputPath.trim();
+        if (/^[a-z][a-z\d+.-]*:/i.test(trimmed)) {
+          return trimmed;
+        }
+
+        const normalized = trimmed.replace(/^\/+/, "");
+        const appBaseUrl = new URL(import.meta.env.BASE_URL, window.location.href);
+        return new URL(normalized, appBaseUrl).toString();
+      }
+
+      function formatKilobytes(sizeBytes) {
+        return (Math.max(0, Number(sizeBytes) || 0) / 1024).toFixed(1);
+      }
+
+      async function loadExampleManifest() {
+        exampleSelectionMap.clear();
+        exampleSelect.innerHTML = "";
+        exampleSelect.append(new Option("Examples (loading...)", ""));
+        exampleSelect.value = "";
+        exampleSelect.disabled = true;
+
+        try {
+          const manifestUrl = resolveAppAssetUrl("examples/manifest.json");
+          const response = await fetch(manifestUrl, { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const manifest = await response.json();
+          const entries = Array.isArray(manifest.examples) ? manifest.examples : [];
+
+          exampleSelect.innerHTML = "";
+          exampleSelect.append(new Option("Load example...", ""));
+
+          for (const entry of entries) {
+            if (!entry || typeof entry !== "object") {
+              continue;
+            }
+
+            const name = typeof entry.name === "string" ? entry.name : null;
+            const id = typeof entry.id === "string" ? entry.id : null;
+            const pdfPathRaw = typeof entry.pdf?.path === "string" ? entry.pdf.path : null;
+            const zipPathRaw = typeof entry.parsedZip?.path === "string" ? entry.parsedZip.path : null;
+            if (!name || !id || !pdfPathRaw || !zipPathRaw) {
+              continue;
+            }
+
+            const group = document.createElement("optgroup");
+            group.label = name;
+
+            const pdfPath = resolveAppAssetUrl(pdfPathRaw);
+            const zipPath = resolveAppAssetUrl(zipPathRaw);
+            const pdfSize = formatKilobytes(entry.pdf?.sizeBytes);
+            const zipSize = formatKilobytes(entry.parsedZip?.sizeBytes);
+
+            const pdfKey = `${id}:pdf`;
+            const zipKey = `${id}:zip`;
+
+            exampleSelectionMap.set(pdfKey, {
+              name,
+              kind: "pdf",
+              path: pdfPath
+            });
+            exampleSelectionMap.set(zipKey, {
+              name,
+              kind: "zip",
+              path: zipPath
+            });
+
+            group.append(new Option(`Parse PDF (${pdfSize} kB)`, pdfKey));
+            group.append(new Option(`Load Parsed ZIP (${zipSize} kB)`, zipKey));
+            exampleSelect.append(group);
+          }
+
+          exampleSelect.disabled = exampleSelectionMap.size === 0;
+          exampleSelect.value = "";
+          if (exampleSelectionMap.size === 0) {
+            exampleSelect.innerHTML = "";
+            exampleSelect.append(new Option("Examples unavailable", ""));
+            exampleSelect.disabled = true;
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`[three-example] Failed to load examples manifest: ${message}`);
+          exampleSelect.innerHTML = "";
+          exampleSelect.append(new Option("Examples unavailable", ""));
+          exampleSelect.value = "";
+          exampleSelect.disabled = true;
+        }
+      }
+
+      async function loadExampleSelection(selectionKey) {
+        const selection = exampleSelectionMap.get(selectionKey);
+        if (!selection) {
+          exampleSelect.value = "";
+          return;
+        }
+
+        exampleSelect.disabled = true;
+
+        try {
+          const sourceLabel = selection.kind === "pdf" ? "PDF" : "parsed ZIP";
+          setStatus(`Loading example ${selection.name} (${sourceLabel})...`);
+
+          const response = await fetch(selection.path, { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          const label = selection.kind === "pdf"
+            ? selection.name
+            : `${selection.name} (parsed zip)`;
+          await loadSource(bytes, label);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          setStatus(`Failed to load example: ${message}`);
+        } finally {
+          exampleSelect.value = "";
+          exampleSelect.disabled = exampleSelectionMap.size === 0;
+        }
+      }
+
+      function resizeRenderer() {
+        const width = Math.max(window.innerWidth, 1);
+        const height = Math.max(window.innerHeight, 1);
+        renderer.setSize(width, height, false);
+        if (pdfObject) {
+          fitCameraToObject(pdfObject);
+        } else {
+          camera.updateProjectionMatrix();
+        }
+      }
+
+      function animate() {
+        controls.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+
+      openButton.addEventListener("click", () => fileInput.click());
+
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) {
+          return;
+        }
+        await loadFile(file);
+        fileInput.value = "";
+      });
+
+      exampleSelect.addEventListener("change", () => {
+        const selectionKey = exampleSelect.value;
+        if (!selectionKey) {
+          return;
+        }
+        void loadExampleSelection(selectionKey);
+      });
+
+      window.addEventListener("dragenter", (event) => {
+        event.preventDefault();
+        isDragActive = true;
+        refreshDropIndicator();
+      });
+
+      window.addEventListener("dragover", (event) => {
+        event.preventDefault();
+        if (!isDragActive) {
+          isDragActive = true;
+          refreshDropIndicator();
+        }
+      });
+
+      window.addEventListener("dragleave", (event) => {
+        if (event.target === document.documentElement || event.target === document.body) {
+          isDragActive = false;
+          refreshDropIndicator();
+        }
+      });
+
+      window.addEventListener("drop", async (event) => {
+        event.preventDefault();
+        isDragActive = false;
+        refreshDropIndicator();
+
+        const files = Array.from(event.dataTransfer?.files || []);
+        const supported = files.find((file) => isPdfFile(file) || isZipFile(file));
+        if (!supported) {
+          setStatus("Dropped file is not a supported PDF or parsed ZIP.");
+          return;
+        }
+
+        await loadFile(supported);
+      });
+
+      window.addEventListener("resize", resizeRenderer);
+
+      strokeCurveToggle.addEventListener("change", applyMaterialOptions);
+      vectorOnlyToggle.addEventListener("change", applyMaterialOptions);
+      pageBgColorInput.addEventListener("input", applyMaterialOptions);
+      pageBgOpacityInput.addEventListener("input", applyMaterialOptions);
+      vectorColorInput.addEventListener("input", applyMaterialOptions);
+      vectorOpacityInput.addEventListener("input", applyMaterialOptions);
+
+      applyMaterialOptions();
+      refreshDropIndicator();
+      resizeRenderer();
+      void loadExampleManifest();
+      animate();
+    </script>
+  </body>
+</html>
