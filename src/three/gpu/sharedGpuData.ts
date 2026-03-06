@@ -15,7 +15,7 @@ import {
 
 import type { VectorScene } from "../../pdfVectorExtractor";
 import { buildTextRasterAtlas } from "../../textRasterAtlas";
-import { buildRasterAtlas } from "../../core/rasterAtlas";
+import { buildRasterAtlases, type RasterAtlasTilePlacement } from "../../core/rasterAtlas";
 import type { CompiledPdfDocument } from "../../core/types";
 
 export interface FloatTextureRef {
@@ -60,8 +60,8 @@ export interface SharedGpuData {
   rasterLayerMetaTextureB: FloatTextureRef;
   rasterLayerMetaTextureC: FloatTextureRef;
 
-  rasterAtlasTexture: DataTexture;
-  rasterAtlasSize: { width: number; height: number };
+  rasterAtlasTextures: DataTexture[];
+  rasterAtlasSizes: Array<{ width: number; height: number }>;
   textAtlasTexture: DataTexture;
   textAtlasSize: { width: number; height: number };
 
@@ -73,6 +73,10 @@ const DEFAULT_MAX_TEXTURE_SIZE = 4096;
 
 export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuData {
   const maxTextureSize = resolveMaxTextureSizeFallback();
+
+  const rasterAtlasBuild = buildRasterAtlases(document.rasterLayers, maxTextureSize);
+  const rasterAtlasTextures = rasterAtlasBuild.atlases.map((atlas) => createRgbaTexture(atlas.rgba, atlas.width, atlas.height));
+  const rasterPrimitiveBuild = buildRasterPrimitiveTable(document, rasterAtlasBuild.tiles);
 
   const pageMetaA = new Float32Array(document.pageCount * 4);
   const pageMetaB = new Float32Array(document.pageCount * 4);
@@ -89,8 +93,8 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
 
     pageMetaB[offset] = page.textInstanceStart;
     pageMetaB[offset + 1] = page.textInstanceCount;
-    pageMetaB[offset + 2] = page.rasterLayerStart;
-    pageMetaB[offset + 3] = page.rasterLayerCount;
+    pageMetaB[offset + 2] = rasterPrimitiveBuild.pageRasterStarts[i];
+    pageMetaB[offset + 3] = rasterPrimitiveBuild.pageRasterCounts[i];
 
     pageRects[offset] = page.pageRect[0];
     pageRects[offset + 1] = page.pageRect[1];
@@ -121,17 +125,14 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
   const textGlyphSegmentTextureA = createFloatTexture(document.textGlyphSegmentsA, maxTextureSize);
   const textGlyphSegmentTextureB = createFloatTexture(document.textGlyphSegmentsB, maxTextureSize);
 
-  const rasterAtlas = buildRasterAtlas(document.rasterLayers);
-  const rasterAtlasTexture = createRgbaTexture(rasterAtlas.rgba, rasterAtlas.width, rasterAtlas.height);
+  const rasterLayerMetaA = new Float32Array(rasterPrimitiveBuild.primitives.length * 4);
+  const rasterLayerMetaB = new Float32Array(rasterPrimitiveBuild.primitives.length * 4);
+  const rasterLayerMetaC = new Float32Array(rasterPrimitiveBuild.primitives.length * 4);
 
-  const rasterLayerMetaA = new Float32Array(document.rasterLayers.length * 4);
-  const rasterLayerMetaB = new Float32Array(document.rasterLayers.length * 4);
-  const rasterLayerMetaC = new Float32Array(document.rasterLayers.length * 4);
-
-  for (let i = 0; i < document.rasterLayers.length; i += 1) {
-    const layer = document.rasterLayers[i];
-    const matrix = layer.matrix;
-    const uv = readUvRect(rasterAtlas.uvRects, i);
+  for (let i = 0; i < rasterPrimitiveBuild.primitives.length; i += 1) {
+    const primitive = rasterPrimitiveBuild.primitives[i];
+    const matrix = primitive.matrix;
+    const uv = primitive.uvRect;
     const offset = i * 4;
 
     rasterLayerMetaA[offset] = matrix[0] ?? 1;
@@ -146,7 +147,7 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
 
     rasterLayerMetaC[offset] = uv[2];
     rasterLayerMetaC[offset + 1] = uv[3];
-    rasterLayerMetaC[offset + 2] = 0;
+    rasterLayerMetaC[offset + 2] = primitive.atlasIndex;
     rasterLayerMetaC[offset + 3] = 0;
   }
 
@@ -158,7 +159,7 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
   const textAtlasTexture = createTextAtlasTexture(textAtlasBuild.rgba, textAtlasBuild.width, textAtlasBuild.height);
   const textGlyphRasterMetaTexture = createFloatTexture(textAtlasBuild.glyphUvRects, maxTextureSize);
 
-  const maxRasterPrimitiveCount = Math.max(1, 1 + document.maxRasterLayerCountPerPage);
+  const maxRasterPrimitiveCount = Math.max(1, 1 + rasterPrimitiveBuild.maxRasterPrimitiveCountPerPage);
   const maxFillPrimitiveCount = Math.max(1, document.maxFillPathCountPerPage);
   const maxSegmentPrimitiveCount = Math.max(1, document.maxSegmentCountPerPage);
   const maxTextPrimitiveCount = Math.max(1, document.maxTextInstanceCountPerPage);
@@ -167,7 +168,8 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
     maxRasterPrimitiveCount,
     maxFillPrimitiveCount,
     maxSegmentPrimitiveCount,
-    maxTextPrimitiveCount
+    maxTextPrimitiveCount,
+    rasterAtlasTextures.length
   );
 
   const disposableTextures: DataTexture[] = [
@@ -194,7 +196,7 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
     rasterLayerMetaTextureA.texture,
     rasterLayerMetaTextureB.texture,
     rasterLayerMetaTextureC.texture,
-    rasterAtlasTexture,
+    ...rasterAtlasTextures,
     textAtlasTexture
   ];
 
@@ -228,8 +230,8 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
     rasterLayerMetaTextureA,
     rasterLayerMetaTextureB,
     rasterLayerMetaTextureC,
-    rasterAtlasTexture,
-    rasterAtlasSize: { width: rasterAtlas.width, height: rasterAtlas.height },
+    rasterAtlasTextures,
+    rasterAtlasSizes: rasterAtlasBuild.atlases.map((atlas) => ({ width: atlas.width, height: atlas.height })),
     textAtlasTexture,
     textAtlasSize: { width: textAtlasBuild.width, height: textAtlasBuild.height },
     createInstancedGeometry: (pageIndices: readonly number[]) => createInstancedPageGeometry(geometry, pageIndices),
@@ -239,6 +241,123 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
         texture.dispose();
       }
     }
+  };
+}
+
+interface RasterPrimitiveInfo {
+  atlasIndex: number;
+  matrix: [number, number, number, number, number, number];
+  uvRect: [number, number, number, number];
+}
+
+interface RasterPrimitiveBuildResult {
+  primitives: RasterPrimitiveInfo[];
+  pageRasterStarts: Uint32Array;
+  pageRasterCounts: Uint32Array;
+  maxRasterPrimitiveCountPerPage: number;
+}
+
+function buildRasterPrimitiveTable(
+  document: CompiledPdfDocument,
+  tilePlacements: RasterAtlasTilePlacement[]
+): RasterPrimitiveBuildResult {
+  const pageRasterStarts = new Uint32Array(document.pageCount);
+  const pageRasterCounts = new Uint32Array(document.pageCount);
+  const primitives: RasterPrimitiveInfo[] = [];
+  const layerTileMap = new Map<number, RasterAtlasTilePlacement[]>();
+
+  for (const tile of tilePlacements) {
+    const entries = layerTileMap.get(tile.layerIndex);
+    if (entries) {
+      entries.push(tile);
+      continue;
+    }
+    layerTileMap.set(tile.layerIndex, [tile]);
+  }
+
+  for (const entries of layerTileMap.values()) {
+    entries.sort((a, b) => {
+      if (a.sourceY !== b.sourceY) {
+        return a.sourceY - b.sourceY;
+      }
+      return a.sourceX - b.sourceX;
+    });
+  }
+
+  let maxRasterPrimitiveCountPerPage = 0;
+
+  for (let pageIndex = 0; pageIndex < document.pages.length; pageIndex += 1) {
+    const page = document.pages[pageIndex];
+    const primitiveStart = primitives.length;
+    const layerEnd = page.rasterLayerStart + page.rasterLayerCount;
+
+    for (let layerIndex = page.rasterLayerStart; layerIndex < layerEnd; layerIndex += 1) {
+      const layer = document.rasterLayers[layerIndex];
+      if (!layer) {
+        continue;
+      }
+
+      const layerWidth = Math.max(1, Math.trunc(layer.width));
+      const layerHeight = Math.max(1, Math.trunc(layer.height));
+      if (layerWidth <= 0 || layerHeight <= 0) {
+        continue;
+      }
+
+      const tiles = layerTileMap.get(layerIndex);
+      if (!tiles || tiles.length === 0) {
+        continue;
+      }
+
+      for (const tile of tiles) {
+        primitives.push(buildRasterPrimitive(layer.matrix, layerWidth, layerHeight, tile));
+      }
+    }
+
+    const primitiveCount = primitives.length - primitiveStart;
+    pageRasterStarts[pageIndex] = primitiveStart;
+    pageRasterCounts[pageIndex] = primitiveCount;
+    maxRasterPrimitiveCountPerPage = Math.max(maxRasterPrimitiveCountPerPage, primitiveCount);
+  }
+
+  return {
+    primitives,
+    pageRasterStarts,
+    pageRasterCounts,
+    maxRasterPrimitiveCountPerPage
+  };
+}
+
+function buildRasterPrimitive(
+  matrixSource: Float32Array,
+  layerWidth: number,
+  layerHeight: number,
+  tile: RasterAtlasTilePlacement
+): RasterPrimitiveInfo {
+  const matrix = [
+    Number(matrixSource[0] ?? 1),
+    Number(matrixSource[1] ?? 0),
+    Number(matrixSource[2] ?? 0),
+    Number(matrixSource[3] ?? 1),
+    Number(matrixSource[4] ?? 0),
+    Number(matrixSource[5] ?? 0)
+  ] as [number, number, number, number, number, number];
+
+  const tileScaleX = tile.width / layerWidth;
+  const tileScaleY = tile.height / layerHeight;
+  const tileOffsetX = tile.sourceX / layerWidth;
+  const tileOffsetY = tile.sourceY / layerHeight;
+
+  const a = matrix[0] * tileScaleX;
+  const b = matrix[1] * tileScaleX;
+  const c = matrix[2] * tileScaleY;
+  const d = matrix[3] * tileScaleY;
+  const e = matrix[0] * tileOffsetX + matrix[2] * tileOffsetY + matrix[4];
+  const f = matrix[1] * tileOffsetX + matrix[3] * tileOffsetY + matrix[5];
+
+  return {
+    atlasIndex: tile.atlasIndex,
+    matrix: [a, b, c, d, e, f],
+    uvRect: tile.uvRect
   };
 }
 
@@ -298,8 +417,10 @@ function createSharedPageGeometry(
   maxRasterPrimitiveCount: number,
   maxFillPrimitiveCount: number,
   maxSegmentPrimitiveCount: number,
-  maxTextPrimitiveCount: number
+  maxTextPrimitiveCount: number,
+  rasterPassCountInput: number
 ): InstancedBufferGeometry {
+  const rasterPassCount = Math.max(1, Math.trunc(rasterPassCountInput));
   const totalPrimitiveCount =
     maxRasterPrimitiveCount + maxFillPrimitiveCount + maxSegmentPrimitiveCount + maxTextPrimitiveCount;
   const totalVertexCount = totalPrimitiveCount * 4;
@@ -318,13 +439,15 @@ function createSharedPageGeometry(
   const rasterResult = appendPrimitiveDomain(positions, primitiveIndex, quadIndices, vertexOffset, indexOffset, maxRasterPrimitiveCount);
   vertexOffset = rasterResult.vertexOffset;
   indexOffset = rasterResult.indexOffset;
-  geometry.addGroup(groupStart, maxRasterPrimitiveCount * 6, 0);
+  for (let passIndex = 0; passIndex < rasterPassCount; passIndex += 1) {
+    geometry.addGroup(groupStart, maxRasterPrimitiveCount * 6, passIndex);
+  }
   groupStart += maxRasterPrimitiveCount * 6;
 
   const fillResult = appendPrimitiveDomain(positions, primitiveIndex, quadIndices, vertexOffset, indexOffset, maxFillPrimitiveCount);
   vertexOffset = fillResult.vertexOffset;
   indexOffset = fillResult.indexOffset;
-  geometry.addGroup(groupStart, maxFillPrimitiveCount * 6, 1);
+  geometry.addGroup(groupStart, maxFillPrimitiveCount * 6, rasterPassCount);
   groupStart += maxFillPrimitiveCount * 6;
 
   const strokeResult = appendPrimitiveDomain(
@@ -337,11 +460,11 @@ function createSharedPageGeometry(
   );
   vertexOffset = strokeResult.vertexOffset;
   indexOffset = strokeResult.indexOffset;
-  geometry.addGroup(groupStart, maxSegmentPrimitiveCount * 6, 2);
+  geometry.addGroup(groupStart, maxSegmentPrimitiveCount * 6, rasterPassCount + 1);
   groupStart += maxSegmentPrimitiveCount * 6;
 
   appendPrimitiveDomain(positions, primitiveIndex, quadIndices, vertexOffset, indexOffset, maxTextPrimitiveCount);
-  geometry.addGroup(groupStart, maxTextPrimitiveCount * 6, 3);
+  geometry.addGroup(groupStart, maxTextPrimitiveCount * 6, rasterPassCount + 2);
 
   geometry.setAttribute("position", new BufferAttribute(positions, 3));
   geometry.setAttribute("aPrimitiveIndex", new BufferAttribute(primitiveIndex, 1));
@@ -456,14 +579,6 @@ function buildTextAtlasForDocument(document: CompiledPdfDocument, maxTextureSize
     rgba: atlas.rgba,
     glyphUvRects: atlas.glyphUvRects
   };
-}
-
-function readUvRect(uvRects: Float32Array, index: number): [number, number, number, number] {
-  const offset = index * 4;
-  if (offset + 3 >= uvRects.length) {
-    return [0, 0, 0, 0];
-  }
-  return [uvRects[offset], uvRects[offset + 1], uvRects[offset + 2], uvRects[offset + 3]];
 }
 
 function resolveMaxTextureSizeFallback(): number {

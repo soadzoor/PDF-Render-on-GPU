@@ -3443,6 +3443,33 @@ async function createRasterRenderSurface(width: number, height: number): Promise
     };
   }
 
+  const offscreenCanvasCtor = (globalThis as {
+    OffscreenCanvas?: new (canvasWidth: number, canvasHeight: number) => {
+      width: number;
+      height: number;
+      getContext: (kind: "2d", options?: unknown) => unknown;
+    };
+  }).OffscreenCanvas;
+
+  if (typeof offscreenCanvasCtor === "function") {
+    const canvas = new offscreenCanvasCtor(width, height);
+    const context = canvas.getContext("2d", {
+      alpha: true,
+      willReadFrequently: true
+    });
+    if (context && typeof (context as { getImageData?: unknown }).getImageData === "function") {
+      return {
+        context: context as {
+          getImageData: (x: number, y: number, renderWidth: number, renderHeight: number) => { data: Uint8Array | Uint8ClampedArray };
+        },
+        dispose: () => {
+          canvas.width = 0;
+          canvas.height = 0;
+        }
+      };
+    }
+  }
+
   const nodeCanvas = await getNodeCanvasModule();
   if (!nodeCanvas) {
     return null;
@@ -3481,6 +3508,9 @@ async function renderRasterLayerRgba(
   const height = Math.max(1, Math.ceil(Number(viewportLike.height) || 1));
   const surface = await createRasterRenderSurface(width, height);
   if (!surface) {
+    if (isWorkerRenderScopeWithout2DCanvas()) {
+      throw new Error("Worker raster extraction requires OffscreenCanvas 2D support. Falling back to main thread.");
+    }
     return null;
   }
   const context = surface.context;
@@ -3512,6 +3542,15 @@ async function renderRasterLayerRgba(
   const rgba = new Uint8Array(imageData.data instanceof Uint8ClampedArray ? imageData.data : new Uint8Array(imageData.data));
   surface.dispose();
   return rgba;
+}
+
+function isWorkerRenderScopeWithout2DCanvas(): boolean {
+  if (typeof document !== "undefined") {
+    return false;
+  }
+
+  const scope = globalThis as { importScripts?: unknown };
+  return typeof scope.importScripts === "function";
 }
 
 function hasVisibleAlphaPixels(rgba: Uint8Array): boolean {

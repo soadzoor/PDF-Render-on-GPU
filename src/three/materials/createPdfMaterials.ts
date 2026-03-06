@@ -9,7 +9,7 @@ import type { SharedGpuData } from "../gpu/sharedGpuData";
 import type { ResolvedLoadOptions, ResolvedMaterialOptions } from "../types";
 
 export interface PdfMaterialSet {
-  raster: RawShaderMaterial;
+  rasterPasses: RawShaderMaterial[];
   fill: RawShaderMaterial;
   stroke: RawShaderMaterial;
   text: RawShaderMaterial;
@@ -52,27 +52,30 @@ export function createPdfMaterialSet(
     uTextAAScreenPx: { value: 1.25 }
   };
 
-  const raster = new RawShaderMaterial({
-    glslVersion: GLSL3,
-    transparent: true,
-    side: options.page.side,
-    depthWrite: options.page.depthWrite,
-    depthTest: true,
-    vertexShader: buildRasterVertexShader(isInstanced),
-    fragmentShader: RASTER_FRAGMENT_SHADER,
-    uniforms: {
-      ...commonUniforms,
-      uRasterLayerTexA: { value: shared.rasterLayerMetaTextureA.texture },
-      uRasterLayerTexB: { value: shared.rasterLayerMetaTextureB.texture },
-      uRasterLayerTexC: { value: shared.rasterLayerMetaTextureC.texture },
-      uRasterLayerTexSize: {
-        value: [shared.rasterLayerMetaTextureA.width, shared.rasterLayerMetaTextureA.height]
+  const rasterPasses = shared.rasterAtlasTextures.map((atlasTexture, atlasIndex) =>
+    new RawShaderMaterial({
+      glslVersion: GLSL3,
+      transparent: true,
+      side: options.page.side,
+      depthWrite: options.page.depthWrite,
+      depthTest: true,
+      vertexShader: buildRasterVertexShader(isInstanced),
+      fragmentShader: RASTER_FRAGMENT_SHADER,
+      uniforms: {
+        ...commonUniforms,
+        uRasterLayerTexA: { value: shared.rasterLayerMetaTextureA.texture },
+        uRasterLayerTexB: { value: shared.rasterLayerMetaTextureB.texture },
+        uRasterLayerTexC: { value: shared.rasterLayerMetaTextureC.texture },
+        uRasterLayerTexSize: {
+          value: [shared.rasterLayerMetaTextureA.width, shared.rasterLayerMetaTextureA.height]
+        },
+        uRasterAtlasTex: { value: atlasTexture },
+        uRasterAtlasIndex: { value: atlasIndex },
+        uRasterPassIncludesBackground: { value: atlasIndex === 0 ? 1 : 0 }
       },
-      uRasterAtlasTex: { value: shared.rasterAtlasTexture },
-      uRasterAtlasSize: { value: [shared.rasterAtlasSize.width, shared.rasterAtlasSize.height] }
-    },
-    ...instancedDefinePatch
-  });
+      ...instancedDefinePatch
+    })
+  );
 
   const fill = new RawShaderMaterial({
     glslVersion: GLSL3,
@@ -143,12 +146,12 @@ export function createPdfMaterialSet(
     ...instancedDefinePatch
   });
 
-  const all = [raster, fill, stroke, text];
+  const all = [...rasterPasses, fill, stroke, text];
 
   setMaterialFlags(all, options.page.side, options.page.depthWrite);
 
   return {
-    raster,
+    rasterPasses,
     fill,
     stroke,
     text,
@@ -280,6 +283,8 @@ uniform sampler2D uRasterLayerTexA;
 uniform sampler2D uRasterLayerTexB;
 uniform sampler2D uRasterLayerTexC;
 uniform ivec2 uRasterLayerTexSize;
+uniform float uRasterAtlasIndex;
+uniform float uRasterPassIncludesBackground;
 
 out vec2 vUv;
 flat out float vRasterKind;
@@ -298,11 +303,18 @@ void main() {
   if (primitiveIndex > rasterCount) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vUv = vec2(0.0);
-    vRasterKind = 0.0;
+    vRasterKind = 2.0;
     return;
   }
 
   if (primitiveIndex == 0) {
+    if (uRasterPassIncludesBackground < 0.5) {
+      gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+      vUv = vec2(0.0);
+      vRasterKind = 2.0;
+      return;
+    }
+
     vec2 pagePoint = mix(pageRect.xy, pageRect.zw, corner01);
     gl_Position = toClip(pagePoint, pageCenter);
     vUv = vec2(0.0);
@@ -314,6 +326,13 @@ void main() {
   vec4 metaA = texelFetch(uRasterLayerTexA, coordFromIndex(layerIndex, uRasterLayerTexSize), 0);
   vec4 metaB = texelFetch(uRasterLayerTexB, coordFromIndex(layerIndex, uRasterLayerTexSize), 0);
   vec4 metaC = texelFetch(uRasterLayerTexC, coordFromIndex(layerIndex, uRasterLayerTexSize), 0);
+
+  if (abs(metaC.z - uRasterAtlasIndex) > 0.5) {
+    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+    vUv = vec2(0.0);
+    vRasterKind = 2.0;
+    return;
+  }
 
   vec2 localTopDown = vec2(corner01.x, 1.0 - corner01.y);
   vec2 pagePoint = vec2(
@@ -339,6 +358,10 @@ flat in float vRasterKind;
 out vec4 outColor;
 
 void main() {
+  if (vRasterKind > 1.5) {
+    discard;
+  }
+
   if (vRasterKind < 0.5) {
     if (uPageBackgroundColor.a <= 0.001) {
       discard;
