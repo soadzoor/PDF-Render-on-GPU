@@ -15,6 +15,7 @@
     "build:three": "vite build --mode three-lib && tsc -p tsconfig.three.json",
     "build:all": "npm run build && npm run build:three",
     "preview": "vite preview",
+    "deploy": "npm run build && node scripts/deploy.mjs",
     "examples:generate": "node --max-old-space-size=12288 --experimental-strip-types scripts/generate-example-assets.ts"
   },
   "peerDependencies": {
