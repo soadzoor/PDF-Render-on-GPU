@@ -80,7 +80,7 @@ export async function loadCompiledDocumentInWorker(
 
       const handleError = (event: ErrorEvent) => {
         cleanup();
-        reject(new Error(event.message || "Worker load failed."));
+        reject(new Error(formatWorkerLoadError(event)));
       };
 
       const handleMessageError = () => {
@@ -115,4 +115,18 @@ function createDefaultCompiledDocumentWorker(customUrl?: string): Worker {
 
   const url = new URL("./compiledDocumentLoadWorker.ts", import.meta.url);
   return new Worker(url, { type: "module" });
+}
+
+function formatWorkerLoadError(event: ErrorEvent): string {
+  const baseMessage = event.message || "Worker load failed.";
+  const filename = typeof event.filename === "string" ? event.filename : "";
+  const line = Number.isFinite(event.lineno) && event.lineno > 0 ? Math.trunc(event.lineno) : 0;
+  const column = Number.isFinite(event.colno) && event.colno > 0 ? Math.trunc(event.colno) : 0;
+
+  if (!filename) {
+    return baseMessage;
+  }
+
+  const location = `${filename}${line > 0 ? `:${line}` : ""}${column > 0 ? `:${column}` : ""}`;
+  return `${baseMessage} (${location})`;
 }

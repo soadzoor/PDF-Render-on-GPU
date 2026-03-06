@@ -659,7 +659,7 @@ async function loadPdfSource(source: PDFSource, label: string, options: LoadPdfO
       setStatus(
         `Parsing ${label} with PDF.js... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
-      compiledDocument = await loadCompiledDocumentWithWorkerFallback(source, {
+      compiledDocument = await loadCompiledDocumentWithWorkerFallback(source, label, {
         maxPages: undefined,
         extraction: extractionOptions,
         progress: progress.child(0, 0.97)
@@ -718,7 +718,7 @@ async function loadParsedDataZipSource(source: PDFSource, label: string, options
   try {
     const parseStart = performance.now();
     setStatus(`Loading parsed data from ${label}...`);
-    const compiledDocument = await loadCompiledDocumentWithWorkerFallback(source, {
+    const compiledDocument = await loadCompiledDocumentWithWorkerFallback(source, label, {
       progress: progress.child(0, 0.97)
     });
 
@@ -803,8 +803,16 @@ function sameLoadedSource(a: PDFSource, b: PDFSource): boolean {
   return a === b;
 }
 
+function reportWorkerFallback(label: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  const line = `[hepr/native][worker-fallback] ${label}: ${message}`;
+  console.warn(line, error);
+  hudFlushController.appendDebugLine(line);
+}
+
 async function loadCompiledDocumentWithWorkerFallback(
   source: PDFSource,
+  label: string,
   options: {
     maxPages?: number;
     extraction?: {
@@ -817,12 +825,10 @@ async function loadCompiledDocumentWithWorkerFallback(
   try {
     return await loadCompiledDocumentInWorker(source, {
       ...options,
-      progress: options.progress?.child(0, 1, { executionPath: "worker" }),
-      worker: {
-        create: () => new Worker(new URL("./worker/compiledDocumentLoadWorker.ts", import.meta.url), { type: "module" })
-      }
+      progress: options.progress?.child(0, 1, { executionPath: "worker" })
     });
-  } catch {
+  } catch (error) {
+    reportWorkerFallback(label, error);
     return loadCompiledDocumentFromSource(source, {
       ...options,
       progress: options.progress?.child(0, 1, { executionPath: "main-thread-fallback" })
