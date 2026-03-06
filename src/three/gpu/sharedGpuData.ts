@@ -381,11 +381,12 @@ function createFloatTexture(data: Float32Array, maxTextureSize: number): FloatTe
 function createRgbaTexture(data: Uint8Array, width: number, height: number): DataTexture {
   const texture = new DataTexture(data, width, height, RGBAFormat);
   texture.needsUpdate = true;
-  texture.generateMipmaps = false;
-  texture.minFilter = LinearFilter;
+  texture.generateMipmaps = true;
+  texture.minFilter = LinearMipmapLinearFilter;
   texture.magFilter = LinearFilter;
   texture.wrapS = ClampToEdgeWrapping;
   texture.wrapT = ClampToEdgeWrapping;
+  texture.anisotropy = 4;
   return texture;
 }
 

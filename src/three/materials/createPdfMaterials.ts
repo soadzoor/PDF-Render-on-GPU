@@ -70,6 +70,12 @@ export function createPdfMaterialSet(
           value: [shared.rasterLayerMetaTextureA.width, shared.rasterLayerMetaTextureA.height]
         },
         uRasterAtlasTex: { value: atlasTexture },
+        uRasterAtlasSize: {
+          value: [
+            shared.rasterAtlasSizes[atlasIndex]?.width ?? 1,
+            shared.rasterAtlasSizes[atlasIndex]?.height ?? 1
+          ]
+        },
         uRasterAtlasIndex: { value: atlasIndex },
         uRasterPassIncludesBackground: { value: atlasIndex === 0 ? 1 : 0 }
       },
@@ -287,6 +293,7 @@ uniform float uRasterAtlasIndex;
 uniform float uRasterPassIncludesBackground;
 
 out vec2 vUv;
+flat out vec4 vUvRect;
 flat out float vRasterKind;
 
 void main() {
@@ -303,6 +310,7 @@ void main() {
   if (primitiveIndex > rasterCount) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vUv = vec2(0.0);
+    vUvRect = vec4(0.0);
     vRasterKind = 2.0;
     return;
   }
@@ -311,6 +319,7 @@ void main() {
     if (uRasterPassIncludesBackground < 0.5) {
       gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
       vUv = vec2(0.0);
+      vUvRect = vec4(0.0);
       vRasterKind = 2.0;
       return;
     }
@@ -318,6 +327,7 @@ void main() {
     vec2 pagePoint = mix(pageRect.xy, pageRect.zw, corner01);
     gl_Position = toClip(pagePoint, pageCenter);
     vUv = vec2(0.0);
+    vUvRect = vec4(0.0);
     vRasterKind = 0.0;
     return;
   }
@@ -330,6 +340,7 @@ void main() {
   if (abs(metaC.z - uRasterAtlasIndex) > 0.5) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vUv = vec2(0.0);
+    vUvRect = vec4(0.0);
     vRasterKind = 2.0;
     return;
   }
@@ -341,7 +352,8 @@ void main() {
   );
 
   gl_Position = toClip(pagePoint, pageCenter);
-  vUv = vec2(metaB.z + localTopDown.x * metaC.x, metaB.w + localTopDown.y * metaC.y);
+  vUvRect = vec4(metaB.z, metaB.w, metaC.x, metaC.y);
+  vUv = vec2(vUvRect.x + localTopDown.x * vUvRect.z, vUvRect.y + localTopDown.y * vUvRect.w);
   vRasterKind = 1.0;
 }
 `;
@@ -351,9 +363,11 @@ const RASTER_FRAGMENT_SHADER = `precision highp float;
 precision highp sampler2D;
 
 uniform sampler2D uRasterAtlasTex;
+uniform vec2 uRasterAtlasSize;
 uniform vec4 uPageBackgroundColor;
 
 in vec2 vUv;
+flat in vec4 vUvRect;
 flat in float vRasterKind;
 out vec4 outColor;
 
@@ -370,7 +384,29 @@ void main() {
     return;
   }
 
-  vec4 color = texture(uRasterAtlasTex, vUv);
+  vec2 atlasPxSize = max(uRasterAtlasSize, vec2(1.0));
+  vec2 texel = 1.0 / atlasPxSize;
+  vec2 uvMin = vUvRect.xy + texel * 0.5;
+  vec2 uvMax = vUvRect.xy + vUvRect.zw - texel * 0.5;
+  vec2 uvCenter = clamp(vUv, uvMin, uvMax);
+  vec2 nc = uvCenter * atlasPxSize;
+
+  vec4 color;
+  if (min(fwidth(nc.x), fwidth(nc.y)) > 2.0) {
+    vec2 dx = dFdx(nc) * 0.33 * texel;
+    vec2 dy = dFdy(nc) * 0.33 * texel;
+    float mipBias = 0.0;
+    color = (1.0 / 3.0) * texture(uRasterAtlasTex, uvCenter, mipBias) +
+      (1.0 / 6.0) * (
+        texture(uRasterAtlasTex, clamp(uvCenter - dx - dy, uvMin, uvMax), mipBias) +
+        texture(uRasterAtlasTex, clamp(uvCenter - dx + dy, uvMin, uvMax), mipBias) +
+        texture(uRasterAtlasTex, clamp(uvCenter + dx - dy, uvMin, uvMax), mipBias) +
+        texture(uRasterAtlasTex, clamp(uvCenter + dx + dy, uvMin, uvMax), mipBias)
+      );
+  } else {
+    color = texture(uRasterAtlasTex, uvCenter);
+  }
+
   if (color.a <= 0.001) {
     discard;
   }

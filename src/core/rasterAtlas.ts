@@ -35,7 +35,7 @@ interface PackedTile extends RasterTileInput {
   y: number;
 }
 
-const ATLAS_PADDING = 1;
+const ATLAS_PADDING = 2;
 
 export function buildRasterAtlases(layers: CompiledRasterLayer[], maxTextureSize: number): RasterAtlasBuildResult {
   const atlasMaxSize = Math.max(1, Math.trunc(maxTextureSize));
