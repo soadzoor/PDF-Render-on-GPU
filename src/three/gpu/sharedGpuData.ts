@@ -17,6 +17,7 @@ import type { VectorScene } from "../../pdfVectorExtractor";
 import { buildTextRasterAtlas } from "../../textRasterAtlas";
 import { buildRasterAtlases, type RasterAtlasTilePlacement } from "../../core/rasterAtlas";
 import type { CompiledPdfDocument } from "../../core/types";
+import { RASTER_TEXTURE_ANISOTROPY } from "../../shared/shaders/samplingPolicy";
 
 export interface FloatTextureRef {
   texture: DataTexture;
@@ -386,7 +387,7 @@ function createRgbaTexture(data: Uint8Array, width: number, height: number): Dat
   texture.magFilter = LinearFilter;
   texture.wrapS = ClampToEdgeWrapping;
   texture.wrapT = ClampToEdgeWrapping;
-  texture.anisotropy = 4;
+  texture.anisotropy = RASTER_TEXTURE_ANISOTROPY;
   return texture;
 }
 

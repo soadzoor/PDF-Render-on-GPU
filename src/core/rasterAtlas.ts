@@ -1,4 +1,5 @@
 import type { CompiledRasterLayer } from "./types";
+import { RASTER_ATLAS_PADDING } from "../shared/shaders/samplingPolicy";
 
 export interface RasterAtlasPage {
   width: number;
@@ -35,8 +36,6 @@ interface PackedTile extends RasterTileInput {
   y: number;
 }
 
-const ATLAS_PADDING = 2;
-
 export function buildRasterAtlases(layers: CompiledRasterLayer[], maxTextureSize: number): RasterAtlasBuildResult {
   const atlasMaxSize = Math.max(1, Math.trunc(maxTextureSize));
 
@@ -47,7 +46,7 @@ export function buildRasterAtlases(layers: CompiledRasterLayer[], maxTextureSize
     };
   }
 
-  const maxTileDimension = atlasMaxSize - ATLAS_PADDING * 2;
+  const maxTileDimension = atlasMaxSize - RASTER_ATLAS_PADDING * 2;
   if (maxTileDimension <= 0) {
     throw new Error("Raster atlas padding exceeds available texture size.");
   }
@@ -161,10 +160,10 @@ function packTilesIntoSingleAtlas(
   atlasMaxSize: number
 ): { width: number; height: number; placements: PackedTile[] } | null {
   const paddedArea = remaining.reduce(
-    (sum, item) => sum + (item.width + ATLAS_PADDING * 2) * (item.height + ATLAS_PADDING * 2),
+    (sum, item) => sum + (item.width + RASTER_ATLAS_PADDING * 2) * (item.height + RASTER_ATLAS_PADDING * 2),
     0
   );
-  const widest = remaining.reduce((max, item) => Math.max(max, item.width + ATLAS_PADDING * 2), 1);
+  const widest = remaining.reduce((max, item) => Math.max(max, item.width + RASTER_ATLAS_PADDING * 2), 1);
 
   let atlasWidth = clamp(roundUpToPowerOfTwo(Math.ceil(Math.sqrt(paddedArea))), widest, atlasMaxSize);
 
@@ -200,8 +199,8 @@ function layoutTilesForWidth(
   let usedHeight = 0;
 
   for (const tile of tiles) {
-    const paddedWidth = tile.width + ATLAS_PADDING * 2;
-    const paddedHeight = tile.height + ATLAS_PADDING * 2;
+    const paddedWidth = tile.width + RASTER_ATLAS_PADDING * 2;
+    const paddedHeight = tile.height + RASTER_ATLAS_PADDING * 2;
     if (paddedWidth > atlasWidth || paddedHeight > atlasMaxSize) {
       continue;
     }
@@ -218,8 +217,8 @@ function layoutTilesForWidth(
 
     placements.push({
       ...tile,
-      x: x + ATLAS_PADDING,
-      y: y + ATLAS_PADDING
+      x: x + RASTER_ATLAS_PADDING,
+      y: y + RASTER_ATLAS_PADDING
     });
 
     x += paddedWidth;
@@ -242,10 +241,10 @@ function blitTileWithPadding(
   const maxSourceX = tile.sourceX + tile.width - 1;
   const maxSourceY = tile.sourceY + tile.height - 1;
 
-  const minDstX = tile.x - ATLAS_PADDING;
-  const minDstY = tile.y - ATLAS_PADDING;
-  const maxDstX = tile.x + tile.width + ATLAS_PADDING - 1;
-  const maxDstY = tile.y + tile.height + ATLAS_PADDING - 1;
+  const minDstX = tile.x - RASTER_ATLAS_PADDING;
+  const minDstY = tile.y - RASTER_ATLAS_PADDING;
+  const maxDstX = tile.x + tile.width + RASTER_ATLAS_PADDING - 1;
+  const maxDstY = tile.y + tile.height + RASTER_ATLAS_PADDING - 1;
 
   for (let dstY = minDstY; dstY <= maxDstY; dstY += 1) {
     if (dstY < 0 || dstY >= atlasHeight) {

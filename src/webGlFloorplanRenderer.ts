@@ -1,6 +1,13 @@
 import type { Bounds, VectorScene } from "./pdfVectorExtractor";
 import { buildSpatialGrid, type SpatialGrid } from "./spatialGrid";
 import { buildTextRasterAtlas } from "./textRasterAtlas";
+import { buildRasterStableSamplingGlsl } from "./shared/shaders/rasterSampling";
+import {
+  buildFillWindingFunctionsGlsl,
+  buildTextWindingFunctionsGlsl,
+  buildVectorDistanceFunctionsGlsl
+} from "./shared/shaders/vectorGeometry";
+import { buildTextMinifySamplingGlsl } from "./shared/shaders/textMinify";
 
 const VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
@@ -121,64 +128,7 @@ flat in float vAlpha;
 
 out vec4 outColor;
 
-float distanceToLineSegment(vec2 p, vec2 a, vec2 b) {
-  vec2 ab = b - a;
-  float abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return length(p - a);
-  }
-  float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
-}
-
-float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
-  vec2 aa = b - a;
-  vec2 bb = a - 2.0 * b + c;
-  vec2 cc = aa * 2.0;
-  vec2 dd = a - p;
-
-  float bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return distanceToLineSegment(p, a, c);
-  }
-
-  float inv = 1.0 / bbLenSq;
-  float kx = inv * dot(aa, bb);
-  float ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  float kz = inv * dot(dd, aa);
-
-  float pValue = ky - kx * kx;
-  float pCube = pValue * pValue * pValue;
-  float qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  float hValue = qValue * qValue + 4.0 * pCube;
-
-  float best = 1e20;
-
-  if (hValue >= 0.0) {
-    float hSqrt = sqrt(hValue);
-    vec2 roots = (vec2(hSqrt, -hSqrt) - qValue) * 0.5;
-    vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
-    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    vec2 delta = dd + (cc + bb * t) * t;
-    best = dot(delta, delta);
-  } else {
-    float z = sqrt(-pValue);
-    float acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    float angle = acos(acosArg) / 3.0;
-    float cosine = cos(angle);
-    float sine = sin(angle) * 1.732050808;
-    vec3 t = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
-
-    vec2 delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
-  }
-
-  return sqrt(max(best, 0.0));
-}
+${buildVectorDistanceFunctionsGlsl()}
 
 void main() {
   if (vAlpha <= 0.001) {
@@ -291,7 +241,6 @@ out vec4 outColor;
 
 const int MAX_FILL_PATH_PRIMITIVES = 2048;
 const float FILL_PRIMITIVE_QUADRATIC = 1.0;
-const int QUAD_WINDING_SUBDIVISIONS = 6;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   int x = index % sizeValue.x;
@@ -299,98 +248,8 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   return ivec2(x, y);
 }
 
-float distanceToLineSegment(vec2 p, vec2 a, vec2 b) {
-  vec2 ab = b - a;
-  float abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return length(p - a);
-  }
-  float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
-}
-
-float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
-  vec2 aa = b - a;
-  vec2 bb = a - 2.0 * b + c;
-  vec2 cc = aa * 2.0;
-  vec2 dd = a - p;
-
-  float bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return distanceToLineSegment(p, a, c);
-  }
-
-  float inv = 1.0 / bbLenSq;
-  float kx = inv * dot(aa, bb);
-  float ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  float kz = inv * dot(dd, aa);
-
-  float pValue = ky - kx * kx;
-  float pCube = pValue * pValue * pValue;
-  float qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  float hValue = qValue * qValue + 4.0 * pCube;
-
-  float best = 1e20;
-
-  if (hValue >= 0.0) {
-    float hSqrt = sqrt(hValue);
-    vec2 roots = (vec2(hSqrt, -hSqrt) - qValue) * 0.5;
-    vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
-    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    vec2 delta = dd + (cc + bb * t) * t;
-    best = dot(delta, delta);
-  } else {
-    float z = sqrt(-pValue);
-    float acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    float angle = acos(acosArg) / 3.0;
-    float cosine = cos(angle);
-    float sine = sin(angle) * 1.732050808;
-    vec3 t = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
-
-    vec2 delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
-  }
-
-  return sqrt(max(best, 0.0));
-}
-
-vec2 evaluateQuadratic(vec2 a, vec2 b, vec2 c, float t) {
-  float oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
-}
-
-void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding, inout int crossings) {
-  bool upward = (a.y <= p.y) && (b.y > p.y);
-  bool downward = (a.y > p.y) && (b.y <= p.y);
-  if (!upward && !downward) {
-    return;
-  }
-
-  float denom = b.y - a.y;
-  if (abs(denom) <= 1e-6) {
-    return;
-  }
-
-  float xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
-  if (xCross > p.x) {
-    crossings += 1;
-    winding += upward ? 1 : -1;
-  }
-}
-
-void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding, inout int crossings) {
-  vec2 prev = a;
-  for (int i = 1; i <= QUAD_WINDING_SUBDIVISIONS; i += 1) {
-    float t = float(i) / float(QUAD_WINDING_SUBDIVISIONS);
-    vec2 next = evaluateQuadratic(a, b, c, t);
-    accumulateLineCrossing(prev, next, p, winding, crossings);
-    prev = next;
-  }
-}
+${buildVectorDistanceFunctionsGlsl()}
+${buildFillWindingFunctionsGlsl()}
 
 void main() {
   if (vSegmentCount <= 0 || vAlpha <= 0.001) {
@@ -557,7 +416,6 @@ out vec4 outColor;
 
 const int MAX_GLYPH_PRIMITIVES = 256;
 const float TEXT_PRIMITIVE_QUADRATIC = 1.0;
-const int QUAD_WINDING_SUBDIVISIONS = 6;
 
 ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   int x = index % sizeValue.x;
@@ -565,146 +423,9 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
   return ivec2(x, y);
 }
 
-float distanceToLineSegment(vec2 p, vec2 a, vec2 b) {
-  vec2 ab = b - a;
-  float abLenSq = dot(ab, ab);
-  if (abLenSq <= 1e-10) {
-    return length(p - a);
-  }
-  float t = clamp(dot(p - a, ab) / abLenSq, 0.0, 1.0);
-  return length(p - (a + ab * t));
-}
-
-float distanceToQuadraticBezier(vec2 p, vec2 a, vec2 b, vec2 c) {
-  vec2 aa = b - a;
-  vec2 bb = a - 2.0 * b + c;
-  vec2 cc = aa * 2.0;
-  vec2 dd = a - p;
-
-  float bbLenSq = dot(bb, bb);
-  if (bbLenSq <= 1e-12) {
-    return distanceToLineSegment(p, a, c);
-  }
-
-  float inv = 1.0 / bbLenSq;
-  float kx = inv * dot(aa, bb);
-  float ky = inv * (2.0 * dot(aa, aa) + dot(dd, bb)) / 3.0;
-  float kz = inv * dot(dd, aa);
-
-  float pValue = ky - kx * kx;
-  float pCube = pValue * pValue * pValue;
-  float qValue = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-  float hValue = qValue * qValue + 4.0 * pCube;
-
-  float best = 1e20;
-
-  if (hValue >= 0.0) {
-    float hSqrt = sqrt(hValue);
-    vec2 roots = (vec2(hSqrt, -hSqrt) - qValue) * 0.5;
-    vec2 uv = sign(roots) * pow(abs(roots), vec2(1.0 / 3.0));
-    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-    vec2 delta = dd + (cc + bb * t) * t;
-    best = dot(delta, delta);
-  } else {
-    float z = sqrt(-pValue);
-    float acosArg = clamp(qValue / (2.0 * pValue * z), -1.0, 1.0);
-    float angle = acos(acosArg) / 3.0;
-    float cosine = cos(angle);
-    float sine = sin(angle) * 1.732050808;
-    vec3 t = clamp(vec3(cosine + cosine, -sine - cosine, sine - cosine) * z - kx, 0.0, 1.0);
-
-    vec2 delta = dd + (cc + bb * t.x) * t.x;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.y) * t.y;
-    best = min(best, dot(delta, delta));
-    delta = dd + (cc + bb * t.z) * t.z;
-    best = min(best, dot(delta, delta));
-  }
-
-  return sqrt(max(best, 0.0));
-}
-
-vec2 evaluateQuadratic(vec2 a, vec2 b, vec2 c, float t) {
-  float oneMinusT = 1.0 - t;
-  return oneMinusT * oneMinusT * a + 2.0 * oneMinusT * t * b + t * t * c;
-}
-
-void accumulateLineCrossing(vec2 a, vec2 b, vec2 p, inout int winding) {
-  bool upward = (a.y <= p.y) && (b.y > p.y);
-  bool downward = (a.y > p.y) && (b.y <= p.y);
-  if (!upward && !downward) {
-    return;
-  }
-
-  float denom = b.y - a.y;
-  if (abs(denom) <= 1e-6) {
-    return;
-  }
-
-  float xCross = a.x + (p.y - a.y) * (b.x - a.x) / denom;
-  if (xCross > p.x) {
-    winding += upward ? 1 : -1;
-  }
-}
-
-void accumulateQuadraticCrossingRoot(
-  vec2 a,
-  vec2 b,
-  vec2 c,
-  vec2 p,
-  float ay,
-  float by,
-  float t,
-  inout int winding
-) {
-  const float ROOT_EPS = 1e-5;
-  if (t < -ROOT_EPS || t >= 1.0 - ROOT_EPS) {
-    return;
-  }
-
-  float tc = clamp(t, 0.0, 1.0);
-  float oneMinusT = 1.0 - tc;
-  float xCross = oneMinusT * oneMinusT * a.x + 2.0 * oneMinusT * tc * b.x + tc * tc * c.x;
-  if (xCross <= p.x) {
-    return;
-  }
-
-  float dy = by + 2.0 * ay * tc;
-  if (abs(dy) <= 1e-6) {
-    return;
-  }
-
-  winding += dy > 0.0 ? 1 : -1;
-}
-
-void accumulateQuadraticCrossing(vec2 a, vec2 b, vec2 c, vec2 p, inout int winding) {
-  float ay = a.y - 2.0 * b.y + c.y;
-  float by = 2.0 * (b.y - a.y);
-  float cy = a.y - p.y;
-
-  if (abs(ay) <= 1e-8) {
-    if (abs(by) <= 1e-8) {
-      return;
-    }
-    float t = -cy / by;
-    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t, winding);
-    return;
-  }
-
-  float discriminant = by * by - 4.0 * ay * cy;
-  if (discriminant < 0.0) {
-    return;
-  }
-
-  float sqrtDiscriminant = sqrt(max(discriminant, 0.0));
-  float invDen = 0.5 / ay;
-  float t0 = (-by - sqrtDiscriminant) * invDen;
-  float t1 = (-by + sqrtDiscriminant) * invDen;
-  accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t0, winding);
-  if (abs(t1 - t0) > 1e-5) {
-    accumulateQuadraticCrossingRoot(a, b, c, p, ay, by, t1, winding);
-  }
-}
+${buildVectorDistanceFunctionsGlsl()}
+${buildTextWindingFunctionsGlsl()}
+${buildTextMinifySamplingGlsl()}
 
 void main() {
   if (vSegmentCount <= 0) {
@@ -714,24 +435,14 @@ void main() {
   if (uTextVectorOnly < 0.5 && vRasterRect.z > 0.0 && vRasterRect.w > 0.0) {
     vec2 atlasPxSize = max(uTextRasterAtlasSize, vec2(1.0));
     vec2 nc = vec2(vNormCoord.x, 1.0 - vNormCoord.y) * (vRasterRect.zw * atlasPxSize);
-    if (min(fwidth(nc.x), fwidth(nc.y)) > 2.0) {
-      vec2 uvCenter = vec2(
-        vRasterRect.x + vNormCoord.x * vRasterRect.z,
-        vRasterRect.y + (1.0 - vNormCoord.y) * vRasterRect.w
+    if (shouldUseTextMinifyFallback(nc)) {
+      float alpha = sampleTextMinifiedAlpha(
+        uTextRasterAtlasTex,
+        atlasPxSize,
+        vRasterRect,
+        vNormCoord,
+        nc
       );
-      vec2 texel = 1.0 / atlasPxSize;
-      vec2 uvMin = vRasterRect.xy + texel * 0.5;
-      vec2 uvMax = vRasterRect.xy + vRasterRect.zw - texel * 0.5;
-      vec2 dx = dFdx(nc) * 0.33 * texel;
-      vec2 dy = dFdy(nc) * 0.33 * texel;
-      float mipBias = -1.25;
-      float alpha = (1.0 / 3.0) * texture(uTextRasterAtlasTex, clamp(uvCenter, uvMin, uvMax), mipBias).r +
-        (1.0 / 6.0) * (
-          texture(uTextRasterAtlasTex, clamp(uvCenter - dx - dy, uvMin, uvMax), mipBias).r +
-          texture(uTextRasterAtlasTex, clamp(uvCenter - dx + dy, uvMin, uvMax), mipBias).r +
-          texture(uTextRasterAtlasTex, clamp(uvCenter + dx - dy, uvMin, uvMax), mipBias).r +
-          texture(uTextRasterAtlasTex, clamp(uvCenter + dx + dy, uvMin, uvMax), mipBias).r
-        );
       alpha *= vColorAlpha;
       if (alpha <= 0.001) {
         discard;
@@ -848,6 +559,7 @@ uniform vec2 uCameraCenter;
 uniform float uZoom;
 
 out vec2 vUv;
+flat out vec4 vUvRect;
 
 void main() {
   vec2 corner01 = aCorner * 0.5 + 0.5;
@@ -870,6 +582,7 @@ void main() {
 
   gl_Position = vec4(clip, 0.0, 1.0);
   vUv = localTopDown;
+  vUvRect = vec4(0.0, 0.0, 1.0, 1.0);
 }
 `;
 
@@ -878,11 +591,15 @@ precision highp float;
 precision highp sampler2D;
 
 uniform sampler2D uRasterTex;
+uniform vec2 uRasterTexSize;
 in vec2 vUv;
+flat in vec4 vUvRect;
 out vec4 outColor;
 
+${buildRasterStableSamplingGlsl()}
+
 void main() {
-  vec4 color = texture(uRasterTex, vUv);
+  vec4 color = sampleRasterStable(uRasterTex, vUv, vUvRect, uRasterTexSize);
   if (color.a <= 0.001) {
     discard;
   }
@@ -949,6 +666,8 @@ type FrameListener = (stats: DrawStats) => void;
 interface RasterLayerGpu {
   texture: WebGLTexture;
   matrix: Float32Array;
+  width: number;
+  height: number;
 }
 
 export class WebGlFloorplanRenderer {
@@ -1125,6 +844,8 @@ export class WebGlFloorplanRenderer {
   private readonly uVectorLayerViewportPx: WebGLUniformLocation;
 
   private readonly uRasterTex: WebGLUniformLocation;
+
+  private readonly uRasterTexSize: WebGLUniformLocation;
 
   private readonly uRasterMatrixABCD: WebGLUniformLocation;
 
@@ -1410,6 +1131,7 @@ export class WebGlFloorplanRenderer {
     this.uVectorLayerViewportPx = this.mustGetUniformLocation(this.vectorCompositeProgram, "uViewportPx");
 
     this.uRasterTex = this.mustGetUniformLocation(this.rasterProgram, "uRasterTex");
+    this.uRasterTexSize = this.mustGetUniformLocation(this.rasterProgram, "uRasterTexSize");
     this.uRasterMatrixABCD = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixABCD");
     this.uRasterMatrixEF = this.mustGetUniformLocation(this.rasterProgram, "uRasterMatrixEF");
     this.uRasterViewport = this.mustGetUniformLocation(this.rasterProgram, "uViewport");
@@ -2131,6 +1853,7 @@ export class WebGlFloorplanRenderer {
       gl.activeTexture(gl.TEXTURE12);
       gl.bindTexture(gl.TEXTURE_2D, this.pageBackgroundTexture);
       gl.uniform1i(this.uRasterTex, 12);
+      gl.uniform2f(this.uRasterTexSize, 1, 1);
 
       for (let i = 0; i < this.pageRects.length; i += 4) {
         const minX = this.pageRects[i];
@@ -2155,6 +1878,7 @@ export class WebGlFloorplanRenderer {
       gl.activeTexture(gl.TEXTURE12);
       gl.bindTexture(gl.TEXTURE_2D, layer.texture);
       gl.uniform1i(this.uRasterTex, 12);
+      gl.uniform2f(this.uRasterTexSize, layer.width, layer.height);
       gl.uniform4f(
         this.uRasterMatrixABCD,
         layer.matrix[0],
@@ -2580,7 +2304,7 @@ export class WebGlFloorplanRenderer {
         matrix[3] = 1;
       }
 
-      this.rasterLayers.push({ texture, matrix });
+      this.rasterLayers.push({ texture, matrix, width: source.width, height: source.height });
     }
   }
 

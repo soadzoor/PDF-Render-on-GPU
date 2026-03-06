@@ -1,0 +1,14 @@
+export const RASTER_ATLAS_PADDING = 2;
+export const RASTER_TEXTURE_ANISOTROPY = 4;
+
+export const RASTER_MINIFY_THRESHOLD = 2.0;
+export const RASTER_MINIFY_DERIVATIVE_SCALE = 0.33;
+export const RASTER_MINIFY_CENTER_WEIGHT = 1 / 3;
+export const RASTER_MINIFY_NEIGHBOR_WEIGHT = 1 / 6;
+export const RASTER_MINIFY_MIP_BIAS = 0.0;
+
+export const TEXT_MINIFY_THRESHOLD = 2.0;
+export const TEXT_MINIFY_DERIVATIVE_SCALE = 0.33;
+export const TEXT_MINIFY_CENTER_WEIGHT = 1 / 3;
+export const TEXT_MINIFY_NEIGHBOR_WEIGHT = 1 / 6;
+export const TEXT_MINIFY_MIP_BIAS = -1.25;
