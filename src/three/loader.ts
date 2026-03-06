@@ -14,6 +14,7 @@ let isPdfWorkerConfigured = false;
 export async function LoadPDFObject(source: PDFSource, options: LoadPDFObjectOptions = {}): Promise<PDFObject> {
   ensurePdfJsWorkerConfigured();
 
+  const loadStart = nowMs();
   const resolved = resolveLoadOptions(options);
 
   let compiled: CompiledPdfDocument;
@@ -38,9 +39,16 @@ export async function LoadPDFObject(source: PDFSource, options: LoadPDFObjectOpt
       extraction: resolved.extraction
     });
   }
+  const parseEnd = nowMs();
 
+  const uploadStart = nowMs();
   const shared = createSharedGpuData(compiled);
-  return new PDFObject(compiled, shared, resolved);
+  const uploadEnd = nowMs();
+  return new PDFObject(compiled, shared, resolved, {
+    parseMs: Math.max(0, parseEnd - loadStart),
+    uploadMs: Math.max(0, uploadEnd - uploadStart),
+    totalMs: Math.max(0, uploadEnd - loadStart)
+  });
 }
 
 async function loadCompiledDocumentOnMain(
@@ -138,4 +146,11 @@ function ensurePdfJsWorkerConfigured(): void {
 
   GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
   isPdfWorkerConfigured = true;
+}
+
+function nowMs(): number {
+  if (typeof performance !== "undefined" && typeof performance.now === "function") {
+    return performance.now();
+  }
+  return Date.now();
 }

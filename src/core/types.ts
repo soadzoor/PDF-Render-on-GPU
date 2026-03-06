@@ -31,6 +31,21 @@ export interface CompiledRasterLayer {
   matrix: Float32Array;
 }
 
+export interface CompiledDocumentStats {
+  operatorCount: number;
+  imagePaintOpCount: number;
+  sourceSegmentCount: number;
+  mergedSegmentCount: number;
+  sourceTextCount: number;
+  textInPageCount: number;
+  textOutOfPageCount: number;
+  discardedTransparentCount: number;
+  discardedDegenerateCount: number;
+  discardedDuplicateCount: number;
+  discardedContainedCount: number;
+  maxCellPopulation: number;
+}
+
 export interface CompiledPdfDocument {
   pageCount: number;
   pages: CompiledPageInfo[];
@@ -61,4 +76,5 @@ export interface CompiledPdfDocument {
   textGlyphSegmentsA: Float32Array;
   textGlyphSegmentsB: Float32Array;
   rasterLayers: CompiledRasterLayer[];
+  stats: CompiledDocumentStats;
 }

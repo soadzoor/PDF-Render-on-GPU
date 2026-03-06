@@ -22,7 +22,19 @@ export function compiledDocumentToVectorScene(
 ): VectorScene {
   const pageScenes = compiledDocumentToPageScenes(document);
   const normalizedPagesPerRow = normalizePositiveInt(pagesPerRow, 10, 1, 100);
-  return composeVectorScenesInGrid(pageScenes, normalizedPagesPerRow);
+  const composed = composeVectorScenesInGrid(pageScenes, normalizedPagesPerRow);
+  composed.operatorCount = document.stats.operatorCount;
+  composed.imagePaintOpCount = document.stats.imagePaintOpCount;
+  composed.sourceSegmentCount = document.stats.sourceSegmentCount;
+  composed.mergedSegmentCount = document.stats.mergedSegmentCount;
+  composed.sourceTextCount = document.stats.sourceTextCount;
+  composed.textInPageCount = document.stats.textInPageCount;
+  composed.textOutOfPageCount = document.stats.textOutOfPageCount;
+  composed.discardedTransparentCount = document.stats.discardedTransparentCount;
+  composed.discardedDegenerateCount = document.stats.discardedDegenerateCount;
+  composed.discardedDuplicateCount = document.stats.discardedDuplicateCount;
+  composed.discardedContainedCount = document.stats.discardedContainedCount;
+  return composed;
 }
 
 function buildSinglePageScene(

@@ -9,7 +9,12 @@ import {
   encodeChannelMajorFloat32,
   encodeXorDeltaByteShuffledFloat32
 } from "../parsedDataEncoding";
-import type { CompiledPageInfo, CompiledPdfDocument, CompiledRasterLayer } from "./types";
+import type {
+  CompiledDocumentStats,
+  CompiledPageInfo,
+  CompiledPdfDocument,
+  CompiledRasterLayer
+} from "./types";
 
 const PARSED_DATA_KIND = "hepr.compiled-pdf-document";
 const REQUIRED_TEXTURE_NAMES = [
@@ -115,6 +120,22 @@ interface ManifestDocumentEntry {
   textGlyphCount?: unknown;
   textGlyphSegmentCount?: unknown;
   rasterLayers?: unknown;
+  stats?: unknown;
+}
+
+interface ManifestDocumentStatsEntry {
+  operatorCount?: unknown;
+  imagePaintOpCount?: unknown;
+  sourceSegmentCount?: unknown;
+  mergedSegmentCount?: unknown;
+  sourceTextCount?: unknown;
+  textInPageCount?: unknown;
+  textOutOfPageCount?: unknown;
+  discardedTransparentCount?: unknown;
+  discardedDegenerateCount?: unknown;
+  discardedDuplicateCount?: unknown;
+  discardedContainedCount?: unknown;
+  maxCellPopulation?: unknown;
 }
 
 interface ParsedDataZipManifest {
@@ -237,7 +258,8 @@ export async function buildParsedDataZipV4Blob(
       textInstanceCount: document.textInstanceCount,
       textGlyphCount: document.textGlyphCount,
       textGlyphSegmentCount: document.textGlyphSegmentCount,
-      rasterLayers
+      rasterLayers,
+      stats: document.stats
     },
     textures: textureEntries.map((entry) => ({
       name: entry.name,
@@ -375,7 +397,8 @@ export async function loadCompiledDocumentFromParsedDataZipV4(
     textGlyphMetaB,
     textGlyphSegmentsA,
     textGlyphSegmentsB,
-    rasterLayers
+    rasterLayers,
+    stats: documentMeta.stats
   };
 }
 
@@ -602,6 +625,7 @@ function parseDocumentMeta(input: unknown): {
   textGlyphCount: number;
   textGlyphSegmentCount: number;
   rasterLayers: ManifestRasterLayerEntry[];
+  stats: CompiledDocumentStats;
 } {
   if (!input || typeof input !== "object") {
     throw new Error("Parsed data zip manifest is missing document metadata.");
@@ -626,20 +650,34 @@ function parseDocumentMeta(input: unknown): {
     ? (documentMeta.rasterLayers as ManifestRasterLayerEntry[])
     : [];
 
+  const segmentCount = readNonNegativeInt(documentMeta.segmentCount, 0);
+  const fillPathCount = readNonNegativeInt(documentMeta.fillPathCount, 0);
+  const fillSegmentCount = readNonNegativeInt(documentMeta.fillSegmentCount, 0);
+  const textInstanceCount = readNonNegativeInt(documentMeta.textInstanceCount, 0);
+  const textGlyphCount = readNonNegativeInt(documentMeta.textGlyphCount, 0);
+  const textGlyphSegmentCount = readNonNegativeInt(documentMeta.textGlyphSegmentCount, 0);
+  const maxSegmentCountPerPage = readNonNegativeInt(documentMeta.maxSegmentCountPerPage, 0);
+
   return {
     pageCount,
     pages,
-    maxSegmentCountPerPage: readNonNegativeInt(documentMeta.maxSegmentCountPerPage, 0),
+    maxSegmentCountPerPage,
     maxFillPathCountPerPage: readNonNegativeInt(documentMeta.maxFillPathCountPerPage, 0),
     maxTextInstanceCountPerPage: readNonNegativeInt(documentMeta.maxTextInstanceCountPerPage, 0),
     maxRasterLayerCountPerPage: readNonNegativeInt(documentMeta.maxRasterLayerCountPerPage, 0),
-    segmentCount: readNonNegativeInt(documentMeta.segmentCount, 0),
-    fillPathCount: readNonNegativeInt(documentMeta.fillPathCount, 0),
-    fillSegmentCount: readNonNegativeInt(documentMeta.fillSegmentCount, 0),
-    textInstanceCount: readNonNegativeInt(documentMeta.textInstanceCount, 0),
-    textGlyphCount: readNonNegativeInt(documentMeta.textGlyphCount, 0),
-    textGlyphSegmentCount: readNonNegativeInt(documentMeta.textGlyphSegmentCount, 0),
-    rasterLayers
+    segmentCount,
+    fillPathCount,
+    fillSegmentCount,
+    textInstanceCount,
+    textGlyphCount,
+    textGlyphSegmentCount,
+    rasterLayers,
+    stats: parseDocumentStats(documentMeta.stats, {
+      segmentCount,
+      textInstanceCount,
+      rasterLayerCount: rasterLayers.length,
+      maxSegmentCountPerPage
+    })
   };
 }
 
@@ -670,6 +708,58 @@ function parsePageInfo(page: ManifestPageEntry, index: number): CompiledPageInfo
     textGlyphSegmentCount: readNonNegativeInt(page.textGlyphSegmentCount, 0),
     rasterLayerStart: readNonNegativeInt(page.rasterLayerStart, 0),
     rasterLayerCount: readNonNegativeInt(page.rasterLayerCount, 0)
+  };
+}
+
+function parseDocumentStats(
+  input: unknown,
+  fallback: {
+    segmentCount: number;
+    textInstanceCount: number;
+    rasterLayerCount: number;
+    maxSegmentCountPerPage: number;
+  }
+): CompiledDocumentStats {
+  if (!input || typeof input !== "object") {
+    return createDefaultDocumentStats(fallback);
+  }
+
+  const stats = input as ManifestDocumentStatsEntry;
+  return {
+    operatorCount: readNonNegativeInt(stats.operatorCount, 0),
+    imagePaintOpCount: readNonNegativeInt(stats.imagePaintOpCount, fallback.rasterLayerCount),
+    sourceSegmentCount: readNonNegativeInt(stats.sourceSegmentCount, fallback.segmentCount),
+    mergedSegmentCount: readNonNegativeInt(stats.mergedSegmentCount, fallback.segmentCount),
+    sourceTextCount: readNonNegativeInt(stats.sourceTextCount, fallback.textInstanceCount),
+    textInPageCount: readNonNegativeInt(stats.textInPageCount, fallback.textInstanceCount),
+    textOutOfPageCount: readNonNegativeInt(stats.textOutOfPageCount, 0),
+    discardedTransparentCount: readNonNegativeInt(stats.discardedTransparentCount, 0),
+    discardedDegenerateCount: readNonNegativeInt(stats.discardedDegenerateCount, 0),
+    discardedDuplicateCount: readNonNegativeInt(stats.discardedDuplicateCount, 0),
+    discardedContainedCount: readNonNegativeInt(stats.discardedContainedCount, 0),
+    maxCellPopulation: readNonNegativeInt(stats.maxCellPopulation, fallback.maxSegmentCountPerPage)
+  };
+}
+
+function createDefaultDocumentStats(fallback: {
+  segmentCount: number;
+  textInstanceCount: number;
+  rasterLayerCount: number;
+  maxSegmentCountPerPage: number;
+}): CompiledDocumentStats {
+  return {
+    operatorCount: 0,
+    imagePaintOpCount: fallback.rasterLayerCount,
+    sourceSegmentCount: fallback.segmentCount,
+    mergedSegmentCount: fallback.segmentCount,
+    sourceTextCount: fallback.textInstanceCount,
+    textInPageCount: fallback.textInstanceCount,
+    textOutOfPageCount: 0,
+    discardedTransparentCount: 0,
+    discardedDegenerateCount: 0,
+    discardedDuplicateCount: 0,
+    discardedContainedCount: 0,
+    maxCellPopulation: fallback.maxSegmentCountPerPage
   };
 }
 

@@ -2,4 +2,10 @@ export { LoadPDFObject } from "./loader";
 export { PDFObject } from "./PDFObject";
 export { PDFPageMesh } from "./PDFPageMesh";
 export { PDFPageInstancedMesh } from "./PDFPageInstancedMesh";
-export type { PDFSource, LoadPDFObjectOptions } from "./types";
+export type {
+  PDFDocumentMetrics,
+  PDFLoadTimingMetrics,
+  PDFSource,
+  PDFTextureMetrics,
+  LoadPDFObjectOptions
+} from "./types";

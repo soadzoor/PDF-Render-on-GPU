@@ -50,3 +50,53 @@ export interface ResolvedLoadOptions {
   page: ResolvedPageOptions;
   material: ResolvedMaterialOptions;
 }
+
+export interface PDFDocumentMetrics {
+  operatorCount: number;
+  imagePaintOpCount: number;
+  sourceSegmentCount: number;
+  mergedSegmentCount: number;
+  visibleSegmentCount: number;
+  sourceTextCount: number;
+  textInstanceCount: number;
+  textGlyphCount: number;
+  textGlyphSegmentCount: number;
+  textInPageCount: number;
+  textOutOfPageCount: number;
+  fillPathCount: number;
+  fillSegmentCount: number;
+  rasterLayerCount: number;
+  discardedTransparentCount: number;
+  discardedDegenerateCount: number;
+  discardedDuplicateCount: number;
+  discardedContainedCount: number;
+  maxCellPopulation: number;
+  pageCount: number;
+}
+
+export interface PDFTextureMetrics {
+  fillPathTextureWidth: number;
+  fillPathTextureHeight: number;
+  fillSegmentTextureWidth: number;
+  fillSegmentTextureHeight: number;
+  segmentTextureWidth: number;
+  segmentTextureHeight: number;
+  textInstanceTextureWidth: number;
+  textInstanceTextureHeight: number;
+  textGlyphTextureWidth: number;
+  textGlyphTextureHeight: number;
+  textSegmentTextureWidth: number;
+  textSegmentTextureHeight: number;
+  rasterLayerMetaTextureWidth: number;
+  rasterLayerMetaTextureHeight: number;
+  rasterAtlasSizes: Array<{ width: number; height: number }>;
+  textAtlasWidth: number;
+  textAtlasHeight: number;
+  maxTextureSize: number;
+}
+
+export interface PDFLoadTimingMetrics {
+  parseMs: number;
+  uploadMs: number;
+  totalMs: number;
+}

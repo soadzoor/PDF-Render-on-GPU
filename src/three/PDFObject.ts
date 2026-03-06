@@ -1,7 +1,13 @@
 import { type BufferGeometry, Group } from "three";
 
 import type { CompiledPdfDocument } from "../core/types";
-import type { LoadPDFObjectOptions, ResolvedLoadOptions } from "./types";
+import type {
+  LoadPDFObjectOptions,
+  PDFDocumentMetrics,
+  PDFLoadTimingMetrics,
+  PDFTextureMetrics,
+  ResolvedLoadOptions
+} from "./types";
 import { createPdfMaterialSet, type PdfMaterialSet } from "./materials/createPdfMaterials";
 import type { SharedGpuData } from "./gpu/sharedGpuData";
 import { PDFPageInstancedMesh } from "./PDFPageInstancedMesh";
@@ -11,6 +17,9 @@ import { PanCacheController } from "./PanCacheController";
 export class PDFObject extends Group {
   readonly pages: PDFPageMesh[];
   readonly pageCount: number;
+  readonly documentMetrics: PDFDocumentMetrics;
+  readonly textureMetrics: PDFTextureMetrics;
+  readonly loadTiming: PDFLoadTimingMetrics;
 
   private readonly document: CompiledPdfDocument;
   private readonly shared: SharedGpuData;
@@ -20,11 +29,19 @@ export class PDFObject extends Group {
   private readonly instancedMaterialSets = new Set<PdfMaterialSet>();
   private readonly instancedGeometries = new Set<BufferGeometry>();
 
-  constructor(document: CompiledPdfDocument, shared: SharedGpuData, options: ResolvedLoadOptions) {
+  constructor(
+    document: CompiledPdfDocument,
+    shared: SharedGpuData,
+    options: ResolvedLoadOptions,
+    loadTiming: PDFLoadTimingMetrics
+  ) {
     super();
     this.document = document;
     this.shared = shared;
     this.options = options;
+    this.loadTiming = { ...loadTiming };
+    this.documentMetrics = createDocumentMetrics(document);
+    this.textureMetrics = createTextureMetrics(shared);
     this.pageMaterialSet = createPdfMaterialSet(shared, options, "mesh");
     this.panCacheController = new PanCacheController(this, shared.textAtlasTexture);
     this.panCacheController.registerMaterialSet(this.pageMaterialSet);
@@ -98,6 +115,55 @@ export class PDFObject extends Group {
       this.remove(child);
     }
   }
+}
+
+function createDocumentMetrics(document: CompiledPdfDocument): PDFDocumentMetrics {
+  const sourceStats = document.stats;
+  return {
+    operatorCount: sourceStats.operatorCount,
+    imagePaintOpCount: sourceStats.imagePaintOpCount,
+    sourceSegmentCount: sourceStats.sourceSegmentCount,
+    mergedSegmentCount: sourceStats.mergedSegmentCount,
+    visibleSegmentCount: document.segmentCount,
+    sourceTextCount: sourceStats.sourceTextCount,
+    textInstanceCount: document.textInstanceCount,
+    textGlyphCount: document.textGlyphCount,
+    textGlyphSegmentCount: document.textGlyphSegmentCount,
+    textInPageCount: sourceStats.textInPageCount,
+    textOutOfPageCount: sourceStats.textOutOfPageCount,
+    fillPathCount: document.fillPathCount,
+    fillSegmentCount: document.fillSegmentCount,
+    rasterLayerCount: document.rasterLayers.length,
+    discardedTransparentCount: sourceStats.discardedTransparentCount,
+    discardedDegenerateCount: sourceStats.discardedDegenerateCount,
+    discardedDuplicateCount: sourceStats.discardedDuplicateCount,
+    discardedContainedCount: sourceStats.discardedContainedCount,
+    maxCellPopulation: sourceStats.maxCellPopulation,
+    pageCount: document.pageCount
+  };
+}
+
+function createTextureMetrics(shared: SharedGpuData): PDFTextureMetrics {
+  return {
+    fillPathTextureWidth: shared.fillPathTextureA.width,
+    fillPathTextureHeight: shared.fillPathTextureA.height,
+    fillSegmentTextureWidth: shared.fillSegmentTextureA.width,
+    fillSegmentTextureHeight: shared.fillSegmentTextureA.height,
+    segmentTextureWidth: shared.segmentTextureA.width,
+    segmentTextureHeight: shared.segmentTextureA.height,
+    textInstanceTextureWidth: shared.textInstanceTextureA.width,
+    textInstanceTextureHeight: shared.textInstanceTextureA.height,
+    textGlyphTextureWidth: shared.textGlyphMetaTextureA.width,
+    textGlyphTextureHeight: shared.textGlyphMetaTextureA.height,
+    textSegmentTextureWidth: shared.textGlyphSegmentTextureA.width,
+    textSegmentTextureHeight: shared.textGlyphSegmentTextureA.height,
+    rasterLayerMetaTextureWidth: shared.rasterLayerMetaTextureA.width,
+    rasterLayerMetaTextureHeight: shared.rasterLayerMetaTextureA.height,
+    rasterAtlasSizes: shared.rasterAtlasSizes.map((size) => ({ width: size.width, height: size.height })),
+    textAtlasWidth: shared.textAtlasSize.width,
+    textAtlasHeight: shared.textAtlasSize.height,
+    maxTextureSize: shared.maxTextureSize
+  };
 }
 
 function normalizePageIndexList(pageIndices: readonly number[], pageCount: number): number[] {

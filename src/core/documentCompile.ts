@@ -1,5 +1,10 @@
 import type { VectorScene } from "../pdfVectorExtractor";
-import type { CompiledPdfDocument, CompiledPageInfo, CompiledRasterLayer } from "./types";
+import type {
+  CompiledDocumentStats,
+  CompiledPdfDocument,
+  CompiledPageInfo,
+  CompiledRasterLayer
+} from "./types";
 
 export function compilePdfPageScenes(pageScenes: VectorScene[]): CompiledPdfDocument {
   if (pageScenes.length === 0) {
@@ -32,9 +37,23 @@ export function compilePdfPageScenes(pageScenes: VectorScene[]): CompiledPdfDocu
       textGlyphMetaB: new Float32Array(0),
       textGlyphSegmentsA: new Float32Array(0),
       textGlyphSegmentsB: new Float32Array(0),
-      rasterLayers: []
+      rasterLayers: [],
+      stats: createEmptyCompiledDocumentStats()
     };
   }
+
+  let totalOperatorCount = 0;
+  let totalImagePaintOpCount = 0;
+  let totalSourceSegmentCount = 0;
+  let totalMergedSegmentCount = 0;
+  let totalSourceTextCount = 0;
+  let totalTextInPageCount = 0;
+  let totalTextOutOfPageCount = 0;
+  let totalDiscardedTransparentCount = 0;
+  let totalDiscardedDegenerateCount = 0;
+  let totalDiscardedDuplicateCount = 0;
+  let totalDiscardedContainedCount = 0;
+  let maxCellPopulation = 0;
 
   let totalSegmentCount = 0;
   let totalFillPathCount = 0;
@@ -52,6 +71,19 @@ export function compilePdfPageScenes(pageScenes: VectorScene[]): CompiledPdfDocu
 
   for (let pageIndex = 0; pageIndex < pageScenes.length; pageIndex += 1) {
     const scene = pageScenes[pageIndex];
+    totalOperatorCount += scene.operatorCount;
+    totalImagePaintOpCount += scene.imagePaintOpCount;
+    totalSourceSegmentCount += scene.sourceSegmentCount;
+    totalMergedSegmentCount += scene.mergedSegmentCount;
+    totalSourceTextCount += scene.sourceTextCount;
+    totalTextInPageCount += scene.textInPageCount;
+    totalTextOutOfPageCount += scene.textOutOfPageCount;
+    totalDiscardedTransparentCount += scene.discardedTransparentCount;
+    totalDiscardedDegenerateCount += scene.discardedDegenerateCount;
+    totalDiscardedDuplicateCount += scene.discardedDuplicateCount;
+    totalDiscardedContainedCount += scene.discardedContainedCount;
+    maxCellPopulation = Math.max(maxCellPopulation, computeSceneMaxCellPopulation(scene));
+
     totalSegmentCount += scene.segmentCount;
     totalFillPathCount += scene.fillPathCount;
     totalFillSegmentCount += scene.fillSegmentCount;
@@ -230,7 +262,21 @@ export function compilePdfPageScenes(pageScenes: VectorScene[]): CompiledPdfDocu
     textGlyphMetaB,
     textGlyphSegmentsA,
     textGlyphSegmentsB,
-    rasterLayers: allRasterLayers
+    rasterLayers: allRasterLayers,
+    stats: {
+      operatorCount: totalOperatorCount,
+      imagePaintOpCount: totalImagePaintOpCount,
+      sourceSegmentCount: totalSourceSegmentCount,
+      mergedSegmentCount: totalMergedSegmentCount,
+      sourceTextCount: totalSourceTextCount,
+      textInPageCount: totalTextInPageCount,
+      textOutOfPageCount: totalTextOutOfPageCount,
+      discardedTransparentCount: totalDiscardedTransparentCount,
+      discardedDegenerateCount: totalDiscardedDegenerateCount,
+      discardedDuplicateCount: totalDiscardedDuplicateCount,
+      discardedContainedCount: totalDiscardedContainedCount,
+      maxCellPopulation
+    }
   };
 }
 
@@ -283,4 +329,108 @@ function listSceneRasterLayers(
   });
 
   return out;
+}
+
+function createEmptyCompiledDocumentStats(): CompiledDocumentStats {
+  return {
+    operatorCount: 0,
+    imagePaintOpCount: 0,
+    sourceSegmentCount: 0,
+    mergedSegmentCount: 0,
+    sourceTextCount: 0,
+    textInPageCount: 0,
+    textOutOfPageCount: 0,
+    discardedTransparentCount: 0,
+    discardedDegenerateCount: 0,
+    discardedDuplicateCount: 0,
+    discardedContainedCount: 0,
+    maxCellPopulation: 0
+  };
+}
+
+const MIN_GRID_SIDE = 64;
+const MAX_GRID_SIDE = 1024;
+const MIN_TARGET_CELLS = 30_000;
+const MAX_TARGET_CELLS = 220_000;
+
+function computeSceneMaxCellPopulation(scene: VectorScene): number {
+  const segmentCount = Math.max(0, Math.trunc(scene.segmentCount));
+  if (segmentCount <= 0) {
+    return 0;
+  }
+
+  const width = Math.max(scene.bounds.maxX - scene.bounds.minX, 1e-5);
+  const height = Math.max(scene.bounds.maxY - scene.bounds.minY, 1e-5);
+  const { gridWidth, gridHeight } = chooseGridSize(segmentCount, width, height);
+  const cellWidth = width / gridWidth;
+  const cellHeight = height / gridHeight;
+  const counts = new Uint32Array(gridWidth * gridHeight);
+
+  let maxCellPopulation = 0;
+
+  for (let i = 0; i < segmentCount; i += 1) {
+    const primitiveBoundsOffset = i * 4;
+    const styleOffset = i * 4;
+    const halfWidth = Number(scene.styles[styleOffset] ?? 0);
+    const margin = halfWidth + 0.35;
+
+    const minX = scene.primitiveBounds[primitiveBoundsOffset] - margin;
+    const minY = scene.primitiveBounds[primitiveBoundsOffset + 1] - margin;
+    const maxX = scene.primitiveBounds[primitiveBoundsOffset + 2] + margin;
+    const maxY = scene.primitiveBounds[primitiveBoundsOffset + 3] + margin;
+
+    const c0 = clampToCell(Math.floor((minX - scene.bounds.minX) / cellWidth), gridWidth);
+    const c1 = clampToCell(Math.floor((maxX - scene.bounds.minX) / cellWidth), gridWidth);
+    const r0 = clampToCell(Math.floor((minY - scene.bounds.minY) / cellHeight), gridHeight);
+    const r1 = clampToCell(Math.floor((maxY - scene.bounds.minY) / cellHeight), gridHeight);
+
+    for (let row = r0; row <= r1; row += 1) {
+      let cellIndex = row * gridWidth + c0;
+      for (let col = c0; col <= c1; col += 1) {
+        const next = counts[cellIndex] + 1;
+        counts[cellIndex] = next;
+        if (next > maxCellPopulation) {
+          maxCellPopulation = next;
+        }
+        cellIndex += 1;
+      }
+    }
+  }
+
+  return maxCellPopulation;
+}
+
+function chooseGridSize(segmentCount: number, width: number, height: number): { gridWidth: number; gridHeight: number } {
+  const targetCells = clamp(
+    Math.round(segmentCount / 8),
+    MIN_TARGET_CELLS,
+    MAX_TARGET_CELLS
+  );
+  const aspect = width / height;
+  let gridWidth = Math.round(Math.sqrt(targetCells * aspect));
+  let gridHeight = Math.round(targetCells / Math.max(gridWidth, 1));
+
+  gridWidth = clamp(gridWidth, MIN_GRID_SIDE, MAX_GRID_SIDE);
+  gridHeight = clamp(gridHeight, MIN_GRID_SIDE, MAX_GRID_SIDE);
+  return { gridWidth, gridHeight };
+}
+
+function clampToCell(value: number, maxCells: number): number {
+  if (value < 0) {
+    return 0;
+  }
+  if (value >= maxCells) {
+    return maxCells - 1;
+  }
+  return value;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (value < min) {
+    return min;
+  }
+  if (value > max) {
+    return max;
+  }
+  return value;
 }

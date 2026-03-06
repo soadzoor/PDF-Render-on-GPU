@@ -110,6 +110,53 @@
         color: #293446;
       }
 
+      #runtime,
+      #help {
+        margin-top: 6px;
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      #runtime {
+        color: #334155;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      }
+
+      #help {
+        color: #475569;
+      }
+
+      #metrics {
+        margin-top: 8px;
+        border: 1px solid rgba(15, 23, 42, 0.12);
+        border-radius: 8px;
+        padding: 8px 10px;
+        background: rgba(255, 255, 255, 0.72);
+      }
+
+      .metric-row {
+        display: grid;
+        grid-template-columns: minmax(120px, 150px) 1fr;
+        gap: 10px;
+        align-items: baseline;
+      }
+
+      .metric-row + .metric-row {
+        margin-top: 4px;
+      }
+
+      .metric-label {
+        color: #475569;
+        font-size: 12px;
+      }
+
+      .metric-value {
+        color: #0f172a;
+        font-size: 12px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        word-break: break-word;
+      }
+
       #drop-indicator {
         position: absolute;
         inset: 0;
@@ -180,6 +227,21 @@
           </div>
         </div>
         <div id="status">Waiting for PDF or parsed ZIP...</div>
+        <div id="runtime"></div>
+        <div id="metrics">
+          <div class="metric-row"><span class="metric-label">File</span><span id="metric-file" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Operators</span><span id="metric-operators" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Source Segments</span><span id="metric-source-segments" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Merged Segments</span><span id="metric-merged-segments" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Visible Segments</span><span id="metric-visible-segments" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Reductions</span><span id="metric-reductions" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Cull Discards</span><span id="metric-cull-discards" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Parse / Upload</span><span id="metric-times" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">FPS</span><span id="metric-fps" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
+          <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
+        </div>
+        <div id="help">Drag to pan, mouse wheel or pinch to zoom, or drag-and-drop a PDF or parsed ZIP.</div>
       </div>
       <div id="drop-indicator" class="active">Drop PDF or parsed ZIP to render</div>
     </div>
@@ -194,6 +256,19 @@
       const fileInput = document.querySelector("#file-input");
       const exampleSelect = document.querySelector("#example-select");
       const statusElement = document.querySelector("#status");
+      const runtimeElement = document.querySelector("#runtime");
+      const metricsElement = document.querySelector("#metrics");
+      const metricFileElement = document.querySelector("#metric-file");
+      const metricOperatorsElement = document.querySelector("#metric-operators");
+      const metricSourceSegmentsElement = document.querySelector("#metric-source-segments");
+      const metricMergedSegmentsElement = document.querySelector("#metric-merged-segments");
+      const metricVisibleSegmentsElement = document.querySelector("#metric-visible-segments");
+      const metricReductionsElement = document.querySelector("#metric-reductions");
+      const metricCullDiscardsElement = document.querySelector("#metric-cull-discards");
+      const metricTimesElement = document.querySelector("#metric-times");
+      const metricFpsElement = document.querySelector("#metric-fps");
+      const metricTextureElement = document.querySelector("#metric-texture");
+      const metricGridMaxCellElement = document.querySelector("#metric-grid-max-cell");
       const dropIndicator = document.querySelector("#drop-indicator");
       const strokeCurveToggle = document.querySelector("#toggle-stroke-curves");
       const vectorOnlyToggle = document.querySelector("#toggle-vector-text-only");
@@ -210,6 +285,19 @@
         !fileInput ||
         !exampleSelect ||
         !statusElement ||
+        !runtimeElement ||
+        !metricsElement ||
+        !metricFileElement ||
+        !metricOperatorsElement ||
+        !metricSourceSegmentsElement ||
+        !metricMergedSegmentsElement ||
+        !metricVisibleSegmentsElement ||
+        !metricReductionsElement ||
+        !metricCullDiscardsElement ||
+        !metricTimesElement ||
+        !metricFpsElement ||
+        !metricTextureElement ||
+        !metricGridMaxCellElement ||
         !dropIndicator ||
         !strokeCurveToggle ||
         !vectorOnlyToggle ||
@@ -251,6 +339,8 @@
       let pdfObject = null;
       let isDragActive = false;
       const exampleSelectionMap = new Map();
+      let fpsLastSampleTime = 0;
+      let fpsSmoothed = 0;
 
       const WORLD_UNITS_PER_POINT = 0.01;
 
@@ -260,6 +350,106 @@
 
       function formatPercent(value) {
         return `${Math.max(0, Math.min(100, Math.trunc(value)))}%`;
+      }
+
+      function setMetricPlaceholder(label = "-") {
+        metricFileElement.textContent = label;
+        metricOperatorsElement.textContent = "-";
+        metricSourceSegmentsElement.textContent = "-";
+        metricMergedSegmentsElement.textContent = "-";
+        metricVisibleSegmentsElement.textContent = "-";
+        metricReductionsElement.textContent = "-";
+        metricCullDiscardsElement.textContent = "-";
+        metricTimesElement.textContent = "-";
+        metricFpsElement.textContent = "-";
+        metricTextureElement.textContent = "-";
+        metricGridMaxCellElement.textContent = "-";
+        metricsElement.dataset.ready = "false";
+      }
+
+      function updateMetricsPanel(label, loadMs) {
+        metricFileElement.textContent = label;
+        const documentMetrics = pdfObject ? pdfObject.documentMetrics : null;
+        const textureMetrics = pdfObject ? pdfObject.textureMetrics : null;
+        const loadTiming = pdfObject ? pdfObject.loadTiming : null;
+
+        if (documentMetrics) {
+          const sourceSegments = Math.max(0, Number(documentMetrics.sourceSegmentCount) || 0);
+          const mergedSegments = Math.max(0, Number(documentMetrics.mergedSegmentCount) || 0);
+          const visibleSegments = Math.max(0, Number(documentMetrics.visibleSegmentCount) || 0);
+          const mergeReduction = sourceSegments > 0 ? (1 - mergedSegments / sourceSegments) * 100 : 0;
+          const cullReduction = mergedSegments > 0 ? (1 - visibleSegments / mergedSegments) * 100 : 0;
+          const totalReduction = sourceSegments > 0 ? (1 - visibleSegments / sourceSegments) * 100 : 0;
+
+          metricOperatorsElement.textContent = documentMetrics.operatorCount.toLocaleString();
+          metricSourceSegmentsElement.textContent = sourceSegments.toLocaleString();
+          metricMergedSegmentsElement.textContent =
+            `${mergedSegments.toLocaleString()} (${mergeReduction.toFixed(1)}% reduction)`;
+          metricVisibleSegmentsElement.textContent =
+            `${visibleSegments.toLocaleString()} (${totalReduction.toFixed(1)}% total reduction), fills ${documentMetrics.fillPathCount.toLocaleString()}, text ${documentMetrics.textInstanceCount.toLocaleString()} instances, pages ${documentMetrics.pageCount.toLocaleString()}, raster ${documentMetrics.rasterLayerCount.toLocaleString()} layers`;
+          metricReductionsElement.textContent =
+            `merge ${mergeReduction.toFixed(1)}%, invisible-cull ${cullReduction.toFixed(1)}%, total ${totalReduction.toFixed(1)}%`;
+          metricCullDiscardsElement.textContent =
+            `transparent ${documentMetrics.discardedTransparentCount.toLocaleString()}, degenerate ${documentMetrics.discardedDegenerateCount.toLocaleString()}, duplicates ${documentMetrics.discardedDuplicateCount.toLocaleString()}, contained ${documentMetrics.discardedContainedCount.toLocaleString()}, glyphs ${documentMetrics.textGlyphCount.toLocaleString()} / glyph segments ${documentMetrics.textGlyphSegmentCount.toLocaleString()}`;
+          metricGridMaxCellElement.textContent = documentMetrics.maxCellPopulation.toLocaleString();
+        } else {
+          metricOperatorsElement.textContent = "0";
+          metricSourceSegmentsElement.textContent = "0";
+          metricMergedSegmentsElement.textContent = "0";
+          metricVisibleSegmentsElement.textContent = "0";
+          metricReductionsElement.textContent = "0.0%";
+          metricCullDiscardsElement.textContent = "0";
+          metricGridMaxCellElement.textContent = "0";
+        }
+
+        if (loadTiming) {
+          metricTimesElement.textContent =
+            `parse ${Math.max(0, loadTiming.parseMs).toFixed(0)} ms, upload ${Math.max(0, loadTiming.uploadMs).toFixed(0)} ms, total ${Math.max(0, loadTiming.totalMs).toFixed(0)} ms`;
+        } else {
+          metricTimesElement.textContent = `load ${Math.max(0, loadMs).toFixed(0)} ms`;
+        }
+
+        if (textureMetrics) {
+          const fillPathsSize = `${textureMetrics.fillPathTextureWidth}x${textureMetrics.fillPathTextureHeight}`;
+          const fillSegmentsSize = `${textureMetrics.fillSegmentTextureWidth}x${textureMetrics.fillSegmentTextureHeight}`;
+          const segmentSize = `${textureMetrics.segmentTextureWidth}x${textureMetrics.segmentTextureHeight}`;
+          const textInstSize = `${textureMetrics.textInstanceTextureWidth}x${textureMetrics.textInstanceTextureHeight}`;
+          const glyphSize = `${textureMetrics.textGlyphTextureWidth}x${textureMetrics.textGlyphTextureHeight}`;
+          const glyphSegSize = `${textureMetrics.textSegmentTextureWidth}x${textureMetrics.textSegmentTextureHeight}`;
+          const rasterAtlasSummary = textureMetrics.rasterAtlasSizes.length > 0
+            ? textureMetrics.rasterAtlasSizes.map((size) => `${size.width}x${size.height}`).join(", ")
+            : "-";
+
+          metricTextureElement.textContent =
+            `fill paths ${fillPathsSize}, fill seg ${fillSegmentsSize}, segments ${segmentSize}, text inst ${textInstSize}, glyph ${glyphSize}, glyph-seg ${glyphSegSize}, raster atlas ${rasterAtlasSummary}, max ${textureMetrics.maxTextureSize}x${textureMetrics.maxTextureSize}`;
+        } else {
+          metricTextureElement.textContent = "0";
+        }
+
+        metricsElement.dataset.ready = "true";
+      }
+
+      function updateFpsMetric() {
+        const now = performance.now();
+        if (fpsLastSampleTime > 0) {
+          const deltaMs = now - fpsLastSampleTime;
+          if (deltaMs > 0) {
+            const fpsNow = 1000 / deltaMs;
+            fpsSmoothed = fpsSmoothed === 0 ? fpsNow : fpsSmoothed * 0.85 + fpsNow * 0.15;
+            metricFpsElement.textContent = `${fpsSmoothed.toFixed(0)} FPS`;
+          }
+        }
+        fpsLastSampleTime = now;
+      }
+
+      function updateRuntimeText() {
+        if (!pdfObject) {
+          runtimeElement.textContent = "";
+          return;
+        }
+        const renderInfo = renderer.info.render;
+        runtimeElement.textContent =
+          `Draw calls ${renderInfo.calls.toLocaleString()} | triangles ${renderInfo.triangles.toLocaleString()} | lines ${renderInfo.lines.toLocaleString()} | points ${renderInfo.points.toLocaleString()}`;
       }
 
       function readMaterialOptions() {
@@ -299,6 +489,7 @@
         rootGroup.remove(pdfObject);
         pdfObject.dispose();
         pdfObject = null;
+        runtimeElement.textContent = "";
       }
 
       function layoutPages(pageMeshes) {
@@ -389,11 +580,13 @@
 
       async function loadSource(source, label) {
         setStatus(`Loading ${label}...`);
+        setMetricPlaceholder(label);
 
         disposeCurrentPdfObject();
         refreshDropIndicator();
 
         try {
+          const loadStart = performance.now();
           const next = await LoadPDFObject(source, {
             worker: "auto",
             page: {
@@ -409,12 +602,15 @@
           rootGroup.add(pdfObject);
           fitCameraToObject(pdfObject);
           refreshDropIndicator();
+          const loadMs = performance.now() - loadStart;
+          updateMetricsPanel(label, loadMs);
 
           setStatus(
             `${label} loaded | pages ${pdfObject.pageCount.toLocaleString()} | drag to pan, wheel to zoom`
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          setMetricPlaceholder(label);
           if (message.includes("v3 is unsupported")) {
             setStatus(`Failed to load ${label}: ${message}`);
           } else {
@@ -571,6 +767,8 @@
       function animate() {
         controls.update();
         renderer.render(scene, camera);
+        updateFpsMetric();
+        updateRuntimeText();
         requestAnimationFrame(animate);
       }
 
@@ -639,6 +837,7 @@
       vectorOpacityInput.addEventListener("input", applyMaterialOptions);
 
       applyMaterialOptions();
+      setMetricPlaceholder();
       refreshDropIndicator();
       resizeRenderer();
       void loadExampleManifest();

@@ -27,6 +27,7 @@ export interface FloatTextureRef {
 
 export interface SharedGpuData {
   document: CompiledPdfDocument;
+  maxTextureSize: number;
   geometry: InstancedBufferGeometry;
   maxRasterPrimitiveCount: number;
   maxFillPrimitiveCount: number;
@@ -203,6 +204,7 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
 
   return {
     document,
+    maxTextureSize,
     geometry,
     maxRasterPrimitiveCount,
     maxFillPrimitiveCount,
