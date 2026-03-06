@@ -380,7 +380,8 @@ function createFloatTexture(data: Float32Array, maxTextureSize: number): FloatTe
 }
 
 function createRgbaTexture(data: Uint8Array, width: number, height: number): DataTexture {
-  const texture = new DataTexture(data, width, height, RGBAFormat);
+  const premultiplied = premultiplyRgba(data);
+  const texture = new DataTexture(premultiplied, width, height, RGBAFormat);
   texture.needsUpdate = true;
   texture.generateMipmaps = true;
   texture.minFilter = LinearMipmapLinearFilter;
@@ -400,6 +401,33 @@ function createTextAtlasTexture(data: Uint8Array, width: number, height: number)
   texture.wrapS = ClampToEdgeWrapping;
   texture.wrapT = ClampToEdgeWrapping;
   return texture;
+}
+
+function premultiplyRgba(source: Uint8Array): Uint8Array {
+  const out = new Uint8Array(source.length);
+  for (let i = 0; i + 3 < source.length; i += 4) {
+    const alpha = source[i + 3];
+    if (alpha <= 0) {
+      out[i] = 0;
+      out[i + 1] = 0;
+      out[i + 2] = 0;
+      out[i + 3] = 0;
+      continue;
+    }
+    if (alpha >= 255) {
+      out[i] = source[i];
+      out[i + 1] = source[i + 1];
+      out[i + 2] = source[i + 2];
+      out[i + 3] = 255;
+      continue;
+    }
+    const scale = alpha / 255;
+    out[i] = Math.round(source[i] * scale);
+    out[i + 1] = Math.round(source[i + 1] * scale);
+    out[i + 2] = Math.round(source[i + 2] * scale);
+    out[i + 3] = alpha;
+  }
+  return out;
 }
 
 function chooseTextureDimensions(itemCount: number, maxTextureSize: number): { width: number; height: number } {

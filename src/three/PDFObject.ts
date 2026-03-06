@@ -6,6 +6,7 @@ import { createPdfMaterialSet, type PdfMaterialSet } from "./materials/createPdf
 import type { SharedGpuData } from "./gpu/sharedGpuData";
 import { PDFPageInstancedMesh } from "./PDFPageInstancedMesh";
 import { PDFPageMesh } from "./PDFPageMesh";
+import { PanCacheController } from "./PanCacheController";
 
 export class PDFObject extends Group {
   readonly pages: PDFPageMesh[];
@@ -15,6 +16,7 @@ export class PDFObject extends Group {
   private readonly shared: SharedGpuData;
   private readonly options: ResolvedLoadOptions;
   private readonly pageMaterialSet: PdfMaterialSet;
+  private readonly panCacheController: PanCacheController;
   private readonly instancedMaterialSets = new Set<PdfMaterialSet>();
   private readonly instancedGeometries = new Set<BufferGeometry>();
 
@@ -24,8 +26,20 @@ export class PDFObject extends Group {
     this.shared = shared;
     this.options = options;
     this.pageMaterialSet = createPdfMaterialSet(shared, options, "mesh");
+    this.panCacheController = new PanCacheController(this, shared.textAtlasTexture);
+    this.panCacheController.registerMaterialSet(this.pageMaterialSet);
 
-    this.pages = document.pages.map((pageInfo) => new PDFPageMesh(pageInfo, shared.geometry, this.pageMaterialSet.all));
+    this.pages = document.pages.map(
+      (pageInfo) =>
+        new PDFPageMesh(
+          pageInfo,
+          shared.geometry,
+          this.pageMaterialSet.all,
+          (renderer, scene, camera) => {
+            this.panCacheController.onBeforeRender(renderer, scene, camera);
+          }
+        )
+    );
     this.pageCount = this.pages.length;
     this.pages.forEach((page) => this.add(page));
   }
@@ -37,12 +51,22 @@ export class PDFObject extends Group {
 
     const geometry = this.shared.createInstancedGeometry(indices);
     const materialSet = createPdfMaterialSet(this.shared, this.options, "instanced");
+    this.panCacheController.registerMaterialSet(materialSet);
     this.instancedMaterialSets.add(materialSet);
     this.instancedGeometries.add(geometry);
 
     const sourcePages = indices.map((index) => this.pages[index]);
-    const instanced = new PDFPageInstancedMesh(geometry, materialSet.all, indices, sourcePages);
+    const instanced = new PDFPageInstancedMesh(
+      geometry,
+      materialSet.all,
+      indices,
+      sourcePages,
+      (renderer, scene, camera) => {
+        this.panCacheController.onBeforeRender(renderer, scene, camera);
+      }
+    );
     this.add(instanced);
+    this.panCacheController.invalidate();
     return instanced;
   }
 
@@ -51,9 +75,11 @@ export class PDFObject extends Group {
     for (const set of this.instancedMaterialSets) {
       set.setMaterialOptions(options);
     }
+    this.panCacheController.invalidate();
   }
 
   dispose(): void {
+    this.panCacheController.dispose();
     this.pageMaterialSet.dispose();
 
     for (const set of this.instancedMaterialSets) {

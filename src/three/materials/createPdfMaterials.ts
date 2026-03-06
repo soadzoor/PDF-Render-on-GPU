@@ -1,8 +1,13 @@
 import {
   Color,
+  CustomBlending,
   GLSL3,
+  Matrix4,
+  OneFactor,
+  OneMinusSrcAlphaFactor,
   RawShaderMaterial,
-  type Side
+  type Side,
+  type Texture
 } from "three";
 
 import type { SharedGpuData } from "../gpu/sharedGpuData";
@@ -22,6 +27,7 @@ export interface PdfMaterialSet {
   text: RawShaderMaterial;
   all: RawShaderMaterial[];
   setMaterialOptions(options: Partial<ResolvedMaterialOptions>): void;
+  setPanCacheState(enabled: boolean, viewProj: Matrix4, texture: Texture): void;
   dispose(): void;
 }
 
@@ -38,6 +44,8 @@ export function createPdfMaterialSet(
     ? new Color(options.material.vectorColorOverride)
     : new Color(0, 0, 0);
   const overrideOpacity = options.material.vectorColorOverride ? options.material.vectorOpacityOverride : 0;
+  const panCacheViewProj = new Matrix4();
+  const panCacheFallbackTexture: Texture = shared.textAtlasTexture;
 
   const commonUniforms = {
     uWorldUnitsPerPoint: { value: options.page.worldUnitsPerPoint },
@@ -54,6 +62,9 @@ export function createPdfMaterialSet(
     uStrokeCurveEnabled: { value: options.material.strokeCurveEnabled ? 1 : 0 },
     uTextCurveEnabled: { value: options.material.strokeCurveEnabled ? 1 : 0 },
     uTextVectorOnly: { value: options.material.textVectorOnly ? 1 : 0 },
+    uPanCacheEnabled: { value: 0 },
+    uPanCacheViewProj: { value: panCacheViewProj },
+    uPanCacheTex: { value: panCacheFallbackTexture },
     uStrokeAAScreenPx: { value: 1.0 },
     uFillAAScreenPx: { value: 1.0 },
     uTextAAScreenPx: { value: 1.25 }
@@ -63,6 +74,11 @@ export function createPdfMaterialSet(
     new RawShaderMaterial({
       glslVersion: GLSL3,
       transparent: true,
+      blending: CustomBlending,
+      blendSrc: OneFactor,
+      blendDst: OneMinusSrcAlphaFactor,
+      blendSrcAlpha: OneFactor,
+      blendDstAlpha: OneMinusSrcAlphaFactor,
       side: options.page.side,
       depthWrite: options.page.depthWrite,
       depthTest: true,
@@ -84,6 +100,7 @@ export function createPdfMaterialSet(
           ]
         },
         uRasterAtlasIndex: { value: atlasIndex },
+        uPanCachePrimaryPass: { value: atlasIndex === 0 ? 1 : 0 },
         uRasterPassIncludesBackground: { value: atlasIndex === 0 ? 1 : 0 }
       },
       ...instancedDefinePatch
@@ -106,7 +123,8 @@ export function createPdfMaterialSet(
       uFillPathMetaTexSize: { value: [shared.fillPathTextureA.width, shared.fillPathTextureA.height] },
       uFillSegmentTexA: { value: shared.fillSegmentTextureA.texture },
       uFillSegmentTexB: { value: shared.fillSegmentTextureB.texture },
-      uFillSegmentTexSize: { value: [shared.fillSegmentTextureA.width, shared.fillSegmentTextureA.height] }
+      uFillSegmentTexSize: { value: [shared.fillSegmentTextureA.width, shared.fillSegmentTextureA.height] },
+      uPanCachePrimaryPass: { value: 0 }
     },
     ...instancedDefinePatch
   });
@@ -125,7 +143,8 @@ export function createPdfMaterialSet(
       uSegmentTexB: { value: shared.segmentTextureB.texture },
       uSegmentStyleTex: { value: shared.segmentTextureC.texture },
       uSegmentBoundsTex: { value: shared.segmentTextureD.texture },
-      uSegmentTexSize: { value: [shared.segmentTextureA.width, shared.segmentTextureA.height] }
+      uSegmentTexSize: { value: [shared.segmentTextureA.width, shared.segmentTextureA.height] },
+      uPanCachePrimaryPass: { value: 0 }
     },
     ...instancedDefinePatch
   });
@@ -154,7 +173,8 @@ export function createPdfMaterialSet(
       },
       uTextGlyphRasterMetaTex: { value: shared.textGlyphRasterMetaTexture.texture },
       uTextRasterAtlasTex: { value: shared.textAtlasTexture },
-      uTextRasterAtlasSize: { value: [shared.textAtlasSize.width, shared.textAtlasSize.height] }
+      uTextRasterAtlasSize: { value: [shared.textAtlasSize.width, shared.textAtlasSize.height] },
+      uPanCachePrimaryPass: { value: 0 }
     },
     ...instancedDefinePatch
   });
@@ -218,6 +238,11 @@ export function createPdfMaterialSet(
         material.needsUpdate = true;
       }
     },
+    setPanCacheState: (enabled, viewProj, texture) => {
+      commonUniforms.uPanCacheEnabled.value = enabled ? 1 : 0;
+      (commonUniforms.uPanCacheViewProj.value as Matrix4).copy(viewProj);
+      commonUniforms.uPanCacheTex.value = texture;
+    },
     dispose: () => {
       for (const material of all) {
         material.dispose();
@@ -257,8 +282,11 @@ ${isInstanced ? "in float aPageIndex;" : ""}
 
 uniform mat4 modelViewMatrix;
 uniform mat4 projectionMatrix;
+uniform mat4 modelMatrix;
 uniform float uWorldUnitsPerPoint;
 uniform int uPageIndex;
+uniform float uPanCacheEnabled;
+uniform float uPanCachePrimaryPass;
 uniform sampler2D uPageMetaTexA;
 uniform sampler2D uPageMetaTexB;
 uniform sampler2D uPageRectTex;
@@ -281,14 +309,58 @@ ${isInstanced ? "  return int(aPageIndex + 0.5);" : "  return uPageIndex;"}
 
 vec4 toClip(vec2 pagePoint, vec2 pageCenter) {
   vec3 local = vec3((pagePoint - pageCenter) * uWorldUnitsPerPoint, 0.0);
-  vec4 world = vec4(local, 1.0);
+  vec4 modelLocal = vec4(local, 1.0);
 #ifdef USE_INSTANCING
-  world = instanceMatrix * world;
+  modelLocal = instanceMatrix * modelLocal;
 #endif
-  return projectionMatrix * (modelViewMatrix * world);
+  return projectionMatrix * (modelViewMatrix * modelLocal);
+}
+
+vec3 toWorldPosition(vec2 pagePoint, vec2 pageCenter) {
+  vec3 local = vec3((pagePoint - pageCenter) * uWorldUnitsPerPoint, 0.0);
+  vec4 modelLocal = vec4(local, 1.0);
+#ifdef USE_INSTANCING
+  modelLocal = instanceMatrix * modelLocal;
+#endif
+  return (modelMatrix * modelLocal).xyz;
 }
 `;
 }
+
+const PAN_CACHE_SAMPLING_GLSL = `
+vec4 samplePanCacheColor(vec3 worldPos) {
+  vec4 cacheClip = uPanCacheViewProj * vec4(worldPos, 1.0);
+  if (cacheClip.w <= 1e-6) {
+    return vec4(0.0);
+  }
+
+  vec2 ndc = cacheClip.xy / cacheClip.w;
+  const float ndcGuard = 1e-3;
+  if (abs(ndc.x) > 1.0 + ndcGuard || abs(ndc.y) > 1.0 + ndcGuard) {
+    return vec4(0.0);
+  }
+
+  vec2 uv = clamp(ndc * 0.5 + 0.5, vec2(0.0), vec2(1.0));
+  return texture(uPanCacheTex, uv);
+}
+
+vec4 compositeOver(vec4 fg, vec4 bg) {
+  float outA = fg.a + bg.a * (1.0 - fg.a);
+  vec3 outRgb = fg.rgb + bg.rgb * (1.0 - fg.a);
+  return vec4(outRgb, outA);
+}
+
+float computePageEdgeBandMask(vec2 pageNormCoord) {
+  float edgeDistanceNorm = min(
+    min(pageNormCoord.x, 1.0 - pageNormCoord.x),
+    min(pageNormCoord.y, 1.0 - pageNormCoord.y)
+  );
+  vec2 normPerPixel = max(fwidth(pageNormCoord), vec2(1e-6));
+  float onePxNorm = max(normPerPixel.x, normPerPixel.y);
+  float twoPxNorm = onePxNorm * 2.0;
+  return 1.0 - smoothstep(onePxNorm, twoPxNorm, edgeDistanceNorm);
+}
+`;
 
 function buildRasterVertexShader(isInstanced: boolean): string {
   return `${commonVertexHeader(isInstanced)}
@@ -302,23 +374,40 @@ uniform float uRasterPassIncludesBackground;
 out vec2 vUv;
 flat out vec4 vUvRect;
 flat out float vRasterKind;
+out vec2 vPageNormCoord;
+out vec3 vWorldPos;
 
 void main() {
   int pageIndex = readPageIndex();
   vec4 pageMetaB = texelFetch(uPageMetaTexB, coordFromIndex(pageIndex, uPageMetaTexSize), 0);
   vec4 pageRect = texelFetch(uPageRectTex, coordFromIndex(pageIndex, uPageRectTexSize), 0);
   vec2 pageCenter = (pageRect.xy + pageRect.zw) * 0.5;
+  vec2 pageSize = max(pageRect.zw - pageRect.xy, vec2(1e-6));
 
   int primitiveIndex = int(aPrimitiveIndex + 0.5);
   int rasterCount = int(pageMetaB.w + 0.5);
 
   vec2 corner01 = position.xy * 0.5 + 0.5;
 
+  if (uPanCacheEnabled >= 0.5) {
+    if (uPanCachePrimaryPass < 0.5 || primitiveIndex != 0) {
+      gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+      vUv = vec2(0.0);
+      vUvRect = vec4(0.0);
+      vRasterKind = 2.0;
+      vPageNormCoord = vec2(0.0);
+      vWorldPos = vec3(0.0);
+      return;
+    }
+  }
+
   if (primitiveIndex > rasterCount) {
     gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
     vUv = vec2(0.0);
     vUvRect = vec4(0.0);
     vRasterKind = 2.0;
+    vPageNormCoord = vec2(0.0);
+    vWorldPos = vec3(0.0);
     return;
   }
 
@@ -328,14 +417,18 @@ void main() {
       vUv = vec2(0.0);
       vUvRect = vec4(0.0);
       vRasterKind = 2.0;
+      vPageNormCoord = vec2(0.0);
+      vWorldPos = vec3(0.0);
       return;
     }
 
     vec2 pagePoint = mix(pageRect.xy, pageRect.zw, corner01);
+    vWorldPos = toWorldPosition(pagePoint, pageCenter);
     gl_Position = toClip(pagePoint, pageCenter);
     vUv = vec2(0.0);
     vUvRect = vec4(0.0);
     vRasterKind = 0.0;
+    vPageNormCoord = corner01;
     return;
   }
 
@@ -349,6 +442,8 @@ void main() {
     vUv = vec2(0.0);
     vUvRect = vec4(0.0);
     vRasterKind = 2.0;
+    vPageNormCoord = vec2(0.0);
+    vWorldPos = vec3(0.0);
     return;
   }
 
@@ -358,10 +453,12 @@ void main() {
     metaA.y * localTopDown.x + metaA.w * localTopDown.y + metaB.y
   );
 
+  vWorldPos = toWorldPosition(pagePoint, pageCenter);
   gl_Position = toClip(pagePoint, pageCenter);
   vUvRect = vec4(metaB.z, metaB.w, metaC.x, metaC.y);
   vUv = vec2(vUvRect.x + localTopDown.x * vUvRect.z, vUvRect.y + localTopDown.y * vUvRect.w);
   vRasterKind = 1.0;
+  vPageNormCoord = clamp((pagePoint - pageRect.xy) / pageSize, 0.0, 1.0);
 }
 `;
 }
@@ -370,17 +467,41 @@ const RASTER_FRAGMENT_SHADER = `precision highp float;
 precision highp sampler2D;
 
 uniform sampler2D uRasterAtlasTex;
+uniform sampler2D uPanCacheTex;
 uniform vec2 uRasterAtlasSize;
+uniform mat4 uPanCacheViewProj;
+uniform float uPanCacheEnabled;
+uniform float uPanCachePrimaryPass;
 uniform vec4 uPageBackgroundColor;
 
 in vec2 vUv;
 flat in vec4 vUvRect;
 flat in float vRasterKind;
+in vec2 vPageNormCoord;
+in vec3 vWorldPos;
 out vec4 outColor;
 
 ${buildRasterStableSamplingGlsl()}
+${PAN_CACHE_SAMPLING_GLSL}
 
 void main() {
+  if (uPanCacheEnabled >= 0.5) {
+    if (uPanCachePrimaryPass < 0.5) {
+      discard;
+    }
+    vec4 cached = samplePanCacheColor(vWorldPos);
+    float pageQuadMask = 1.0 - step(0.5, vRasterKind);
+    float edgeMask = computePageEdgeBandMask(vPageNormCoord) * pageQuadMask;
+    vec4 backgroundPremult = vec4(uPageBackgroundColor.rgb * uPageBackgroundColor.a, uPageBackgroundColor.a);
+    vec4 edgeComposited = compositeOver(cached, backgroundPremult);
+    vec4 stabilized = mix(cached, edgeComposited, edgeMask);
+    if (stabilized.a <= 0.001) {
+      discard;
+    }
+    outColor = stabilized;
+    return;
+  }
+
   if (vRasterKind > 1.5) {
     discard;
   }
@@ -389,7 +510,7 @@ void main() {
     if (uPageBackgroundColor.a <= 0.001) {
       discard;
     }
-    outColor = uPageBackgroundColor;
+    outColor = vec4(uPageBackgroundColor.rgb * uPageBackgroundColor.a, uPageBackgroundColor.a);
     return;
   }
 
@@ -416,8 +537,22 @@ flat out float vAlpha;
 flat out float vFillRule;
 flat out float vFillHasCompanionStroke;
 out vec2 vLocal;
+out vec3 vWorldPos;
 
 void main() {
+  if (uPanCacheEnabled >= 0.5 && uPanCachePrimaryPass < 0.5) {
+    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+    vSegmentStart = 0;
+    vSegmentCount = 0;
+    vColor = vec3(0.0);
+    vAlpha = 0.0;
+    vFillRule = 0.0;
+    vFillHasCompanionStroke = 0.0;
+    vLocal = vec2(0.0);
+    vWorldPos = vec3(0.0);
+    return;
+  }
+
   int pageIndex = readPageIndex();
   vec4 pageMetaA = texelFetch(uPageMetaTexA, coordFromIndex(pageIndex, uPageMetaTexSize), 0);
   vec4 pageRect = texelFetch(uPageRectTex, coordFromIndex(pageIndex, uPageRectTexSize), 0);
@@ -434,6 +569,7 @@ void main() {
     vFillRule = 0.0;
     vFillHasCompanionStroke = 0.0;
     vLocal = vec2(0.0);
+    vWorldPos = vec3(0.0);
     return;
   }
 
@@ -453,6 +589,7 @@ void main() {
     vFillRule = 0.0;
     vFillHasCompanionStroke = 0.0;
     vLocal = vec2(0.0);
+    vWorldPos = vec3(0.0);
     return;
   }
 
@@ -461,6 +598,7 @@ void main() {
   vec2 corner01 = position.xy * 0.5 + 0.5;
   vec2 local = mix(minBounds, maxBounds, corner01);
 
+  vWorldPos = toWorldPosition(local, pageCenter);
   gl_Position = toClip(local, pageCenter);
   vSegmentStart = int(metaA.x + 0.5);
   vSegmentCount = segmentCount;
@@ -478,8 +616,12 @@ precision highp sampler2D;
 
 uniform sampler2D uFillSegmentTexA;
 uniform sampler2D uFillSegmentTexB;
+uniform sampler2D uPanCacheTex;
 uniform ivec2 uFillSegmentTexSize;
+uniform mat4 uPanCacheViewProj;
 uniform float uFillAAScreenPx;
+uniform float uPanCacheEnabled;
+uniform float uPanCachePrimaryPass;
 uniform vec4 uVectorOverride;
 
 flat in int vSegmentStart;
@@ -489,6 +631,7 @@ flat in float vAlpha;
 flat in float vFillRule;
 flat in float vFillHasCompanionStroke;
 in vec2 vLocal;
+in vec3 vWorldPos;
 
 out vec4 outColor;
 
@@ -503,8 +646,21 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
 
 ${buildVectorDistanceFunctionsGlsl()}
 ${buildFillWindingFunctionsGlsl()}
+${PAN_CACHE_SAMPLING_GLSL}
 
 void main() {
+  if (uPanCacheEnabled >= 0.5) {
+    if (uPanCachePrimaryPass < 0.5) {
+      discard;
+    }
+    vec4 cached = samplePanCacheColor(vWorldPos);
+    if (cached.a <= 0.001) {
+      discard;
+    }
+    outColor = cached;
+    return;
+  }
+
   if (vSegmentCount <= 0 || vAlpha <= 0.001) {
     discard;
   }
@@ -579,8 +735,24 @@ flat out float vHalfWidth;
 flat out float vIsHairline;
 flat out vec3 vColor;
 flat out float vAlpha;
+out vec3 vWorldPos;
 
 void main() {
+  if (uPanCacheEnabled >= 0.5 && uPanCachePrimaryPass < 0.5) {
+    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+    vLocal = vec2(0.0);
+    vP0 = vec2(0.0);
+    vP1 = vec2(0.0);
+    vP2 = vec2(0.0);
+    vPrimitiveType = 0.0;
+    vHalfWidth = 0.0;
+    vIsHairline = 0.0;
+    vColor = vec3(0.0);
+    vAlpha = 0.0;
+    vWorldPos = vec3(0.0);
+    return;
+  }
+
   int pageIndex = readPageIndex();
   vec4 pageMetaA = texelFetch(uPageMetaTexA, coordFromIndex(pageIndex, uPageMetaTexSize), 0);
   vec4 pageRect = texelFetch(uPageRectTex, coordFromIndex(pageIndex, uPageRectTexSize), 0);
@@ -600,6 +772,7 @@ void main() {
     vIsHairline = 0.0;
     vColor = vec3(0.0);
     vAlpha = 0.0;
+    vWorldPos = vec3(0.0);
     return;
   }
 
@@ -636,6 +809,7 @@ void main() {
     vIsHairline = 0.0;
     vColor = color;
     vAlpha = 0.0;
+    vWorldPos = vec3(0.0);
     return;
   }
 
@@ -645,6 +819,7 @@ void main() {
   vec2 corner01 = position.xy * 0.5 + 0.5;
   vec2 pagePoint = mix(worldMin, worldMax, corner01);
 
+  vWorldPos = toWorldPosition(pagePoint, pageCenter);
   gl_Position = toClip(pagePoint, pageCenter);
   vLocal = pagePoint;
   vP0 = p0;
@@ -661,8 +836,12 @@ void main() {
 
 const STROKE_FRAGMENT_SHADER = `precision highp float;
 
+uniform sampler2D uPanCacheTex;
 uniform float uStrokeCurveEnabled;
 uniform float uStrokeAAScreenPx;
+uniform mat4 uPanCacheViewProj;
+uniform float uPanCacheEnabled;
+uniform float uPanCachePrimaryPass;
 uniform vec4 uVectorOverride;
 
 in vec2 vLocal;
@@ -674,12 +853,26 @@ flat in float vHalfWidth;
 flat in float vIsHairline;
 flat in vec3 vColor;
 flat in float vAlpha;
+in vec3 vWorldPos;
 
 out vec4 outColor;
 
 ${buildVectorDistanceFunctionsGlsl()}
+${PAN_CACHE_SAMPLING_GLSL}
 
 void main() {
+  if (uPanCacheEnabled >= 0.5) {
+    if (uPanCachePrimaryPass < 0.5) {
+      discard;
+    }
+    vec4 cached = samplePanCacheColor(vWorldPos);
+    if (cached.a <= 0.001) {
+      discard;
+    }
+    outColor = cached;
+    return;
+  }
+
   if (vAlpha <= 0.001) {
     discard;
   }
@@ -733,8 +926,22 @@ flat out float vColorAlpha;
 flat out vec4 vRasterRect;
 out vec2 vNormCoord;
 out vec2 vLocal;
+out vec3 vWorldPos;
 
 void main() {
+  if (uPanCacheEnabled >= 0.5 && uPanCachePrimaryPass < 0.5) {
+    gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+    vSegmentStart = 0;
+    vSegmentCount = 0;
+    vColor = vec3(0.0);
+    vColorAlpha = 0.0;
+    vRasterRect = vec4(0.0);
+    vNormCoord = vec2(0.0);
+    vLocal = vec2(0.0);
+    vWorldPos = vec3(0.0);
+    return;
+  }
+
   int pageIndex = readPageIndex();
   vec4 pageMetaB = texelFetch(uPageMetaTexB, coordFromIndex(pageIndex, uPageMetaTexSize), 0);
   vec4 pageRect = texelFetch(uPageRectTex, coordFromIndex(pageIndex, uPageRectTexSize), 0);
@@ -751,6 +958,7 @@ void main() {
     vRasterRect = vec4(0.0);
     vNormCoord = vec2(0.0);
     vLocal = vec2(0.0);
+    vWorldPos = vec3(0.0);
     return;
   }
 
@@ -774,6 +982,7 @@ void main() {
     vRasterRect = vec4(0.0);
     vNormCoord = vec2(0.0);
     vLocal = vec2(0.0);
+    vWorldPos = vec3(0.0);
     return;
   }
 
@@ -787,6 +996,7 @@ void main() {
     instanceA.y * local.x + instanceA.w * local.y + instanceB.y
   );
 
+  vWorldPos = toWorldPosition(pagePoint, pageCenter);
   gl_Position = toClip(pagePoint, pageCenter);
   vSegmentStart = int(glyphMetaA.x + 0.5);
   vSegmentCount = segmentCount;
@@ -804,11 +1014,15 @@ precision highp sampler2D;
 
 uniform sampler2D uTextGlyphSegmentTexA;
 uniform sampler2D uTextGlyphSegmentTexB;
+uniform sampler2D uPanCacheTex;
 uniform sampler2D uTextRasterAtlasTex;
 uniform ivec2 uTextGlyphSegmentTexSize;
+uniform mat4 uPanCacheViewProj;
 uniform vec2 uTextRasterAtlasSize;
 uniform float uTextAAScreenPx;
 uniform float uTextCurveEnabled;
+uniform float uPanCacheEnabled;
+uniform float uPanCachePrimaryPass;
 uniform float uTextVectorOnly;
 uniform vec4 uVectorOverride;
 
@@ -819,6 +1033,7 @@ flat in float vColorAlpha;
 flat in vec4 vRasterRect;
 in vec2 vNormCoord;
 in vec2 vLocal;
+in vec3 vWorldPos;
 
 out vec4 outColor;
 
@@ -834,8 +1049,21 @@ ivec2 coordFromIndex(int index, ivec2 sizeValue) {
 ${buildVectorDistanceFunctionsGlsl()}
 ${buildTextWindingFunctionsGlsl()}
 ${buildTextMinifySamplingGlsl()}
+${PAN_CACHE_SAMPLING_GLSL}
 
 void main() {
+  if (uPanCacheEnabled >= 0.5) {
+    if (uPanCachePrimaryPass < 0.5) {
+      discard;
+    }
+    vec4 cached = samplePanCacheColor(vWorldPos);
+    if (cached.a <= 0.001) {
+      discard;
+    }
+    outColor = cached;
+    return;
+  }
+
   if (vSegmentCount <= 0) {
     discard;
   }
