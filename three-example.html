@@ -687,7 +687,9 @@
       }
 
       function fitCameraToObject(object3d) {
-        const bounds = new THREE.Box3().setFromObject(object3d);
+        const bounds = typeof object3d?.getWorldBounds === "function"
+          ? object3d.getWorldBounds(new THREE.Box3())
+          : new THREE.Box3().setFromObject(object3d);
         if (bounds.isEmpty()) {
           return;
         }

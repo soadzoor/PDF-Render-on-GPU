@@ -1,4 +1,4 @@
-import { type BufferGeometry, Group } from "three";
+import { Box3, Group, Vector3, type BufferGeometry } from "three";
 
 import type { CompiledPdfDocument } from "../core/types";
 import type {
@@ -95,6 +95,29 @@ export class PDFObject extends Group {
     this.panCacheController.invalidate();
   }
 
+  getWorldBounds(target = new Box3()): Box3 {
+    target.makeEmpty();
+
+    const worldUnitsPerPoint = this.options.page.worldUnitsPerPoint;
+    if (!Number.isFinite(worldUnitsPerPoint) || worldUnitsPerPoint <= 0 || this.pages.length === 0) {
+      return target;
+    }
+
+    this.updateWorldMatrix(true, true);
+
+    for (const page of this.pages) {
+      const halfWidth = page.pageWidthPt * worldUnitsPerPoint * 0.5;
+      const halfHeight = page.pageHeightPt * worldUnitsPerPoint * 0.5;
+
+      for (const [x, y] of PAGE_LOCAL_CORNERS) {
+        BOUNDS_POINT.set(x * halfWidth, y * halfHeight, 0).applyMatrix4(page.matrixWorld);
+        target.expandByPoint(BOUNDS_POINT);
+      }
+    }
+
+    return target;
+  }
+
   dispose(): void {
     this.panCacheController.dispose();
     this.pageMaterialSet.dispose();
@@ -188,3 +211,12 @@ function normalizePageIndexList(pageIndices: readonly number[], pageCount: numbe
   }
   return out;
 }
+
+const PAGE_LOCAL_CORNERS = [
+  [-1, -1],
+  [1, -1],
+  [-1, 1],
+  [1, 1]
+] as const;
+
+const BOUNDS_POINT = new Vector3();
