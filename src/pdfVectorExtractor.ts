@@ -1,9 +1,14 @@
+import { maybeYieldInWorker, shouldReportProgressStep, type LoadProgressReporter } from "./core/loadProgress";
+
 const pdfJsModule = (
   typeof window === "undefined"
     ? await import("pdfjs-dist/legacy/build/pdf.mjs")
     : await import("pdfjs-dist")
 ) as {
   getDocument: typeof import("pdfjs-dist").getDocument;
+  GlobalWorkerOptions?: {
+    workerPort: Worker | null;
+  };
   OPS: typeof import("pdfjs-dist").OPS;
   VerbosityLevel?: {
     ERRORS: number;
@@ -11,7 +16,7 @@ const pdfJsModule = (
   setVerbosityLevel?: (level: number) => void;
 };
 
-const { getDocument, OPS, VerbosityLevel, setVerbosityLevel } = pdfJsModule;
+const { getDocument, GlobalWorkerOptions, OPS, VerbosityLevel, setVerbosityLevel } = pdfJsModule;
 const PDFJS_VERBOSITY_ERRORS = VerbosityLevel?.ERRORS ?? 0;
 setVerbosityLevel?.(PDFJS_VERBOSITY_ERRORS);
 
@@ -195,6 +200,54 @@ const STROKE_STYLE_FLAG_ROUND_CAP = 1 << 1;
 const STROKE_STYLE_FLAG_OFFSET = 2;
 const PAGE_GRID_GAP_FACTOR = 0.08;
 const PAGE_GRID_MIN_GAP = 24;
+const STROKE_PATH_WORK_MOVE = 0.1;
+const STROKE_PATH_WORK_CLOSE = 0.1;
+const STROKE_PATH_WORK_LINE = 1;
+const STROKE_PATH_WORK_QUAD = 3.5;
+const STROKE_PATH_WORK_CUBIC = 18;
+const FILL_PATH_WORK_MOVE = 0.1;
+const FILL_PATH_WORK_CLOSE = 0.1;
+const FILL_PATH_WORK_LINE = 0.8;
+const FILL_PATH_WORK_QUAD = 2.8;
+const FILL_PATH_WORK_CUBIC = 14;
+
+const IS_DEDICATED_WORKER_CONTEXT =
+  typeof WorkerGlobalScope !== "undefined" &&
+  typeof self !== "undefined" &&
+  self instanceof WorkerGlobalScope &&
+  typeof document === "undefined";
+
+let pdfJsNestedWorkerPort: Worker | null = null;
+
+function configurePdfJsWorkerPort(
+  globalWorkerOptions: {
+    workerPort: Worker | null;
+  } | undefined
+): void {
+  if (!IS_DEDICATED_WORKER_CONTEXT || !globalWorkerOptions || typeof Worker === "undefined") {
+    return;
+  }
+
+  // Avoid forcing PDF.js into fake-worker mode inside our own dedicated worker.
+  const pdfJsGlobal = globalThis as typeof globalThis & { pdfjsWorker?: unknown };
+  if (pdfJsGlobal.pdfjsWorker) {
+    pdfJsGlobal.pdfjsWorker = undefined;
+  }
+
+  if (globalWorkerOptions.workerPort) {
+    return;
+  }
+
+  if (!pdfJsNestedWorkerPort) {
+    pdfJsNestedWorkerPort = new Worker(new URL("./pdfjsNestedWorker.ts", import.meta.url), {
+      type: "module"
+    });
+  }
+
+  globalWorkerOptions.workerPort = pdfJsNestedWorkerPort;
+}
+
+configurePdfJsWorkerPort(GlobalWorkerOptions);
 
 function encodeStrokeStyleMeta(alpha: number, styleFlags: number): number {
   const normalizedAlpha = clamp01(alpha);
@@ -216,7 +269,11 @@ export async function extractFirstPageVectors(pdfData: ArrayBuffer, options: Vec
   });
 }
 
-export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: VectorExtractOptions = {}): Promise<VectorScene[]> {
+export async function extractPdfPageScenes(
+  pdfData: ArrayBuffer,
+  options: VectorExtractOptions = {},
+  progress?: LoadProgressReporter
+): Promise<VectorScene[]> {
   const enableSegmentMerge = options.enableSegmentMerge !== false;
   const enableInvisibleCull = options.enableInvisibleCull !== false;
   const maxPages = normalizePositiveInt(options.maxPages, Number.MAX_SAFE_INTEGER, 1, Number.MAX_SAFE_INTEGER);
@@ -237,12 +294,55 @@ export async function extractPdfPageScenes(pdfData: ArrayBuffer, options: Vector
     const pageScenes: VectorScene[] = [];
 
     for (let pageNumber = 1; pageNumber <= extractedPageCount; pageNumber += 1) {
+      const pageIndex = pageNumber - 1;
+      const pageProgress = progress?.child(pageIndex / extractedPageCount, pageNumber / extractedPageCount, {
+        sourceType: "pdf",
+        pageIndex,
+        pageCount: extractedPageCount
+      });
+      const initialPageBands = getPageProgressBands(undefined, resolveInitialOperatorListProgressEnd(extractedPageCount));
+      const getPageProgress = pageProgress?.child(0, initialPageBands.getPageEnd, {
+        stage: "pdf-page",
+        unit: "pages",
+        processed: pageNumber - 1,
+        total: extractedPageCount
+      });
+      getPageProgress?.report(0);
       const page = await pdf.getPage(pageNumber);
-      const operatorList = await page.getOperatorList();
+      getPageProgress?.complete({
+        stage: "pdf-page",
+        unit: "pages",
+        processed: pageNumber,
+        total: extractedPageCount
+      });
+      const operatorProgress = pageProgress?.child(initialPageBands.getPageEnd, initialPageBands.operatorListEnd, {
+        stage: "pdf-operators",
+        sourceType: "pdf",
+        unit: "operators",
+        pageIndex,
+        pageCount: extractedPageCount
+      });
+      const operatorList = operatorProgress
+        ? await operatorProgress.withIndeterminateProgress(
+          () => page.getOperatorList(),
+          {
+            stage: "pdf-operators",
+            sourceType: "pdf",
+            unit: "operators",
+            pageIndex,
+            pageCount: extractedPageCount,
+            ceiling: extractedPageCount <= 1 ? 0.98 : extractedPageCount <= 4 ? 0.95 : 0.9,
+            advance: extractedPageCount <= 1 ? 0.1 : 0.14,
+            timeConstantMs: extractedPageCount <= 1 ? 24_000 : extractedPageCount <= 4 ? 14_000 : 8_000,
+            curve: "linear"
+          }
+        )
+        : await page.getOperatorList();
+      const pageBands = getPageProgressBands(operatorList, initialPageBands.operatorListEnd);
       const pageScene = await extractSinglePageVectors(page, operatorList, {
         enableSegmentMerge,
         enableInvisibleCull
-      });
+      }, pageProgress, pageBands);
       pageScenes.push(pageScene);
     }
 
@@ -303,6 +403,16 @@ export async function extractPdfRasterScene(pdfData: ArrayBuffer, options: Vecto
 interface SinglePageExtractOptions {
   enableSegmentMerge: boolean;
   enableInvisibleCull: boolean;
+}
+
+interface PageProgressBands {
+  getPageEnd: number;
+  operatorListEnd: number;
+  vectorEnd: number;
+  finalizeEnd: number;
+  textEnd: number;
+  rasterEnd: number;
+  pageEndStart: number;
 }
 
 interface PagePlacement {
@@ -367,7 +477,9 @@ async function extractSinglePageRasterOnly(
 async function extractSinglePageVectors(
   page: unknown,
   operatorList: { fnArray: number[]; argsArray: unknown[] },
-  options: SinglePageExtractOptions
+  options: SinglePageExtractOptions,
+  progress?: LoadProgressReporter,
+  pageBands: PageProgressBands = getPageProgressBands(operatorList)
 ): Promise<VectorScene> {
   const pageView = (page as { view?: unknown }).view;
   const pageBoundsInput = Array.isArray(pageView) ? pageView : [0, 0, 1, 1];
@@ -416,9 +528,32 @@ async function extractSinglePageVectors(
   const formStateStack: GraphicsState[] = [];
   let currentState: GraphicsState = createDefaultState(pageMatrix);
 
+  const totalOperators = Math.max(1, operatorList.fnArray.length);
+  const totalVectorWeight = estimateVectorOperatorWork(operatorList);
+  let processedVectorWeight = 0;
+  const vectorProgress = progress?.child(pageBands.operatorListEnd, pageBands.vectorEnd, {
+    stage: "pdf-operators",
+    sourceType: "pdf",
+    unit: "operators",
+    processed: 0,
+    total: totalOperators
+  });
+
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
     const fn = operatorList.fnArray[i];
     const args = operatorList.argsArray[i];
+    if (vectorProgress && shouldReportProgressStep(i, 255)) {
+      vectorProgress.report(processedVectorWeight / totalVectorWeight, {
+        stage: "pdf-operators",
+        sourceType: "pdf",
+        unit: "operators",
+        processed: i,
+        total: totalOperators
+      });
+    }
+    if (shouldReportProgressStep(i, 31)) {
+      await maybeYieldInWorker(96);
+    }
 
     if (fn === OPS.save) {
       stateStack.push(cloneState(currentState));
@@ -525,6 +660,7 @@ async function extractSinglePageVectors(
     }
 
     if (fn !== OPS.constructPath) {
+      processedVectorWeight += estimateVectorOperatorWeight(fn);
       continue;
     }
 
@@ -532,15 +668,20 @@ async function extractSinglePageVectors(
     const strokePaint = isStrokePaintOp(paintOp);
     const fillPaint = isFillPaintOp(paintOp);
     if (!strokePaint && !fillPaint) {
+      processedVectorWeight += estimateVectorOperatorWeight(fn);
       continue;
     }
 
     const pathData = readPathData(args);
     if (!pathData) {
+      processedVectorWeight += estimateVectorOperatorWeight(fn);
       continue;
     }
 
     pathCount += 1;
+    const strokeWeight = strokePaint ? estimateConstructPathStrokeWeight(pathData) : 0;
+    const fillWeight = fillPaint ? estimateConstructPathFillWeight(pathData) : 0;
+    const baseWeight = estimateVectorOperatorWeight(fn);
 
     if (strokePaint) {
       const isHairlineStroke = currentState.lineWidth <= 0;
@@ -574,9 +715,23 @@ async function extractSinglePageVectors(
         primitiveMetaBuilder,
         styleBuilder,
         primitiveBoundsBuilder,
-        bounds
+        bounds,
+        strokeWeight,
+        vectorProgress && strokeWeight > 0
+          ? (localValue) => {
+            vectorProgress.report((processedVectorWeight + localValue * strokeWeight) / totalVectorWeight, {
+              stage: "pdf-operators",
+              sourceType: "pdf",
+              unit: "operators",
+              processed: i + 1,
+              total: totalOperators
+            });
+          }
+          : undefined
       );
     }
+
+    processedVectorWeight += baseWeight + strokeWeight;
 
     if (fillPaint) {
       const fillRule = isEvenOddFillPaintOp(paintOp) ? FILL_RULE_EVEN_ODD : FILL_RULE_NONZERO;
@@ -597,14 +752,36 @@ async function extractSinglePageVectors(
           fillPathMetaCBuilder,
           fillSegmentBuilderA,
           fillSegmentBuilderB,
-          fillBounds
+          fillBounds,
+          fillWeight,
+          vectorProgress && fillWeight > 0
+            ? (localValue) => {
+              vectorProgress.report((processedVectorWeight + localValue * fillWeight) / totalVectorWeight, {
+                stage: "pdf-operators",
+                sourceType: "pdf",
+                unit: "operators",
+                processed: i + 1,
+                total: totalOperators
+              });
+            }
+            : undefined
         );
         if (emitted) {
           fillPathCount += 1;
         }
       }
     }
+
+    processedVectorWeight += fillWeight;
   }
+
+  vectorProgress?.complete({
+    stage: "pdf-operators",
+    sourceType: "pdf",
+    unit: "operators",
+    processed: totalOperators,
+    total: totalOperators
+  });
 
   const mergedSegmentCount = endpointBuilder.quadCount;
   const mergedEndpoints = endpointBuilder.toTypedArray();
@@ -631,8 +808,19 @@ async function extractSinglePageVectors(
   let discardedDuplicateCount = 0;
   let discardedContainedCount = 0;
 
+  const finalizeProgress = progress?.child(pageBands.vectorEnd, pageBands.finalizeEnd, {
+    stage: "pdf-page",
+    sourceType: "pdf"
+  });
+  finalizeProgress?.report(0);
   if (mergedSegmentCount > 0 && options.enableInvisibleCull) {
-    const culled = cullInvisibleSegments(mergedEndpoints, mergedPrimitiveMeta, mergedStyles, mergedPrimitiveBounds);
+    const culled = await cullInvisibleSegments(
+      mergedEndpoints,
+      mergedPrimitiveMeta,
+      mergedStyles,
+      mergedPrimitiveBounds,
+      finalizeProgress
+    );
     segmentCount = culled.segmentCount;
     endpoints = culled.endpoints;
     primitiveMeta = culled.primitiveMeta;
@@ -653,24 +841,70 @@ async function extractSinglePageVectors(
     styles = new Float32Array(0);
     resolvedMaxHalfWidth = 0;
   }
+  finalizeProgress?.complete({
+    stage: "pdf-page",
+    sourceType: "pdf"
+  });
 
-  let textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
+  const textProgress = progress?.child(pageBands.finalizeEnd, pageBands.textEnd, {
+    stage: "pdf-text",
+    sourceType: "pdf",
+    unit: "operators",
+    total: totalOperators
+  });
+  let textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds, textProgress?.child(0, 0.75));
   if (textData.instanceCount === 0 && hasTextShowOperators(operatorList)) {
-    await warmUpTextPathCache(page);
-    textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds);
+    const warmupProgress = textProgress?.child(0.75, 0.85, {
+      stage: "pdf-text",
+      sourceType: "pdf"
+    });
+    if (warmupProgress) {
+      await warmupProgress.withIndeterminateProgress(
+        () => warmUpTextPathCache(page),
+        {
+          stage: "pdf-text",
+          sourceType: "pdf",
+          unit: "operators"
+        }
+      );
+    } else {
+      await warmUpTextPathCache(page);
+    }
+    textData = await extractTextVectorData(page, operatorList, pageMatrix, pageBounds, textProgress?.child(0.85, 1));
   }
 
   if (textData.instanceCount > 0 && textData.inPageCount < textData.instanceCount * 0.2) {
-    const fallbackTextData = await extractTextVectorData(page, operatorList, IDENTITY_MATRIX, pageBounds);
+    const fallbackTextData = await extractTextVectorData(page, operatorList, IDENTITY_MATRIX, pageBounds, textProgress?.child(0.85, 1));
     if (fallbackTextData.inPageCount > textData.inPageCount) {
       textData = fallbackTextData;
     }
   }
+  textProgress?.complete({
+    stage: "pdf-text",
+    sourceType: "pdf",
+    unit: "operators",
+    processed: totalOperators,
+    total: totalOperators
+  });
 
   const allowFullPageRasterFallback = segmentCount === 0 && fillPathCount === 0 && textData.instanceCount === 0;
-  const rasterLayer = await extractRasterLayerData(page, operatorList, pageMatrix, {
-    allowFullPageFallback: allowFullPageRasterFallback
+  const rasterProgress = progress?.child(pageBands.textEnd, pageBands.rasterEnd, {
+    stage: "pdf-raster",
+    sourceType: "pdf"
   });
+  const rasterLayer = rasterProgress
+    ? await rasterProgress.withIndeterminateProgress(
+      () => extractRasterLayerData(page, operatorList, pageMatrix, {
+        allowFullPageFallback: allowFullPageRasterFallback
+      }),
+      {
+        stage: "pdf-raster",
+        sourceType: "pdf"
+      }
+    )
+    : await extractRasterLayerData(page, operatorList, pageMatrix, {
+      allowFullPageFallback: allowFullPageRasterFallback
+    });
   const rasterLayers: RasterLayer[] =
     rasterLayer.width > 0 && rasterLayer.height > 0 && rasterLayer.data.length >= rasterLayer.width * rasterLayer.height * 4
       ? [
@@ -685,6 +919,10 @@ async function extractSinglePageVectors(
   const combinedBounds =
     combineBounds(combineBounds(combineBounds(segmentBounds, resolvedFillBounds), textData.bounds), rasterLayer.bounds) ??
     { ...pageBounds };
+  progress?.child(pageBands.pageEndStart, 1, {
+    stage: "pdf-page",
+    sourceType: "pdf"
+  }).complete();
 
   return {
     pageCount: 1,
@@ -1691,7 +1929,9 @@ function emitSegmentsFromPath(
   primitiveMeta: Float4Builder,
   styles: Float4Builder,
   primitiveBounds: Float4Builder,
-  bounds: Bounds
+  bounds: Bounds,
+  progressTotalWork: number,
+  progress?: (localValue: number) => void
 ): number {
   let sourceSegmentCount = 0;
   let cursorX = 0;
@@ -1837,8 +2077,17 @@ function emitSegmentsFromPath(
     emitPrimitive(x0, y0, cx, cy, x1, y1, STROKE_PRIMITIVE_QUADRATIC);
   };
 
+  let processedProgressWork = 0;
+  const reportPathProgress = (workValue: number): void => {
+    if (!progress || progressTotalWork <= 0) {
+      return;
+    }
+    progress(Math.min(1, Math.max(0, workValue / progressTotalWork)));
+  };
+
   for (let i = 0; i < pathData.length; ) {
     const op = pathData[i++];
+    const opWork = getStrokePathOperationWork(op);
 
     if (op === DRAW_MOVE_TO) {
       flushPending();
@@ -1847,6 +2096,8 @@ function emitSegmentsFromPath(
       startX = cursorX;
       startY = cursorY;
       hasStart = true;
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
@@ -1858,6 +2109,8 @@ function emitSegmentsFromPath(
       emitLine(tx0, ty0, tx1, ty1, true);
       cursorX = x;
       cursorY = y;
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
@@ -1885,11 +2138,16 @@ function emitSegmentsFromPath(
         t3y,
         emitQuadratic,
         FILL_CUBIC_TO_QUAD_ERROR,
-        MAX_FILL_CUBIC_TO_QUAD_DEPTH
+        MAX_FILL_CUBIC_TO_QUAD_DEPTH,
+        (localValue) => {
+          reportPathProgress(processedProgressWork + opWork * localValue);
+        }
       );
 
       cursorX = x3;
       cursorY = y3;
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
@@ -1907,6 +2165,8 @@ function emitSegmentsFromPath(
 
       cursorX = x;
       cursorY = y;
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
@@ -1919,6 +2179,8 @@ function emitSegmentsFromPath(
       cursorX = startX;
       cursorY = startY;
       flushPending();
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
@@ -1927,6 +2189,7 @@ function emitSegmentsFromPath(
   }
 
   flushPending();
+  reportPathProgress(progressTotalWork);
   return sourceSegmentCount;
 }
 
@@ -1944,7 +2207,9 @@ function emitFilledPathFromPath(
   metaC: Float4Builder,
   segmentsA: Float4Builder,
   segmentsB: Float4Builder,
-  bounds: Bounds
+  bounds: Bounds,
+  progressTotalWork: number,
+  progress?: (localValue: number) => void
 ): boolean {
   let cursorX = 0;
   let cursorY = 0;
@@ -2011,8 +2276,17 @@ function emitFilledPathFromPath(
     cursorY = startY;
   };
 
+  let processedProgressWork = 0;
+  const reportPathProgress = (workValue: number): void => {
+    if (!progress || progressTotalWork <= 0) {
+      return;
+    }
+    progress(Math.min(1, Math.max(0, workValue / progressTotalWork)));
+  };
+
   for (let i = 0; i < pathData.length; ) {
     const op = pathData[i++];
+    const opWork = getFillPathOperationWork(op);
 
     if (op === DRAW_MOVE_TO) {
       closeSubpath();
@@ -2021,6 +2295,8 @@ function emitFilledPathFromPath(
       startX = cursorX;
       startY = cursorY;
       hasStart = true;
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
@@ -2032,6 +2308,8 @@ function emitFilledPathFromPath(
       emitLine(tx0, ty0, tx1, ty1);
       cursorX = x;
       cursorY = y;
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
@@ -2059,11 +2337,16 @@ function emitFilledPathFromPath(
         t3y,
         emitQuadratic,
         FILL_CUBIC_TO_QUAD_ERROR,
-        MAX_FILL_CUBIC_TO_QUAD_DEPTH
+        MAX_FILL_CUBIC_TO_QUAD_DEPTH,
+        (localValue) => {
+          reportPathProgress(processedProgressWork + opWork * localValue);
+        }
       );
 
       cursorX = x3;
       cursorY = y3;
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
@@ -2081,11 +2364,15 @@ function emitFilledPathFromPath(
 
       cursorX = x;
       cursorY = y;
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
     if (op === DRAW_CLOSE) {
       closeSubpath();
+      processedProgressWork += opWork;
+      reportPathProgress(processedProgressWork);
       continue;
     }
 
@@ -2094,6 +2381,7 @@ function emitFilledPathFromPath(
   }
 
   closeSubpath();
+  reportPathProgress(progressTotalWork);
 
   if (primitiveCount === 0) {
     return false;
@@ -2134,12 +2422,13 @@ interface InvisibleCullResult {
   discardedContainedCount: number;
 }
 
-function cullInvisibleSegments(
+async function cullInvisibleSegments(
   endpoints: Float32Array,
   primitiveMeta: Float32Array,
   styles: Float32Array,
-  primitiveBounds: Float32Array
-): InvisibleCullResult {
+  primitiveBounds: Float32Array,
+  progress?: LoadProgressReporter
+): Promise<InvisibleCullResult> {
   const segmentCount = endpoints.length >> 2;
   const keepMask = new Uint8Array(segmentCount);
   const seenDuplicates = new Set<string>();
@@ -2149,6 +2438,13 @@ function cullInvisibleSegments(
   let discardedDegenerateCount = 0;
   let discardedDuplicateCount = 0;
   let discardedContainedCount = 0;
+
+  const reportCullProgress = (value: number): void => {
+    progress?.report(value, {
+      stage: "pdf-page",
+      sourceType: "pdf"
+    });
+  };
 
   for (let i = 0; i < segmentCount; i += 1) {
     const offset = i * 4;
@@ -2224,9 +2520,18 @@ function cullInvisibleSegments(
         styleFlags: coverage.styleFlags
       });
     }
+
+    if (progress && shouldReportProgressStep(i, 1023)) {
+      reportCullProgress((i / Math.max(1, segmentCount)) * 0.52);
+    }
+    if (shouldReportProgressStep(i, 255)) {
+      await maybeYieldInWorker(96);
+    }
   }
 
-  for (const candidates of coverageGroups.values()) {
+  const coverageBuckets = Array.from(coverageGroups.values());
+  for (let bucketIndex = 0; bucketIndex < coverageBuckets.length; bucketIndex += 1) {
+    const candidates = coverageBuckets[bucketIndex];
     candidates.sort((a, b) => {
       if (Math.abs(a.halfWidth - b.halfWidth) > COVER_HALF_WIDTH_EPSILON) {
         return b.halfWidth - a.halfWidth;
@@ -2271,12 +2576,26 @@ function cullInvisibleSegments(
         opaqueCovers.push(candidate);
       }
     }
+
+    if (progress && shouldReportProgressStep(bucketIndex, 63)) {
+      reportCullProgress(0.52 + (bucketIndex / Math.max(1, coverageBuckets.length)) * 0.2);
+    }
+    if (shouldReportProgressStep(bucketIndex, 15)) {
+      await maybeYieldInWorker(96);
+    }
   }
 
   let visibleCount = 0;
   for (let i = 0; i < segmentCount; i += 1) {
     if (keepMask[i] === 1) {
       visibleCount += 1;
+    }
+
+    if (progress && shouldReportProgressStep(i, 2047)) {
+      reportCullProgress(0.72 + (i / Math.max(1, segmentCount)) * 0.08);
+    }
+    if (shouldReportProgressStep(i, 511)) {
+      await maybeYieldInWorker(96);
     }
   }
 
@@ -2357,7 +2676,16 @@ function cullInvisibleSegments(
 
     maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
     out += 1;
+
+    if (progress && shouldReportProgressStep(i, 1023)) {
+      reportCullProgress(0.8 + (i / Math.max(1, segmentCount)) * 0.2);
+    }
+    if (shouldReportProgressStep(i, 255)) {
+      await maybeYieldInWorker(96);
+    }
   }
+
+  reportCullProgress(1);
 
   return {
     segmentCount: visibleCount,
@@ -2487,7 +2815,8 @@ async function extractTextVectorData(
   page: unknown,
   operatorList: { fnArray: number[]; argsArray: unknown[] },
   pageMatrix: Mat2D,
-  pageBounds?: Bounds
+  pageBounds?: Bounds,
+  progress?: LoadProgressReporter
 ): Promise<TextExtractResult> {
   const commonObjs = resolveCommonObjs(page);
   if (!commonObjs) {
@@ -2633,9 +2962,22 @@ async function extractTextVectorData(
     }
   };
 
+  const totalOperators = Math.max(1, operatorList.fnArray.length);
   for (let i = 0; i < operatorList.fnArray.length; i += 1) {
     const fn = operatorList.fnArray[i];
     const args = operatorList.argsArray[i];
+    if (progress && shouldReportProgressStep(i, 63)) {
+      progress.report(i / totalOperators, {
+        stage: "pdf-text",
+        sourceType: "pdf",
+        unit: "operators",
+        processed: i,
+        total: totalOperators
+      });
+    }
+    if (shouldReportProgressStep(i, 31)) {
+      await maybeYieldInWorker(96);
+    }
 
     if (fn === OPS.save) {
       stateStack.push(cloneTextState(state));
@@ -2835,6 +3177,14 @@ async function extractTextVectorData(
       continue;
     }
   }
+
+  progress?.complete({
+    stage: "pdf-text",
+    sourceType: "pdf",
+    unit: "operators",
+    processed: totalOperators,
+    total: totalOperators
+  });
 
   return {
     sourceTextCount,
@@ -3036,6 +3386,186 @@ function countImagePaintOps(operatorList: { fnArray: number[] }): number {
     }
   }
   return count;
+}
+
+function getPageProgressBands(
+  operatorList?: { fnArray: number[]; argsArray: unknown[] },
+  operatorListEnd = 0.18
+): PageProgressBands {
+  const getPageEnd = Math.min(0.03, operatorListEnd * 0.12);
+  if (!operatorList) {
+    return {
+      getPageEnd,
+      operatorListEnd,
+      vectorEnd: lerpProgress(operatorListEnd, 1, 0.6),
+      finalizeEnd: lerpProgress(operatorListEnd, 1, 0.86),
+      textEnd: lerpProgress(operatorListEnd, 1, 0.95),
+      rasterEnd: lerpProgress(operatorListEnd, 1, 0.985),
+      pageEndStart: lerpProgress(operatorListEnd, 1, 0.985)
+    };
+  }
+
+  const hasText = hasTextShowOperators(operatorList);
+  const hasRaster = countImagePaintOps(operatorList) > 0;
+
+  if (hasText && hasRaster) {
+    return {
+      getPageEnd,
+      operatorListEnd,
+      vectorEnd: lerpProgress(operatorListEnd, 1, 0.56),
+      finalizeEnd: lerpProgress(operatorListEnd, 1, 0.8),
+      textEnd: lerpProgress(operatorListEnd, 1, 0.92),
+      rasterEnd: lerpProgress(operatorListEnd, 1, 0.985),
+      pageEndStart: lerpProgress(operatorListEnd, 1, 0.985)
+    };
+  }
+
+  if (hasText) {
+    return {
+      getPageEnd,
+      operatorListEnd,
+      vectorEnd: lerpProgress(operatorListEnd, 1, 0.6),
+      finalizeEnd: lerpProgress(operatorListEnd, 1, 0.9),
+      textEnd: lerpProgress(operatorListEnd, 1, 0.98),
+      rasterEnd: lerpProgress(operatorListEnd, 1, 0.98),
+      pageEndStart: lerpProgress(operatorListEnd, 1, 0.98)
+    };
+  }
+
+  if (hasRaster) {
+    return {
+      getPageEnd,
+      operatorListEnd,
+      vectorEnd: lerpProgress(operatorListEnd, 1, 0.62),
+      finalizeEnd: lerpProgress(operatorListEnd, 1, 0.82),
+      textEnd: lerpProgress(operatorListEnd, 1, 0.82),
+      rasterEnd: lerpProgress(operatorListEnd, 1, 0.98),
+      pageEndStart: lerpProgress(operatorListEnd, 1, 0.98)
+    };
+  }
+
+  return {
+    getPageEnd,
+    operatorListEnd,
+    vectorEnd: lerpProgress(operatorListEnd, 1, 0.68),
+    finalizeEnd: lerpProgress(operatorListEnd, 1, 0.98),
+    textEnd: lerpProgress(operatorListEnd, 1, 0.98),
+    rasterEnd: lerpProgress(operatorListEnd, 1, 0.98),
+    pageEndStart: lerpProgress(operatorListEnd, 1, 0.98)
+  };
+}
+
+function resolveInitialOperatorListProgressEnd(pageCount: number): number {
+  if (pageCount <= 1) {
+    return 0.42;
+  }
+  if (pageCount <= 2) {
+    return 0.3;
+  }
+  if (pageCount <= 4) {
+    return 0.24;
+  }
+  return 0.18;
+}
+
+function lerpProgress(start: number, end: number, t: number): number {
+  return start + (end - start) * t;
+}
+
+function estimateVectorOperatorWork(operatorList: { fnArray: number[]; argsArray: unknown[] }): number {
+  let total = 0;
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const fn = operatorList.fnArray[i];
+    total += estimateVectorOperatorWeight(fn);
+    if (fn !== OPS.constructPath) {
+      continue;
+    }
+
+    const args = operatorList.argsArray[i];
+    const paintOp = readNumber(args, 0, -1);
+    if (!isStrokePaintOp(paintOp) && !isFillPaintOp(paintOp)) {
+      continue;
+    }
+    const pathData = readPathData(args);
+    if (!pathData) {
+      continue;
+    }
+    if (isStrokePaintOp(paintOp)) {
+      total += estimateConstructPathStrokeWeight(pathData);
+    }
+    if (isFillPaintOp(paintOp)) {
+      total += estimateConstructPathFillWeight(pathData);
+    }
+  }
+  return Math.max(1, total);
+}
+
+function estimateVectorOperatorWeight(fn: number): number {
+  return fn === OPS.constructPath ? 1 : 0;
+}
+
+function estimateConstructPathStrokeWeight(pathData: Float32Array): number {
+  return Math.max(1, estimatePathOperationWork(pathData, "stroke"));
+}
+
+function estimateConstructPathFillWeight(pathData: Float32Array): number {
+  return Math.max(0.75, estimatePathOperationWork(pathData, "fill"));
+}
+
+function estimatePathOperationWork(pathData: Float32Array, mode: "stroke" | "fill"): number {
+  let total = 0;
+  for (let i = 0; i < pathData.length; ) {
+    const op = pathData[i++];
+    total += mode === "stroke" ? getStrokePathOperationWork(op) : getFillPathOperationWork(op);
+
+    if (op === DRAW_MOVE_TO || op === DRAW_LINE_TO) {
+      i += 2;
+      continue;
+    }
+    if (op === DRAW_QUAD_TO) {
+      i += 4;
+      continue;
+    }
+    if (op === DRAW_CURVE_TO) {
+      i += 6;
+      continue;
+    }
+  }
+  return total;
+}
+
+function getStrokePathOperationWork(op: number): number {
+  switch (op) {
+    case DRAW_MOVE_TO:
+      return STROKE_PATH_WORK_MOVE;
+    case DRAW_LINE_TO:
+      return STROKE_PATH_WORK_LINE;
+    case DRAW_QUAD_TO:
+      return STROKE_PATH_WORK_QUAD;
+    case DRAW_CURVE_TO:
+      return STROKE_PATH_WORK_CUBIC;
+    case DRAW_CLOSE:
+      return STROKE_PATH_WORK_CLOSE;
+    default:
+      return 0;
+  }
+}
+
+function getFillPathOperationWork(op: number): number {
+  switch (op) {
+    case DRAW_MOVE_TO:
+      return FILL_PATH_WORK_MOVE;
+    case DRAW_LINE_TO:
+      return FILL_PATH_WORK_LINE;
+    case DRAW_QUAD_TO:
+      return FILL_PATH_WORK_QUAD;
+    case DRAW_CURVE_TO:
+      return FILL_PATH_WORK_CUBIC;
+    case DRAW_CLOSE:
+      return FILL_PATH_WORK_CLOSE;
+    default:
+      return 0;
+  }
 }
 
 async function warmUpTextPathCache(page: unknown): Promise<void> {
@@ -3949,12 +4479,21 @@ function emitCubicAsQuadratics(
   y3: number,
   emitQuadratic: (sx: number, sy: number, cx: number, cy: number, ex: number, ey: number) => void,
   maxError: number,
-  maxDepth: number
+  maxDepth: number,
+  progress?: (localValue: number) => void
 ): void {
   const stack: number[] = [x0, y0, x1, y1, x2, y2, x3, y3, 0];
   const maxErrorSq = maxError * maxError;
+  let workSteps = 0;
+  let syntheticProgress = 0;
 
   while (stack.length > 0) {
+    workSteps += 1;
+    if (progress && shouldReportProgressStep(workSteps, 255)) {
+      syntheticProgress = Math.min(0.98, syntheticProgress + Math.max(0.01, (1 - syntheticProgress) * 0.14));
+      progress(syntheticProgress);
+    }
+
     const depth = stack.pop() as number;
     const q3y = stack.pop() as number;
     const q3x = stack.pop() as number;
@@ -3991,6 +4530,8 @@ function emitCubicAsQuadratics(
     stack.push(x0123, y0123, x123, y123, x23, y23, q3x, q3y, nextDepth);
     stack.push(q0x, q0y, x01, y01, x012, y012, x0123, y0123, nextDepth);
   }
+
+  progress?.(1);
 }
 
 function approximateCubicAsQuadraticControl(

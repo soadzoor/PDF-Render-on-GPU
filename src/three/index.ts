@@ -4,6 +4,7 @@ export { PDFPageMesh } from "./PDFPageMesh";
 export { PDFPageInstancedMesh } from "./PDFPageInstancedMesh";
 export type {
   PDFDocumentMetrics,
+  PDFLoadProgress,
   PDFLoadTimingMetrics,
   PDFSource,
   PDFTextureMetrics,

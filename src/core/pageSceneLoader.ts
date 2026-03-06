@@ -1,4 +1,5 @@
 import { extractPdfPageScenes, type VectorExtractOptions, type VectorScene } from "../pdfVectorExtractor";
+import type { LoadProgressReporter } from "./loadProgress";
 
 export interface PageSceneLoadOptions {
   maxPages?: number;
@@ -6,6 +7,7 @@ export interface PageSceneLoadOptions {
     enableSegmentMerge?: boolean;
     enableInvisibleCull?: boolean;
   };
+  progress?: LoadProgressReporter;
 }
 
 export async function loadPdfPageScenes(
@@ -21,5 +23,5 @@ export async function loadPdfPageScenes(
   const buffer = new ArrayBuffer(sourceBytes.byteLength);
   new Uint8Array(buffer).set(sourceBytes);
 
-  return extractPdfPageScenes(buffer, extractionOptions);
+  return extractPdfPageScenes(buffer, extractionOptions, options.progress);
 }

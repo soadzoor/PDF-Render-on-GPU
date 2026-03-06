@@ -110,6 +110,43 @@
         color: #293446;
       }
 
+      #parse-loader {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: fit-content;
+        max-width: 100%;
+        margin-top: 6px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(12, 19, 32, 0.16);
+        background: rgba(255, 255, 255, 0.82);
+        color: #0f172a;
+        font-size: 12px;
+      }
+
+      #parse-loader[hidden] {
+        display: none !important;
+      }
+
+      .loader-spinner {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 2px solid rgba(15, 23, 42, 0.2);
+        border-top-color: #0f172a;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        from {
+          transform: rotate(0deg);
+        }
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
       #runtime,
       #help {
         margin-top: 6px;
@@ -132,6 +169,35 @@
         border-radius: 8px;
         padding: 8px 10px;
         background: rgba(255, 255, 255, 0.72);
+      }
+
+      #load-debug {
+        margin-top: 8px;
+        border: 1px solid rgba(15, 23, 42, 0.12);
+        border-radius: 8px;
+        padding: 8px 10px;
+        background: rgba(248, 250, 252, 0.92);
+      }
+
+      #load-debug[hidden] {
+        display: none !important;
+      }
+
+      #load-debug summary {
+        cursor: pointer;
+        color: #475569;
+        font-size: 12px;
+      }
+
+      #load-debug-log {
+        margin: 8px 0 0;
+        max-height: 180px;
+        overflow: auto;
+        white-space: pre-wrap;
+        color: #0f172a;
+        font-size: 11px;
+        line-height: 1.4;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
       }
 
       .metric-row {
@@ -227,6 +293,10 @@
           </div>
         </div>
         <div id="status">Waiting for PDF or parsed ZIP...</div>
+        <div id="parse-loader" hidden>
+          <span class="loader-spinner" aria-hidden="true"></span>
+          <span id="parse-loader-text"></span>
+        </div>
         <div id="runtime"></div>
         <div id="metrics">
           <div class="metric-row"><span class="metric-label">File</span><span id="metric-file" class="metric-value">-</span></div>
@@ -241,6 +311,10 @@
           <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
           <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
         </div>
+        <details id="load-debug" hidden>
+          <summary>Load Debug</summary>
+          <pre id="load-debug-log"></pre>
+        </details>
         <div id="help">Drag to pan, mouse wheel or pinch to zoom, or drag-and-drop a PDF or parsed ZIP.</div>
       </div>
       <div id="drop-indicator" class="active">Drop PDF or parsed ZIP to render</div>
@@ -250,12 +324,19 @@
       import * as THREE from "three";
       import { MapControls } from "three/examples/jsm/controls/MapControls.js";
       import { LoadPDFObject } from "hepr/three";
+      import { createHudFlushController } from "./src/demo/hudFlushController.ts";
+      import {
+        createLoadProgressDebugTracker,
+        formatLoadProgressStage
+      } from "./src/demo/loadProgressDebug.ts";
 
       const canvas = document.querySelector("#viewport");
       const openButton = document.querySelector("#open-file");
       const fileInput = document.querySelector("#file-input");
       const exampleSelect = document.querySelector("#example-select");
       const statusElement = document.querySelector("#status");
+      const parseLoaderElement = document.querySelector("#parse-loader");
+      const parseLoaderTextElement = document.querySelector("#parse-loader-text");
       const runtimeElement = document.querySelector("#runtime");
       const metricsElement = document.querySelector("#metrics");
       const metricFileElement = document.querySelector("#metric-file");
@@ -269,6 +350,8 @@
       const metricFpsElement = document.querySelector("#metric-fps");
       const metricTextureElement = document.querySelector("#metric-texture");
       const metricGridMaxCellElement = document.querySelector("#metric-grid-max-cell");
+      const loadDebugElement = document.querySelector("#load-debug");
+      const loadDebugLogElement = document.querySelector("#load-debug-log");
       const dropIndicator = document.querySelector("#drop-indicator");
       const strokeCurveToggle = document.querySelector("#toggle-stroke-curves");
       const vectorOnlyToggle = document.querySelector("#toggle-vector-text-only");
@@ -285,6 +368,8 @@
         !fileInput ||
         !exampleSelect ||
         !statusElement ||
+        !parseLoaderElement ||
+        !parseLoaderTextElement ||
         !runtimeElement ||
         !metricsElement ||
         !metricFileElement ||
@@ -298,6 +383,8 @@
         !metricFpsElement ||
         !metricTextureElement ||
         !metricGridMaxCellElement ||
+        !loadDebugElement ||
+        !loadDebugLogElement ||
         !dropIndicator ||
         !strokeCurveToggle ||
         !vectorOnlyToggle ||
@@ -338,14 +425,82 @@
 
       let pdfObject = null;
       let isDragActive = false;
+      let isDocumentLoading = false;
       const exampleSelectionMap = new Map();
       let fpsLastSampleTime = 0;
       let fpsSmoothed = 0;
+      let activeLoadToken = 0;
+      const LOAD_PROGRESS_DEBUG = new URLSearchParams(window.location.search).get("loadDebug") === "1";
+
+      const hudController = createHudFlushController(
+        {
+          statusElement,
+          loaderElement: parseLoaderElement,
+          loaderTextElement: parseLoaderTextElement,
+          runtimeElement,
+          fpsElement: metricFpsElement,
+          debugElement: loadDebugElement,
+          debugLogElement: loadDebugLogElement
+        },
+        {
+          runtimeThrottleMs: 250,
+          fpsThrottleMs: 250,
+          debugEnabled: LOAD_PROGRESS_DEBUG,
+          debugMaxLines: 200
+        }
+      );
+
+      const loadProgressDebug = createLoadProgressDebugTracker({
+        enabled: LOAD_PROGRESS_DEBUG,
+        tag: "hepr/three",
+        emitLine(line) {
+          console.log(line);
+          hudController.appendDebugLine(line);
+        },
+        minDelta: 0.03,
+        minIntervalMs: 2000
+      });
 
       const WORLD_UNITS_PER_POINT = 0.01;
 
       function setStatus(message) {
-        statusElement.textContent = message;
+        hudController.setStatus(message);
+      }
+
+      function beginLoaderProgress(token) {
+        activeLoadToken = token;
+        isDocumentLoading = true;
+        controls.enabled = false;
+        hudController.setLoader(true, "Parsing / loading 0.00%");
+      }
+
+      function beginLoadProgressDebug(token, label) {
+        hudController.clearDebug();
+        loadProgressDebug.begin(token, label);
+      }
+
+      function updateLoaderProgress(token, progress) {
+        if (token !== activeLoadToken) {
+          return;
+        }
+        loadProgressDebug.update(token, progress);
+        const stageLabel = formatLoadProgressStage(progress.stage);
+        const executionPathLabel = progress.executionPath ? ` [${progress.executionPath}]` : "";
+        const clampedValue = Math.max(0, Math.min(1, Number(progress.value) || 0));
+        hudController.setLoader(true, `${stageLabel}${executionPathLabel} ${(clampedValue * 100).toFixed(2)}%`);
+      }
+
+      function finishLoaderProgress(token, successful = true) {
+        if (token !== activeLoadToken) {
+          return;
+        }
+        isDocumentLoading = false;
+        controls.enabled = true;
+        hudController.setLoader(false, "");
+      }
+
+      function finishLoadProgressDebug(token, successful, error) {
+        loadProgressDebug.finish(token, successful, error);
       }
 
       function formatPercent(value) {
@@ -361,10 +516,10 @@
         metricReductionsElement.textContent = "-";
         metricCullDiscardsElement.textContent = "-";
         metricTimesElement.textContent = "-";
-        metricFpsElement.textContent = "-";
         metricTextureElement.textContent = "-";
         metricGridMaxCellElement.textContent = "-";
         metricsElement.dataset.ready = "false";
+        hudController.setFps("-");
       }
 
       function updateMetricsPanel(label, loadMs) {
@@ -436,7 +591,7 @@
           if (deltaMs > 0) {
             const fpsNow = 1000 / deltaMs;
             fpsSmoothed = fpsSmoothed === 0 ? fpsNow : fpsSmoothed * 0.85 + fpsNow * 0.15;
-            metricFpsElement.textContent = `${fpsSmoothed.toFixed(0)} FPS`;
+            hudController.setFps(`${fpsSmoothed.toFixed(0)} FPS`);
           }
         }
         fpsLastSampleTime = now;
@@ -444,12 +599,13 @@
 
       function updateRuntimeText() {
         if (!pdfObject) {
-          runtimeElement.textContent = "";
+          hudController.setRuntime("");
           return;
         }
         const renderInfo = renderer.info.render;
-        runtimeElement.textContent =
-          `Draw calls ${renderInfo.calls.toLocaleString()} | triangles ${renderInfo.triangles.toLocaleString()} | lines ${renderInfo.lines.toLocaleString()} | points ${renderInfo.points.toLocaleString()}`;
+        hudController.setRuntime(
+          `Draw calls ${renderInfo.calls.toLocaleString()} | triangles ${renderInfo.triangles.toLocaleString()} | lines ${renderInfo.lines.toLocaleString()} | points ${renderInfo.points.toLocaleString()}`
+        );
       }
 
       function readMaterialOptions() {
@@ -489,7 +645,8 @@
         rootGroup.remove(pdfObject);
         pdfObject.dispose();
         pdfObject = null;
-        runtimeElement.textContent = "";
+        hudController.setRuntime("");
+        hudController.setFps("-");
       }
 
       function layoutPages(pageMeshes) {
@@ -579,6 +736,9 @@
       }
 
       async function loadSource(source, label) {
+        const loadToken = activeLoadToken + 1;
+        beginLoaderProgress(loadToken);
+        beginLoadProgressDebug(loadToken, label);
         setStatus(`Loading ${label}...`);
         setMetricPlaceholder(label);
 
@@ -589,6 +749,9 @@
           const loadStart = performance.now();
           const next = await LoadPDFObject(source, {
             worker: "auto",
+            onProgress: (progress) => {
+              updateLoaderProgress(loadToken, progress);
+            },
             page: {
               worldUnitsPerPoint: WORLD_UNITS_PER_POINT,
               depthWrite: false,
@@ -604,12 +767,16 @@
           refreshDropIndicator();
           const loadMs = performance.now() - loadStart;
           updateMetricsPanel(label, loadMs);
+          finishLoaderProgress(loadToken, true);
+          finishLoadProgressDebug(loadToken, true);
 
           setStatus(
             `${label} loaded | pages ${pdfObject.pageCount.toLocaleString()} | drag to pan, wheel to zoom`
           );
         } catch (error) {
+          finishLoaderProgress(loadToken, false);
           const message = error instanceof Error ? error.message : String(error);
+          finishLoadProgressDebug(loadToken, false, message);
           setMetricPlaceholder(label);
           if (message.includes("v3 is unsupported")) {
             setStatus(`Failed to load ${label}: ${message}`);
@@ -625,8 +792,7 @@
           return;
         }
 
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        await loadSource(bytes, file.name);
+        await loadSource(file, file.name);
       }
 
       function resolveAppAssetUrl(inputPath) {
@@ -733,17 +899,10 @@
         try {
           const sourceLabel = selection.kind === "pdf" ? "PDF" : "parsed ZIP";
           setStatus(`Loading example ${selection.name} (${sourceLabel})...`);
-
-          const response = await fetch(selection.path, { cache: "no-store" });
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-
-          const bytes = new Uint8Array(await response.arrayBuffer());
           const label = selection.kind === "pdf"
             ? selection.name
             : `${selection.name} (parsed zip)`;
-          await loadSource(bytes, label);
+          await loadSource(selection.path, label);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           setStatus(`Failed to load example: ${message}`);
@@ -765,11 +924,14 @@
       }
 
       function animate() {
+        requestAnimationFrame(animate);
+        if (isDocumentLoading) {
+          return;
+        }
         controls.update();
         renderer.render(scene, camera);
         updateFpsMetric();
         updateRuntimeText();
-        requestAnimationFrame(animate);
       }
 
       openButton.addEventListener("click", () => fileInput.click());

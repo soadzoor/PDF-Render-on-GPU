@@ -1,24 +1,35 @@
+import type { LoadProgressReporter } from "./loadProgress";
+
 export type PDFSource = string | File | Blob | ArrayBuffer | Uint8Array;
 
 export type SourceContainerType = "pdf" | "zip" | "unknown";
 
 const BASE64_PATTERN = /^[A-Za-z0-9+/=\s]+$/;
 
-export async function normalizePdfSourceToBytes(source: PDFSource): Promise<Uint8Array> {
+export async function normalizePdfSourceToBytes(
+  source: PDFSource,
+  progress?: LoadProgressReporter
+): Promise<Uint8Array> {
   if (source instanceof Uint8Array) {
-    return source.slice();
+    progress?.report(0, { stage: "source", unit: "bytes", processed: 0, total: source.byteLength });
+    const bytes = source.slice();
+    progress?.complete({ stage: "source", unit: "bytes", processed: bytes.byteLength, total: bytes.byteLength });
+    return bytes;
   }
 
   if (source instanceof ArrayBuffer) {
-    return new Uint8Array(source.slice(0));
+    progress?.report(0, { stage: "source", unit: "bytes", processed: 0, total: source.byteLength });
+    const bytes = new Uint8Array(source.slice(0));
+    progress?.complete({ stage: "source", unit: "bytes", processed: bytes.byteLength, total: bytes.byteLength });
+    return bytes;
   }
 
   if (isBlobLike(source)) {
-    return new Uint8Array(await source.arrayBuffer());
+    return readBlobBytes(source, progress);
   }
 
   if (typeof source === "string") {
-    return normalizeStringSourceToBytes(source);
+    return normalizeStringSourceToBytes(source, progress);
   }
 
   throw new Error("Unsupported PDF/ZIP source type.");
@@ -36,22 +47,22 @@ export function detectSourceContainerType(bytes: Uint8Array): SourceContainerTyp
   return "unknown";
 }
 
-async function normalizeStringSourceToBytes(value: string): Promise<Uint8Array> {
+async function normalizeStringSourceToBytes(value: string, progress?: LoadProgressReporter): Promise<Uint8Array> {
   const trimmed = value.trim();
   if (trimmed.length === 0) {
     throw new Error("Empty PDF/ZIP source string.");
   }
 
   if (isDataUri(trimmed)) {
-    return decodeDataUri(trimmed);
+    return decodeDataUri(trimmed, progress);
   }
 
   if (looksLikeUrlOrPath(trimmed)) {
-    return fetchBytes(trimmed);
+    return fetchBytes(trimmed, progress);
   }
 
   if (looksLikeBase64(trimmed)) {
-    return decodeBase64(trimmed);
+    return decodeBase64(trimmed, progress);
   }
 
   throw new Error("String source is neither a URL/path nor Base64/data URI.");
@@ -84,15 +95,24 @@ function looksLikeBase64(value: string): boolean {
   return value.length % 4 === 0;
 }
 
-async function fetchBytes(url: string): Promise<Uint8Array> {
+async function fetchBytes(url: string, progress?: LoadProgressReporter): Promise<Uint8Array> {
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch source (${response.status} ${response.statusText}).`);
   }
-  return new Uint8Array(await response.arrayBuffer());
+
+  if (!progress || !response.body) {
+    progress?.report(0, { stage: "source", unit: "bytes" });
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    progress?.complete({ stage: "source", unit: "bytes", processed: bytes.byteLength, total: bytes.byteLength });
+    return bytes;
+  }
+
+  const total = parseContentLength(response.headers.get("content-length"));
+  return readStreamToBytes(response.body.getReader(), total, progress);
 }
 
-function decodeDataUri(value: string): Uint8Array {
+function decodeDataUri(value: string, progress?: LoadProgressReporter): Uint8Array {
   const commaIndex = value.indexOf(",");
   if (commaIndex < 0) {
     throw new Error("Invalid data URI.");
@@ -103,11 +123,12 @@ function decodeDataUri(value: string): Uint8Array {
     throw new Error("Only base64 data URIs are supported.");
   }
 
-  return decodeBase64(value.slice(commaIndex + 1));
+  return decodeBase64(value.slice(commaIndex + 1), progress);
 }
 
-function decodeBase64(value: string): Uint8Array {
+function decodeBase64(value: string, progress?: LoadProgressReporter): Uint8Array {
   const cleaned = value.replace(/\s+/g, "");
+  progress?.report(0, { stage: "source", unit: "bytes" });
 
   if (typeof atob === "function") {
     const binary = atob(cleaned);
@@ -115,6 +136,7 @@ function decodeBase64(value: string): Uint8Array {
     for (let i = 0; i < binary.length; i += 1) {
       out[i] = binary.charCodeAt(i);
     }
+    progress?.complete({ stage: "source", unit: "bytes", processed: out.byteLength, total: out.byteLength });
     return out;
   }
 
@@ -157,4 +179,85 @@ function hasZipMagic(bytes: Uint8Array): boolean {
     b1 === 0x4b &&
     ((b2 === 0x03 && b3 === 0x04) || (b2 === 0x05 && b3 === 0x06) || (b2 === 0x07 && b3 === 0x08))
   );
+}
+
+async function readBlobBytes(source: Blob, progress?: LoadProgressReporter): Promise<Uint8Array> {
+  if (!progress) {
+    return new Uint8Array(await source.arrayBuffer());
+  }
+
+  const size = Math.max(0, source.size);
+  const streamFactory = source.stream;
+  if (typeof streamFactory !== "function") {
+    progress.report(0, { stage: "source", unit: "bytes", processed: 0, total: size });
+    const bytes = new Uint8Array(await source.arrayBuffer());
+    progress.complete({ stage: "source", unit: "bytes", processed: bytes.byteLength, total: bytes.byteLength });
+    return bytes;
+  }
+
+  return readStreamToBytes(streamFactory.call(source).getReader(), size, progress);
+}
+
+async function readStreamToBytes(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  total: number | undefined,
+  progress: LoadProgressReporter
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+
+  progress.report(0, { stage: "source", unit: "bytes", processed: 0, total });
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value || value.byteLength === 0) {
+        continue;
+      }
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      chunks.push(chunk);
+      loaded += chunk.byteLength;
+      if (total && total > 0) {
+        progress.report(loaded / total, {
+          stage: "source",
+          unit: "bytes",
+          processed: loaded,
+          total
+        });
+      } else {
+        progress.report(0, {
+          stage: "source",
+          unit: "bytes",
+          processed: loaded
+        });
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  progress.complete({
+    stage: "source",
+    unit: "bytes",
+    processed: loaded,
+    total: total ?? loaded
+  });
+  return bytes;
+}
+
+function parseContentLength(value: string | null): number | undefined {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return undefined;
+  }
+  return parsed;
 }

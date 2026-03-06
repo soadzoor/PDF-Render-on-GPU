@@ -1,9 +1,8 @@
 /// <reference lib="webworker" />
 
-import type { CompiledPdfDocument } from "../../core/types";
 import type {
-  WorkerLoadRequest,
-  WorkerResponseMessage
+  CompiledDocumentWorkerLoadRequest,
+  CompiledDocumentWorkerResponseMessage
 } from "./protocol";
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope;
@@ -11,20 +10,21 @@ const WORKER_PROGRESS_THROTTLE_MS = 400;
 const WORKER_PROGRESS_MIN_DELTA = 0.005;
 
 interface WorkerRuntime {
-  loadCompiledDocumentFromSource: typeof import("../../core/compiledDocumentLoader").loadCompiledDocumentFromSource;
-  createLoadProgressReporter: typeof import("../../core/loadProgress").createLoadProgressReporter;
+  loadCompiledDocumentFromSource: typeof import("../compiledDocumentLoader").loadCompiledDocumentFromSource;
+  createLoadProgressReporter: typeof import("../loadProgress").createLoadProgressReporter;
+  collectCompiledDocumentTransferables: typeof import("./transferables").collectCompiledDocumentTransferables;
 }
 
 let runtimePromise: Promise<WorkerRuntime> | null = null;
 
-workerScope.addEventListener("message", async (event: MessageEvent<WorkerLoadRequest>) => {
+workerScope.addEventListener("message", async (event: MessageEvent<CompiledDocumentWorkerLoadRequest>) => {
   const request = event.data;
   if (!request || request.type !== "load") {
     return;
   }
 
   try {
-    const initialProgressMessage: WorkerResponseMessage = {
+    const initialProgressMessage: CompiledDocumentWorkerResponseMessage = {
       type: "load:progress",
       requestId: request.requestId,
       progress: {
@@ -39,7 +39,7 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerLoadReq
 
     const progress = runtime.createLoadProgressReporter(
       (payload) => {
-        const message: WorkerResponseMessage = {
+        const message: CompiledDocumentWorkerResponseMessage = {
           type: "load:progress",
           requestId: request.requestId,
           progress: {
@@ -61,15 +61,14 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerLoadReq
       progress
     });
 
-    const message: WorkerResponseMessage = {
+    const message: CompiledDocumentWorkerResponseMessage = {
       type: "load:success",
       requestId: request.requestId,
       document
     };
-
-    workerScope.postMessage(message, collectTransferables(document));
+    workerScope.postMessage(message, runtime.collectCompiledDocumentTransferables(document));
   } catch (error) {
-    const message: WorkerResponseMessage = {
+    const message: CompiledDocumentWorkerResponseMessage = {
       type: "load:error",
       requestId: request.requestId,
       error: error instanceof Error ? error.message : String(error)
@@ -88,41 +87,17 @@ async function getWorkerRuntime(): Promise<WorkerRuntime> {
 async function initializeWorkerRuntime(): Promise<WorkerRuntime> {
   const [
     compiledDocumentLoaderModule,
-    loadProgressModule
+    loadProgressModule,
+    transferablesModule
   ] = await Promise.all([
-    import("../../core/compiledDocumentLoader"),
-    import("../../core/loadProgress")
+    import("../compiledDocumentLoader"),
+    import("../loadProgress"),
+    import("./transferables")
   ]);
 
   return {
     loadCompiledDocumentFromSource: compiledDocumentLoaderModule.loadCompiledDocumentFromSource,
-    createLoadProgressReporter: loadProgressModule.createLoadProgressReporter
+    createLoadProgressReporter: loadProgressModule.createLoadProgressReporter,
+    collectCompiledDocumentTransferables: transferablesModule.collectCompiledDocumentTransferables
   };
-}
-
-function collectTransferables(document: CompiledPdfDocument): Transferable[] {
-  const transferables: Transferable[] = [
-    document.endpoints.buffer,
-    document.primitiveMeta.buffer,
-    document.primitiveBounds.buffer,
-    document.styles.buffer,
-    document.fillPathMetaA.buffer,
-    document.fillPathMetaB.buffer,
-    document.fillPathMetaC.buffer,
-    document.fillSegmentsA.buffer,
-    document.fillSegmentsB.buffer,
-    document.textInstanceA.buffer,
-    document.textInstanceB.buffer,
-    document.textInstanceC.buffer,
-    document.textGlyphMetaA.buffer,
-    document.textGlyphMetaB.buffer,
-    document.textGlyphSegmentsA.buffer,
-    document.textGlyphSegmentsB.buffer
-  ];
-
-  for (const layer of document.rasterLayers) {
-    transferables.push(layer.data.buffer, layer.matrix.buffer);
-  }
-
-  return transferables;
 }

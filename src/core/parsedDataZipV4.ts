@@ -9,6 +9,7 @@ import {
   encodeChannelMajorFloat32,
   encodeXorDeltaByteShuffledFloat32
 } from "../parsedDataEncoding";
+import type { LoadProgressReporter } from "./loadProgress";
 import type {
   CompiledDocumentStats,
   CompiledPageInfo,
@@ -298,18 +299,49 @@ export async function buildParsedDataZipV4Blob(
 }
 
 export async function loadCompiledDocumentFromParsedDataZipV4(
-  buffer: ArrayBuffer | Uint8Array
+  buffer: ArrayBuffer | Uint8Array,
+  progress?: LoadProgressReporter
 ): Promise<CompiledPdfDocument> {
   const zipBytes = buffer instanceof Uint8Array
     ? buffer
     : new Uint8Array(buffer);
-  const zip = await JSZip.loadAsync(zipBytes);
+  const zipOpenProgress = progress?.child(0, 0.15, {
+    stage: "zip-open",
+    sourceType: "zip"
+  });
+  const zip = zipOpenProgress
+    ? await zipOpenProgress.withIndeterminateProgress(() => JSZip.loadAsync(zipBytes), {
+      stage: "zip-open",
+      sourceType: "zip",
+      unit: "files"
+    })
+    : await JSZip.loadAsync(zipBytes);
   const manifestFile = zip.file("manifest.json");
   if (!manifestFile) {
     throw new Error("Parsed data zip is missing manifest.json.");
   }
 
-  const manifestJson = await manifestFile.async("string");
+  const manifestProgress = progress?.child(0.15, 0.2, {
+    stage: "zip-manifest",
+    sourceType: "zip"
+  });
+  manifestProgress?.report(0, { unit: "files", processed: 0, total: 1 });
+  const manifestJson = await manifestFile.async("string", (metadata) => {
+    manifestProgress?.report(metadata.percent / 100, {
+      stage: "zip-manifest",
+      sourceType: "zip",
+      unit: "files",
+      processed: 1,
+      total: 1
+    });
+  });
+  manifestProgress?.complete({
+    stage: "zip-manifest",
+    sourceType: "zip",
+    unit: "files",
+    processed: 1,
+    total: 1
+  });
   let manifest: ParsedDataZipManifest;
   try {
     manifest = JSON.parse(manifestJson) as ParsedDataZipManifest;
@@ -347,26 +379,139 @@ export async function loadCompiledDocumentFromParsedDataZipV4(
     textureByName.set(name, entry);
   }
 
-  const endpoints = await readRequiredTexture(zip, textureByName, "endpoints", documentMeta.segmentCount);
-  const primitiveMeta = await readRequiredTexture(zip, textureByName, "primitiveMeta", documentMeta.segmentCount);
-  const primitiveBounds = await readRequiredTexture(zip, textureByName, "primitiveBounds", documentMeta.segmentCount);
-  const styles = await readRequiredTexture(zip, textureByName, "styles", documentMeta.segmentCount);
+  const payloadItems = buildZipPayloadItems(textureByName, documentMeta);
+  const payloadWeightTotal = Math.max(1, payloadItems.reduce((sum, item) => sum + item.weight, 0));
+  let payloadWeightProcessed = 0;
+  const payloadProgress = progress?.child(0.2, 1, {
+    stage: "zip-file",
+    sourceType: "zip",
+    unit: "files",
+    processed: 0,
+    total: payloadItems.length
+  });
+  const reportPayloadProgress = (
+    itemWeightProcessed: number,
+    meta: {
+      processedFiles: number;
+      totalFiles: number;
+    }
+  ): void => {
+    payloadProgress?.report((payloadWeightProcessed + itemWeightProcessed) / payloadWeightTotal, {
+      stage: "zip-file",
+      sourceType: "zip",
+      unit: "files",
+      processed: meta.processedFiles,
+      total: meta.totalFiles
+    });
+  };
+  const finalizePayloadProgress = (weight: number, processedFiles: number, totalFiles: number): void => {
+    payloadWeightProcessed += weight;
+    payloadProgress?.report(payloadWeightProcessed / payloadWeightTotal, {
+      stage: "zip-file",
+      sourceType: "zip",
+      unit: "files",
+      processed: processedFiles,
+      total: totalFiles
+    });
+  };
+  let payloadFileIndex = 0;
 
-  const fillPathMetaA = await readRequiredTexture(zip, textureByName, "fillPathMetaA", documentMeta.fillPathCount);
-  const fillPathMetaB = await readRequiredTexture(zip, textureByName, "fillPathMetaB", documentMeta.fillPathCount);
-  const fillPathMetaC = await readRequiredTexture(zip, textureByName, "fillPathMetaC", documentMeta.fillPathCount);
-  const fillSegmentsA = await readRequiredTexture(zip, textureByName, "fillSegmentsA", documentMeta.fillSegmentCount);
-  const fillSegmentsB = await readRequiredTexture(zip, textureByName, "fillSegmentsB", documentMeta.fillSegmentCount);
+  const endpoints = await readRequiredTexture(zip, textureByName, "endpoints", documentMeta.segmentCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, {
+      processedFiles: payloadFileIndex,
+      totalFiles: payloadItems.length
+    })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const primitiveMeta = await readRequiredTexture(zip, textureByName, "primitiveMeta", documentMeta.segmentCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, {
+      processedFiles: payloadFileIndex,
+      totalFiles: payloadItems.length
+    })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const primitiveBounds = await readRequiredTexture(zip, textureByName, "primitiveBounds", documentMeta.segmentCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, {
+      processedFiles: payloadFileIndex,
+      totalFiles: payloadItems.length
+    })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const styles = await readRequiredTexture(zip, textureByName, "styles", documentMeta.segmentCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, {
+      processedFiles: payloadFileIndex,
+      totalFiles: payloadItems.length
+    })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
 
-  const textInstanceA = await readRequiredTexture(zip, textureByName, "textInstanceA", documentMeta.textInstanceCount);
-  const textInstanceB = await readRequiredTexture(zip, textureByName, "textInstanceB", documentMeta.textInstanceCount);
-  const textInstanceC = await readRequiredTexture(zip, textureByName, "textInstanceC", documentMeta.textInstanceCount);
-  const textGlyphMetaA = await readRequiredTexture(zip, textureByName, "textGlyphMetaA", documentMeta.textGlyphCount);
-  const textGlyphMetaB = await readRequiredTexture(zip, textureByName, "textGlyphMetaB", documentMeta.textGlyphCount);
-  const textGlyphSegmentsA = await readRequiredTexture(zip, textureByName, "textGlyphSegmentsA", documentMeta.textGlyphSegmentCount);
-  const textGlyphSegmentsB = await readRequiredTexture(zip, textureByName, "textGlyphSegmentsB", documentMeta.textGlyphSegmentCount);
+  const fillPathMetaA = await readRequiredTexture(zip, textureByName, "fillPathMetaA", documentMeta.fillPathCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const fillPathMetaB = await readRequiredTexture(zip, textureByName, "fillPathMetaB", documentMeta.fillPathCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const fillPathMetaC = await readRequiredTexture(zip, textureByName, "fillPathMetaC", documentMeta.fillPathCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const fillSegmentsA = await readRequiredTexture(zip, textureByName, "fillSegmentsA", documentMeta.fillSegmentCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const fillSegmentsB = await readRequiredTexture(zip, textureByName, "fillSegmentsB", documentMeta.fillSegmentCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
 
-  const rasterLayers = await readRasterLayers(zip, documentMeta.rasterLayers);
+  const textInstanceA = await readRequiredTexture(zip, textureByName, "textInstanceA", documentMeta.textInstanceCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const textInstanceB = await readRequiredTexture(zip, textureByName, "textInstanceB", documentMeta.textInstanceCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const textInstanceC = await readRequiredTexture(zip, textureByName, "textInstanceC", documentMeta.textInstanceCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const textGlyphMetaA = await readRequiredTexture(zip, textureByName, "textGlyphMetaA", documentMeta.textGlyphCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const textGlyphMetaB = await readRequiredTexture(zip, textureByName, "textGlyphMetaB", documentMeta.textGlyphCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const textGlyphSegmentsA = await readRequiredTexture(zip, textureByName, "textGlyphSegmentsA", documentMeta.textGlyphSegmentCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+  const textGlyphSegmentsB = await readRequiredTexture(zip, textureByName, "textGlyphSegmentsB", documentMeta.textGlyphSegmentCount, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, { processedFiles: payloadFileIndex, totalFiles: payloadItems.length })
+  });
+  finalizePayloadProgress(payloadItems[payloadFileIndex]?.weight ?? 0, ++payloadFileIndex, payloadItems.length);
+
+  const rasterLayers = await readRasterLayers(zip, documentMeta.rasterLayers, {
+    report: (localProgress, weight) => reportPayloadProgress(weight * localProgress, {
+      processedFiles: payloadFileIndex,
+      totalFiles: payloadItems.length
+    }),
+    totalFiles: payloadItems.length
+  });
+  for (let i = payloadFileIndex; i < payloadItems.length; i += 1) {
+    finalizePayloadProgress(payloadItems[i]?.weight ?? 0, i + 1, payloadItems.length);
+  }
+  payloadProgress?.complete({
+    stage: "zip-file",
+    sourceType: "zip",
+    unit: "files",
+    processed: payloadItems.length,
+    total: payloadItems.length
+  });
 
   return {
     pageCount: documentMeta.pageCount,
@@ -454,7 +599,10 @@ async function readRequiredTexture(
   zip: JSZip,
   textureByName: Map<string, ManifestTextureEntry>,
   name: RequiredTextureName,
-  expectedItemCount: number
+  expectedItemCount: number,
+  progress?: {
+    report: (localProgress: number, weight: number) => void;
+  }
 ): Promise<Float32Array> {
   const entry = textureByName.get(name);
   if (!entry) {
@@ -472,7 +620,12 @@ async function readRequiredTexture(
     throw new Error(`Parsed data zip is missing texture payload ${filePath}.`);
   }
 
-  const fileBuffer = await file.async("arraybuffer");
+  const weight = Math.max(1, readNonNegativeInt(entry.logicalFloatCount, expectedItemCount * 4) * 4);
+  progress?.report(0, weight);
+  const fileBuffer = await file.async("arraybuffer", (metadata) => {
+    progress?.report(metadata.percent / 100, weight);
+  });
+  progress?.report(1, weight);
   const raw = readTexturePayloadAsFloat32(fileBuffer, entry, name);
   const logicalFloatCountFromManifest = readNonNegativeInt(entry.logicalFloatCount, raw.length);
   if (logicalFloatCountFromManifest > raw.length) {
@@ -547,7 +700,11 @@ function readTexturePayloadAsFloat32(
 
 async function readRasterLayers(
   zip: JSZip,
-  source: ManifestRasterLayerEntry[]
+  source: ManifestRasterLayerEntry[],
+  progress?: {
+    report: (localProgress: number, weight: number) => void;
+    totalFiles: number;
+  }
 ): Promise<CompiledRasterLayer[]> {
   const out: CompiledRasterLayer[] = [];
 
@@ -576,7 +733,11 @@ async function readRasterLayers(
       throw new Error(`Raster layer payload is missing: ${filePath}.`);
     }
 
-    const buffer = await file.async("arraybuffer");
+    const weight = Math.max(1, width * height * 4);
+    progress?.report(0, weight);
+    const buffer = await file.async("arraybuffer", (metadata) => {
+      progress?.report(metadata.percent / 100, weight);
+    });
     const bytes = new Uint8Array(buffer);
     let rgba: Uint8Array;
 
@@ -606,9 +767,33 @@ async function readRasterLayers(
       matrix,
       data: rgba
     });
+    progress?.report(1, weight);
   }
 
   return out;
+}
+
+function buildZipPayloadItems(
+  textureByName: Map<string, ManifestTextureEntry>,
+  documentMeta: {
+    rasterLayers: ManifestRasterLayerEntry[];
+  }
+): Array<{ weight: number }> {
+  const items: Array<{ weight: number }> = [];
+
+  for (const name of REQUIRED_TEXTURE_NAMES) {
+    const entry = textureByName.get(name);
+    const weight = Math.max(1, readNonNegativeInt(entry?.logicalFloatCount, 0) * 4);
+    items.push({ weight });
+  }
+
+  for (const entry of documentMeta.rasterLayers) {
+    const width = readNonNegativeInt(entry.width, 0);
+    const height = readNonNegativeInt(entry.height, 0);
+    items.push({ weight: Math.max(1, width * height * 4) });
+  }
+
+  return items;
 }
 
 function parseDocumentMeta(input: unknown): {

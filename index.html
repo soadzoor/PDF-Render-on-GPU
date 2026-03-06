@@ -78,7 +78,7 @@
         <div id="status" class="status">Waiting for PDF or parsed ZIP...</div>
         <div id="parse-loader" class="parse-loader" hidden>
           <span class="loader-spinner" aria-hidden="true"></span>
-          <span>Parsing / loading...</span>
+          <span id="parse-loader-text"></span>
         </div>
         <div id="runtime" class="runtime"></div>
         <div id="metrics" class="metrics">
@@ -94,6 +94,10 @@
           <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
           <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
         </div>
+        <details id="load-debug" class="load-debug" hidden>
+          <summary>Load Debug</summary>
+          <pre id="load-debug-log" class="load-debug-log"></pre>
+        </details>
         <div class="help">Drag to pan, mouse wheel or pinch to zoom, or drag-and-drop a PDF or parsed ZIP.</div>
       </div>
     </div>

@@ -16,6 +16,7 @@ import {
 import type { VectorScene } from "../../pdfVectorExtractor";
 import { buildTextRasterAtlas } from "../../textRasterAtlas";
 import { buildRasterAtlases, type RasterAtlasTilePlacement } from "../../core/rasterAtlas";
+import type { LoadProgressReporter } from "../../core/loadProgress";
 import type { CompiledPdfDocument } from "../../core/types";
 import { RASTER_TEXTURE_ANISOTROPY } from "../../shared/shaders/samplingPolicy";
 
@@ -73,12 +74,15 @@ export interface SharedGpuData {
 
 const DEFAULT_MAX_TEXTURE_SIZE = 4096;
 
-export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuData {
+export function createSharedGpuData(document: CompiledPdfDocument, progress?: LoadProgressReporter): SharedGpuData {
   const maxTextureSize = resolveMaxTextureSizeFallback();
 
+  progress?.report(0, { stage: "upload", sourceType: undefined });
   const rasterAtlasBuild = buildRasterAtlases(document.rasterLayers, maxTextureSize);
+  progress?.report(0.15, { stage: "upload" });
   const rasterAtlasTextures = rasterAtlasBuild.atlases.map((atlas) => createRgbaTexture(atlas.rgba, atlas.width, atlas.height));
   const rasterPrimitiveBuild = buildRasterPrimitiveTable(document, rasterAtlasBuild.tiles);
+  progress?.report(0.3, { stage: "upload" });
 
   const pageMetaA = new Float32Array(document.pageCount * 4);
   const pageMetaB = new Float32Array(document.pageCount * 4);
@@ -107,17 +111,20 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
   const pageMetaTextureA = createFloatTexture(pageMetaA, maxTextureSize);
   const pageMetaTextureB = createFloatTexture(pageMetaB, maxTextureSize);
   const pageRectTexture = createFloatTexture(pageRects, maxTextureSize);
+  progress?.report(0.4, { stage: "upload" });
 
   const segmentTextureA = createFloatTexture(document.endpoints, maxTextureSize);
   const segmentTextureB = createFloatTexture(document.primitiveMeta, maxTextureSize);
   const segmentTextureC = createFloatTexture(document.styles, maxTextureSize);
   const segmentTextureD = createFloatTexture(document.primitiveBounds, maxTextureSize);
+  progress?.report(0.5, { stage: "upload" });
 
   const fillPathTextureA = createFloatTexture(document.fillPathMetaA, maxTextureSize);
   const fillPathTextureB = createFloatTexture(document.fillPathMetaB, maxTextureSize);
   const fillPathTextureC = createFloatTexture(document.fillPathMetaC, maxTextureSize);
   const fillSegmentTextureA = createFloatTexture(document.fillSegmentsA, maxTextureSize);
   const fillSegmentTextureB = createFloatTexture(document.fillSegmentsB, maxTextureSize);
+  progress?.report(0.62, { stage: "upload" });
 
   const textInstanceTextureA = createFloatTexture(document.textInstanceA, maxTextureSize);
   const textInstanceTextureB = createFloatTexture(document.textInstanceB, maxTextureSize);
@@ -126,6 +133,7 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
   const textGlyphMetaTextureB = createFloatTexture(document.textGlyphMetaB, maxTextureSize);
   const textGlyphSegmentTextureA = createFloatTexture(document.textGlyphSegmentsA, maxTextureSize);
   const textGlyphSegmentTextureB = createFloatTexture(document.textGlyphSegmentsB, maxTextureSize);
+  progress?.report(0.74, { stage: "upload" });
 
   const rasterLayerMetaA = new Float32Array(rasterPrimitiveBuild.primitives.length * 4);
   const rasterLayerMetaB = new Float32Array(rasterPrimitiveBuild.primitives.length * 4);
@@ -156,10 +164,12 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
   const rasterLayerMetaTextureA = createFloatTexture(rasterLayerMetaA, maxTextureSize);
   const rasterLayerMetaTextureB = createFloatTexture(rasterLayerMetaB, maxTextureSize);
   const rasterLayerMetaTextureC = createFloatTexture(rasterLayerMetaC, maxTextureSize);
+  progress?.report(0.84, { stage: "upload" });
 
   const textAtlasBuild = buildTextAtlasForDocument(document, maxTextureSize);
   const textAtlasTexture = createTextAtlasTexture(textAtlasBuild.rgba, textAtlasBuild.width, textAtlasBuild.height);
   const textGlyphRasterMetaTexture = createFloatTexture(textAtlasBuild.glyphUvRects, maxTextureSize);
+  progress?.report(0.92, { stage: "upload" });
 
   const maxRasterPrimitiveCount = Math.max(1, 1 + rasterPrimitiveBuild.maxRasterPrimitiveCountPerPage);
   const maxFillPrimitiveCount = Math.max(1, document.maxFillPathCountPerPage);
@@ -173,6 +183,7 @@ export function createSharedGpuData(document: CompiledPdfDocument): SharedGpuDat
     maxTextPrimitiveCount,
     rasterAtlasTextures.length
   );
+  progress?.complete({ stage: "upload" });
 
   const disposableTextures: DataTexture[] = [
     pageMetaTextureA.texture,

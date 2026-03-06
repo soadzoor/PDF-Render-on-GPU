@@ -6,18 +6,28 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { WebGlFloorplanRenderer, type DrawStats, type SceneStats } from "./webGlFloorplanRenderer";
 import { WebGpuFloorplanRenderer } from "./webGpuFloorplanRenderer";
 import {
-  composeVectorScenesInGrid,
-  extractPdfPageScenes,
   type VectorExtractOptions,
   type VectorScene
 } from "./pdfVectorExtractor";
 import { createCanvasInteractionController } from "./canvasInteractions";
 import { createBackendSwitcher } from "./backendSwitcher";
+import { createHudFlushController } from "./demo/hudFlushController";
+import {
+  createLoadProgressDebugTracker,
+  formatLoadProgressStage
+} from "./demo/loadProgressDebug";
 import { listSceneRasterLayers } from "./parsedDataZip";
-import { compilePdfPageScenes } from "./core/documentCompile";
-import { buildParsedDataZipV4Blob, loadCompiledDocumentFromParsedDataZipV4 } from "./core/parsedDataZipV4";
+import { loadCompiledDocumentFromSource } from "./core/compiledDocumentLoader";
+import { buildParsedDataZipV4Blob } from "./core/parsedDataZipV4";
 import { compiledDocumentToVectorScene } from "./core/compiledDocumentToVectorScene";
+import {
+  createLoadProgressReporter,
+  type LoadProgressReporter,
+  type PDFLoadProgress
+} from "./core/loadProgress";
+import type { PDFSource } from "./core/pdfSource";
 import type { CompiledPdfDocument } from "./core/types";
+import { loadCompiledDocumentInWorker } from "./core/worker/client";
 import type { RendererApi } from "./rendererTypes";
 import { createUiControlManager } from "./uiControls";
 import {
@@ -40,6 +50,7 @@ const downloadAllDataButton = document.querySelector<HTMLButtonElement>("#downlo
 const fileInput = document.querySelector<HTMLInputElement>("#file-input");
 const statusElement = document.querySelector<HTMLDivElement>("#status");
 const parseLoaderElement = document.querySelector<HTMLDivElement>("#parse-loader");
+const parseLoaderTextElement = document.querySelector<HTMLSpanElement>("#parse-loader-text");
 const runtimeElement = document.querySelector<HTMLDivElement>("#runtime");
 const metricsElement = document.querySelector<HTMLDivElement>("#metrics");
 const metricFileElement = document.querySelector<HTMLSpanElement>("#metric-file");
@@ -53,6 +64,8 @@ const metricTimesElement = document.querySelector<HTMLSpanElement>("#metric-time
 const metricFpsElement = document.querySelector<HTMLSpanElement>("#metric-fps");
 const metricTextureElement = document.querySelector<HTMLSpanElement>("#metric-texture");
 const metricGridMaxCellElement = document.querySelector<HTMLSpanElement>("#metric-grid-max-cell");
+const loadDebugElement = document.querySelector<HTMLDetailsElement>("#load-debug");
+const loadDebugLogElement = document.querySelector<HTMLPreElement>("#load-debug-log");
 const dropIndicator = document.querySelector<HTMLDivElement>("#drop-indicator");
 const panOptimizationToggle = document.querySelector<HTMLInputElement>("#toggle-pan-opt");
 const segmentMergeToggle = document.querySelector<HTMLInputElement>("#toggle-segment-merge");
@@ -80,6 +93,7 @@ if (
   !fileInput ||
   !statusElement ||
   !parseLoaderElement ||
+  !parseLoaderTextElement ||
   !runtimeElement ||
   !metricsElement ||
   !metricFileElement ||
@@ -93,6 +107,8 @@ if (
   !metricFpsElement ||
   !metricTextureElement ||
   !metricGridMaxCellElement ||
+  !loadDebugElement ||
+  !loadDebugLogElement ||
   !dropIndicator ||
   !panOptimizationToggle ||
   !segmentMergeToggle ||
@@ -122,6 +138,7 @@ const downloadAllDataButtonElement = downloadAllDataButton;
 const fileInputElement = fileInput;
 const statusTextElement = statusElement;
 const parsingLoaderElement = parseLoaderElement;
+const parsingLoaderTextElement = parseLoaderTextElement;
 const runtimeTextElement = runtimeElement;
 const metricsPanelElement = metricsElement;
 const metricFileTextElement = metricFileElement;
@@ -135,6 +152,8 @@ const metricTimesTextElement = metricTimesElement;
 const metricFpsTextElement = metricFpsElement;
 const metricTextureTextElement = metricTextureElement;
 const metricGridMaxCellTextElement = metricGridMaxCellElement;
+const loadDebugDetailsElement = loadDebugElement;
+const loadDebugLogTextElement = loadDebugLogElement;
 const dropIndicatorElement = dropIndicator;
 const panOptimizationToggleElement = panOptimizationToggle;
 const segmentMergeToggleElement = segmentMergeToggle;
@@ -180,8 +199,9 @@ function onRendererFrame(stats: DrawStats): void {
   const total = stats.totalSegments.toLocaleString();
   const mode = stats.usedCulling ? "culled" : "full";
   const activeBackendLabel = (backendSwitcher?.getActiveBackend() ?? "webgl").toUpperCase();
-  runtimeTextElement.textContent =
-    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}`;
+  hudFlushController.setRuntime(
+    `Draw ${rendered}/${total} segments | mode: ${mode} | zoom: ${stats.zoom.toFixed(2)}x | backend: ${activeBackendLabel}`
+  );
 }
 
 function initializeRendererCommon(rendererApi: RendererApi): void {
@@ -225,7 +245,7 @@ type LoadedSourceKind = "pdf" | "parsed-zip";
 
 interface LoadedSource {
   kind: LoadedSourceKind;
-  bytes: Uint8Array;
+  source: PDFSource;
   label: string;
 }
 
@@ -236,15 +256,17 @@ let lastParsedSceneLabel: string | null = null;
 let lastCompiledDocument: CompiledPdfDocument | null = null;
 let loadToken = 0;
 let isDropDragActive = false;
+const loadDebugEnabled = new URLSearchParams(window.location.search).get("loadDebug") === "1";
 
-interface ParsedPdfPageCache {
-  sourceBytes: Uint8Array;
+interface ParsedPdfCompiledCache {
+  sourceRef: PDFSource;
   sourceLabel: string;
   optionsKey: string;
-  pageScenes: VectorScene[];
+  document: CompiledPdfDocument;
 }
 
-let parsedPdfPageCache: ParsedPdfPageCache | null = null;
+let parsedPdfCompiledCache: ParsedPdfCompiledCache | null = null;
+let loaderProgressUiToken = 0;
 
 interface LoadPdfOptions {
   preserveView?: boolean;
@@ -253,7 +275,6 @@ interface LoadPdfOptions {
 
 const EXPORT_ZIP_COMPRESSION: "STORE" | "DEFLATE" = "DEFLATE";
 const EXPORT_ZIP_DEFLATE_LEVEL = 9;
-
 type ExampleSelectionKind = "pdf" | "zip";
 
 interface ExampleSelection {
@@ -269,6 +290,35 @@ let isBatchExampleExportRunning = false;
 
 let fpsLastSampleTime = 0;
 let fpsSmoothed = 0;
+
+const hudFlushController = createHudFlushController(
+  {
+    statusElement: statusTextElement,
+    loaderElement: parsingLoaderElement,
+    loaderTextElement: parsingLoaderTextElement,
+    runtimeElement: runtimeTextElement,
+    fpsElement: metricFpsTextElement,
+    debugElement: loadDebugDetailsElement,
+    debugLogElement: loadDebugLogTextElement
+  },
+  {
+    runtimeThrottleMs: 250,
+    fpsThrottleMs: 250,
+    debugEnabled: loadDebugEnabled,
+    debugMaxLines: 200
+  }
+);
+
+const loadProgressDebugTracker = createLoadProgressDebugTracker({
+  enabled: loadDebugEnabled,
+  tag: "hepr/native",
+  emitLine(line) {
+    console.log(line);
+    hudFlushController.appendDebugLine(line);
+  },
+  minDelta: 0.03,
+  minIntervalMs: 2000
+});
 
 backendSwitcher = createBackendSwitcher({
   webGpuToggleElement,
@@ -308,7 +358,7 @@ backendSwitcher = createBackendSwitcher({
   },
   setStatus,
   setStatusText: (status) => {
-    statusTextElement.textContent = status;
+    hudFlushController.setStatus(status);
   }
 });
 
@@ -375,10 +425,21 @@ uiControlManager.bindEventListeners({
     renderer.setTextVectorOnly(enabled);
   },
   onMaxPagesPerRowChange: async () => {
-    if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
+    if (!lastCompiledDocument || !lastParsedSceneLabel) {
       return;
     }
-    await loadPdfBuffer(createParseBuffer(lastLoadedSource.bytes), lastLoadedSource.label, { preserveView: false });
+    const activeLoadToken = ++loadToken;
+    const progress = createLoadProgressReporter((payload) => {
+      updateLoaderProgress(activeLoadToken, payload);
+    });
+    beginLoaderProgress(activeLoadToken);
+    await renderCompiledDocument(lastCompiledDocument, lastParsedSceneLabel, {
+      activeLoadToken,
+      preserveView: false,
+      parseMs: 0,
+      progress,
+      sourceLabelSuffix: lastLoadedSource?.kind === "parsed-zip" ? "parsed data zip" : null
+    });
   },
   onWebGpuToggleChange: (enabled) => backendSwitcher?.applyPreference(enabled) ?? Promise.resolve()
 });
@@ -520,22 +581,13 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
   try {
     const modeLabel = selection.kind === "pdf" ? "PDF" : "parsed ZIP";
     setStatus(`Loading example ${selection.sourceName} (${modeLabel})...`);
-    const response = await fetch(selection.path, { cache: "no-store" });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    const fileBuffer = await response.arrayBuffer();
-    const bytes = cloneSourceBytes(fileBuffer);
-    parsedPdfPageCache = null;
-
     if (selection.kind === "pdf") {
       lastLoadedSource = {
         kind: "pdf",
-        bytes,
+        source: selection.path,
         label: selection.sourceName
       };
-      await loadPdfBuffer(createParseBuffer(bytes), selection.sourceName, {
+      await loadPdfSource(selection.path, selection.sourceName, {
         preserveView: false,
         autoMaxPagesPerRow: true
       });
@@ -543,10 +595,10 @@ async function loadExampleSelection(selectionKey: string): Promise<void> {
       const zipLabel = `${selection.sourceName} (parsed zip)`;
       lastLoadedSource = {
         kind: "parsed-zip",
-        bytes,
+        source: selection.path,
         label: zipLabel
       };
-      await loadParsedDataZipBuffer(createParseBuffer(bytes), zipLabel, {
+      await loadParsedDataZipSource(selection.path, zipLabel, {
         preserveView: false
       });
     }
@@ -574,136 +626,76 @@ function isParsedDataZipFile(file: File): boolean {
 }
 
 async function loadPdfFile(file: File): Promise<void> {
-  setStatus(`Reading ${file.name}...`);
-  const buffer = await file.arrayBuffer();
-  const bytes = cloneSourceBytes(buffer);
-  lastLoadedSource = { kind: "pdf", bytes, label: file.name };
-  parsedPdfPageCache = null;
-  await loadPdfBuffer(createParseBuffer(bytes), file.name, { preserveView: false, autoMaxPagesPerRow: true });
+  lastLoadedSource = { kind: "pdf", source: file, label: file.name };
+  parsedPdfCompiledCache = null;
+  await loadPdfSource(file, file.name, { preserveView: false, autoMaxPagesPerRow: true });
 }
 
 async function loadParsedDataZipFile(file: File): Promise<void> {
-  setStatus(`Reading ${file.name}...`);
-  const buffer = await file.arrayBuffer();
-  const bytes = cloneSourceBytes(buffer);
-  lastLoadedSource = { kind: "parsed-zip", bytes, label: file.name };
-  parsedPdfPageCache = null;
-  await loadParsedDataZipBuffer(createParseBuffer(bytes), file.name, { preserveView: false });
+  lastLoadedSource = { kind: "parsed-zip", source: file, label: file.name };
+  await loadParsedDataZipSource(file, file.name, { preserveView: false });
 }
 
-async function loadPdfBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
+async function loadPdfSource(source: PDFSource, label: string, options: LoadPdfOptions = {}): Promise<void> {
   const activeLoadToken = ++loadToken;
   const extractionOptions = getExtractionOptions();
-  const pageSceneOptionsKey = buildPdfPageCacheKey(extractionOptions);
-  const cachedPageScenes = getCachedPdfPageScenes(label, pageSceneOptionsKey);
+  const optionsKey = buildPdfPageCacheKey(extractionOptions);
+  const progress = createLoadProgressReporter((payload) => {
+    updateLoaderProgress(activeLoadToken, payload);
+  });
+  const cachedDocument = getCachedCompiledPdfDocument(label, optionsKey, source);
+
+  beginLoaderProgress(activeLoadToken);
+  beginLoadProgressDebug(activeLoadToken, label);
 
   try {
-    let scene: VectorScene;
-    let pageScenesForCompile: VectorScene[];
-    let parseMs = 0;
-    let pagesPerRow = uiControlManager.readMaxPagesPerRowInput();
+    let compiledDocument = cachedDocument;
+    const parseStart = performance.now();
 
-    if (cachedPageScenes) {
-      if (options.autoMaxPagesPerRow) {
-        pagesPerRow = computeAutoPagesPerRow(cachedPageScenes.length);
-        maxPagesPerRowInputElement.value = String(pagesPerRow);
-      }
-      const composeStart = performance.now();
-      setParsingLoader(false);
-      setStatus(
-        `Rearranging ${label}... (pages/row ${pagesPerRow}, using cached parsed pages)`
-      );
-      scene = composeVectorScenesInGrid(cachedPageScenes, pagesPerRow);
-      pageScenesForCompile = cachedPageScenes;
-      parseMs = performance.now() - composeStart;
-      console.log(
-        `[Page grid] ${label}: recomposed ${cachedPageScenes.length.toLocaleString()} cached page scenes at ${pagesPerRow.toLocaleString()} pages/row in ${parseMs.toFixed(1)} ms`
-      );
+    if (compiledDocument) {
+      setStatus(`Rearranging ${label}... (using cached compiled document)`);
+      progress.report(0.97, { stage: "compile", sourceType: "pdf" });
     } else {
-      const parseStart = performance.now();
-      setParsingLoader(true);
       setStatus(
         `Parsing ${label} with PDF.js... (merge ${extractionOptions.enableSegmentMerge ? "on" : "off"}, cull ${extractionOptions.enableInvisibleCull ? "on" : "off"})`
       );
-      const pageScenes = await extractPdfPageScenes(buffer, extractionOptions);
-      parseMs = performance.now() - parseStart;
-
-      if (activeLoadToken === loadToken) {
-        setParsingLoader(false);
-      }
-
-      if (activeLoadToken !== loadToken) {
-        return;
-      }
-
-      if (options.autoMaxPagesPerRow) {
-        pagesPerRow = computeAutoPagesPerRow(pageScenes.length);
-        maxPagesPerRowInputElement.value = String(pagesPerRow);
-      }
-
-      scene = composeVectorScenesInGrid(pageScenes, pagesPerRow);
-      pageScenesForCompile = pageScenes;
-      storeCachedPdfPageScenes(label, pageSceneOptionsKey, pageScenes);
-      console.log(
-        `[Page grid] ${label}: parsed ${pageScenes.length.toLocaleString()} pages in ${parseMs.toFixed(1)} ms, arranged ${pagesPerRow.toLocaleString()}/row`
-      );
+      compiledDocument = await loadCompiledDocumentWithWorkerFallback(source, {
+        maxPages: undefined,
+        extraction: extractionOptions,
+        progress: progress.child(0, 0.97)
+      });
+      storeCachedCompiledPdfDocument(label, optionsKey, source, compiledDocument);
     }
 
     if (activeLoadToken !== loadToken) {
       return;
     }
 
-    const compiledDocument = compilePdfPageScenes(pageScenesForCompile);
-
-    const rasterLayerCount = listSceneRasterLayers(scene).length;
-    const hasRasterLayer = rasterLayerCount > 0;
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
-      setStatus(`No visible geometry was extracted from ${label}.`);
-      runtimeTextElement.textContent = "";
-      setMetricPlaceholder(label);
-      setDownloadDataButtonState(false);
-      return;
+    if (options.autoMaxPagesPerRow) {
+      const pagesPerRow = computeAutoPagesPerRow(compiledDocument.pageCount);
+      maxPagesPerRowInputElement.value = String(pagesPerRow);
     }
 
-    setStatus(
-      `Uploading ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""} to GPU...`
-    );
-    const uploadStart = performance.now();
-    const sceneStats = renderer.setScene(scene);
-    if (!options.preserveView) {
-      renderer.fitToBounds(scene.bounds, 64);
-    }
-    const uploadEnd = performance.now();
-
-    if (activeLoadToken !== loadToken) {
-      return;
-    }
-
-    logSegmentMergeStats(label, scene);
-    logInvisibleCullStats(label, scene);
-    logTextVectorStats(label, scene);
-    logTextureSizeStats(label, scene, sceneStats);
-
-    lastParsedScene = scene;
-    lastParsedSceneStats = sceneStats;
-    lastParsedSceneLabel = label;
-    lastCompiledDocument = compiledDocument;
-    refreshDropIndicator();
-    setDownloadDataButtonState(true);
-
-    updateMetricsPanel(label, scene, sceneStats, parseMs, uploadEnd - uploadStart);
-    baseStatus = formatSceneStatus(label, scene);
-    statusTextElement.textContent = baseStatus;
+    const parseMs = performance.now() - parseStart;
+    await renderCompiledDocument(compiledDocument, label, {
+      activeLoadToken,
+      preserveView: options.preserveView,
+      parseMs,
+      progress,
+      sourceLabelSuffix: null
+    });
+    finishLoadProgressDebug(activeLoadToken, true);
   } catch (error) {
     if (activeLoadToken !== loadToken) {
       return;
     }
 
-    setParsingLoader(false);
+    finishLoaderProgress(activeLoadToken, false);
     const message = error instanceof Error ? error.message : String(error);
+    finishLoadProgressDebug(activeLoadToken, false, message);
     setStatus(`Failed to render PDF: ${message}`);
     lastCompiledDocument = null;
-    runtimeTextElement.textContent = "";
+    hudFlushController.setRuntime("");
     setMetricPlaceholder(label);
   }
 }
@@ -712,78 +704,48 @@ async function reloadLastPdfWithCurrentOptions(): Promise<void> {
   if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
     return;
   }
-  await loadPdfBuffer(createParseBuffer(lastLoadedSource.bytes), lastLoadedSource.label, { preserveView: true });
+  await loadPdfSource(lastLoadedSource.source, lastLoadedSource.label, { preserveView: true });
 }
 
-async function loadParsedDataZipBuffer(buffer: ArrayBuffer, label: string, options: LoadPdfOptions = {}): Promise<void> {
+async function loadParsedDataZipSource(source: PDFSource, label: string, options: LoadPdfOptions = {}): Promise<void> {
   const activeLoadToken = ++loadToken;
+  const progress = createLoadProgressReporter((payload) => {
+    updateLoaderProgress(activeLoadToken, payload);
+  });
+  beginLoaderProgress(activeLoadToken);
+  beginLoadProgressDebug(activeLoadToken, label);
 
   try {
     const parseStart = performance.now();
-    setParsingLoader(true);
     setStatus(`Loading parsed data from ${label}...`);
-    const compiledDocument = await loadCompiledDocumentFromParsedDataZipV4(buffer);
-    const pagesPerRow = uiControlManager.readMaxPagesPerRowInput();
-    const scene = compiledDocumentToVectorScene(compiledDocument, pagesPerRow);
-    const parseEnd = performance.now();
-
-    if (activeLoadToken === loadToken) {
-      setParsingLoader(false);
-    }
+    const compiledDocument = await loadCompiledDocumentWithWorkerFallback(source, {
+      progress: progress.child(0, 0.97)
+    });
 
     if (activeLoadToken !== loadToken) {
       return;
     }
 
-    const rasterLayerCount = listSceneRasterLayers(scene).length;
-    const hasRasterLayer = rasterLayerCount > 0;
-    if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
-      setStatus(`No visible geometry was found in ${label}.`);
-      runtimeTextElement.textContent = "";
-      setMetricPlaceholder(label);
-      setDownloadDataButtonState(false);
-      return;
-    }
-
-    setStatus(
-      `Uploading ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""} to GPU...`
-    );
-    const uploadStart = performance.now();
-    const sceneStats = renderer.setScene(scene);
-    if (!options.preserveView) {
-      renderer.fitToBounds(scene.bounds, 64);
-    }
-    const uploadEnd = performance.now();
-
-    if (activeLoadToken !== loadToken) {
-      return;
-    }
-
-    logSegmentMergeStats(label, scene);
-    logInvisibleCullStats(label, scene);
-    logTextVectorStats(label, scene);
-    logTextureSizeStats(label, scene, sceneStats);
-
-    lastParsedScene = scene;
-    lastParsedSceneStats = sceneStats;
-    lastParsedSceneLabel = label;
-    lastCompiledDocument = compiledDocument;
-    refreshDropIndicator();
-    setDownloadDataButtonState(true);
-
-    updateMetricsPanel(label, scene, sceneStats, parseEnd - parseStart, uploadEnd - uploadStart);
-    baseStatus = `${formatSceneStatus(label, scene)} | source: parsed data zip`;
-    statusTextElement.textContent = baseStatus;
+    const parseMs = performance.now() - parseStart;
+    await renderCompiledDocument(compiledDocument, label, {
+      activeLoadToken,
+      preserveView: options.preserveView,
+      parseMs,
+      progress,
+      sourceLabelSuffix: "parsed data zip"
+    });
+    finishLoadProgressDebug(activeLoadToken, true);
   } catch (error) {
     if (activeLoadToken !== loadToken) {
       return;
     }
 
-    setParsingLoader(false);
+    finishLoaderProgress(activeLoadToken, false);
     const message = error instanceof Error ? error.message : String(error);
+    finishLoadProgressDebug(activeLoadToken, false, message);
     setStatus(`Failed to load parsed data zip: ${message}`);
     lastCompiledDocument = null;
-    runtimeTextElement.textContent = "";
+    hudFlushController.setRuntime("");
     setMetricPlaceholder(label);
   }
 }
@@ -801,32 +763,149 @@ function buildPdfPageCacheKey(options: VectorExtractOptions): string {
   return `merge:${mergeEnabled ? 1 : 0}|cull:${invisibleCullEnabled ? 1 : 0}`;
 }
 
-function getCachedPdfPageScenes(label: string, optionsKey: string): VectorScene[] | null {
-  if (!lastLoadedSource || lastLoadedSource.kind !== "pdf" || !parsedPdfPageCache) {
+function getCachedCompiledPdfDocument(label: string, optionsKey: string, source: PDFSource): CompiledPdfDocument | null {
+  if (!lastLoadedSource || lastLoadedSource.kind !== "pdf" || !parsedPdfCompiledCache) {
     return null;
   }
-  if (parsedPdfPageCache.sourceBytes !== lastLoadedSource.bytes) {
+  if (!sameLoadedSource(parsedPdfCompiledCache.sourceRef, source)) {
     return null;
   }
-  if (parsedPdfPageCache.sourceLabel !== label) {
+  if (parsedPdfCompiledCache.sourceLabel !== label) {
     return null;
   }
-  if (parsedPdfPageCache.optionsKey !== optionsKey) {
+  if (parsedPdfCompiledCache.optionsKey !== optionsKey) {
     return null;
   }
-  return parsedPdfPageCache.pageScenes;
+  return parsedPdfCompiledCache.document;
 }
 
-function storeCachedPdfPageScenes(label: string, optionsKey: string, pageScenes: VectorScene[]): void {
+function storeCachedCompiledPdfDocument(
+  label: string,
+  optionsKey: string,
+  source: PDFSource,
+  document: CompiledPdfDocument
+): void {
   if (!lastLoadedSource || lastLoadedSource.kind !== "pdf") {
     return;
   }
-  parsedPdfPageCache = {
-    sourceBytes: lastLoadedSource.bytes,
+  parsedPdfCompiledCache = {
+    sourceRef: source,
     sourceLabel: label,
     optionsKey,
-    pageScenes
+    document
   };
+}
+
+function sameLoadedSource(a: PDFSource, b: PDFSource): boolean {
+  if (typeof a === "string" && typeof b === "string") {
+    return a === b;
+  }
+  return a === b;
+}
+
+async function loadCompiledDocumentWithWorkerFallback(
+  source: PDFSource,
+  options: {
+    maxPages?: number;
+    extraction?: {
+      enableSegmentMerge?: boolean;
+      enableInvisibleCull?: boolean;
+    };
+    progress?: LoadProgressReporter;
+  }
+): Promise<CompiledPdfDocument> {
+  try {
+    return await loadCompiledDocumentInWorker(source, {
+      ...options,
+      progress: options.progress?.child(0, 1, { executionPath: "worker" }),
+      worker: {
+        create: () => new Worker(new URL("./worker/compiledDocumentLoadWorker.ts", import.meta.url), { type: "module" })
+      }
+    });
+  } catch {
+    return loadCompiledDocumentFromSource(source, {
+      ...options,
+      progress: options.progress?.child(0, 1, { executionPath: "main-thread-fallback" })
+    });
+  }
+}
+
+async function renderCompiledDocument(
+  compiledDocument: CompiledPdfDocument,
+  label: string,
+  options: {
+    activeLoadToken: number;
+    preserveView?: boolean;
+    parseMs: number;
+    progress: LoadProgressReporter;
+    sourceLabelSuffix: string | null;
+  }
+): Promise<void> {
+  const composeStart = performance.now();
+  const pagesPerRow = uiControlManager.readMaxPagesPerRowInput();
+  const composeProgress = options.progress.child(0.97, 0.985, { stage: "compile" });
+  composeProgress.report(0, { stage: "compile", unit: "pages", processed: 0, total: compiledDocument.pageCount });
+  const scene = compiledDocumentToVectorScene(compiledDocument, pagesPerRow);
+  composeProgress.complete({
+    stage: "compile",
+    unit: "pages",
+    processed: compiledDocument.pageCount,
+    total: compiledDocument.pageCount
+  });
+  const parseMs = options.parseMs + (performance.now() - composeStart);
+
+  if (options.activeLoadToken !== loadToken) {
+    return;
+  }
+
+  const rasterLayerCount = listSceneRasterLayers(scene).length;
+  const hasRasterLayer = rasterLayerCount > 0;
+  if (scene.segmentCount === 0 && scene.textInstanceCount === 0 && scene.fillPathCount === 0 && !hasRasterLayer) {
+    finishLoaderProgress(options.activeLoadToken, false);
+    finishLoadProgressDebug(options.activeLoadToken, false, "No visible geometry was found.");
+    setStatus(`No visible geometry was found in ${label}.`);
+    hudFlushController.setRuntime("");
+    setMetricPlaceholder(label);
+    setDownloadDataButtonState(false);
+    return;
+  }
+
+  setStatus(
+    `Uploading ${scene.segmentCount.toLocaleString()} segments, ${scene.textInstanceCount.toLocaleString()} text instances${hasRasterLayer ? `, ${rasterLayerCount.toLocaleString()} raster layer${rasterLayerCount === 1 ? "" : "s"}` : ""} to GPU...`
+  );
+  const uploadStart = performance.now();
+  const uploadProgress = options.progress.child(0.985, 0.998, { stage: "upload" });
+  uploadProgress.report(0, { stage: "upload" });
+  const sceneStats = renderer.setScene(scene);
+  uploadProgress.complete({ stage: "upload" });
+  if (!options.preserveView) {
+    renderer.fitToBounds(scene.bounds, 64);
+  }
+  const uploadEnd = performance.now();
+
+  if (options.activeLoadToken !== loadToken) {
+    return;
+  }
+
+  logSegmentMergeStats(label, scene);
+  logInvisibleCullStats(label, scene);
+  logTextVectorStats(label, scene);
+  logTextureSizeStats(label, scene, sceneStats);
+
+  lastParsedScene = scene;
+  lastParsedSceneStats = sceneStats;
+  lastParsedSceneLabel = label;
+  lastCompiledDocument = compiledDocument;
+  refreshDropIndicator();
+  setDownloadDataButtonState(true);
+
+  updateMetricsPanel(label, scene, sceneStats, parseMs, uploadEnd - uploadStart);
+  baseStatus = options.sourceLabelSuffix
+    ? `${formatSceneStatus(label, scene)} | source: ${options.sourceLabelSuffix}`
+    : formatSceneStatus(label, scene);
+  hudFlushController.setStatus(baseStatus);
+  options.progress.complete({ stage: "complete" });
+  finishLoaderProgress(options.activeLoadToken, true);
 }
 
 function formatRasterLayerSummary(scene: VectorScene): string {
@@ -862,11 +941,39 @@ function formatSceneStatus(
 
 function setStatus(message: string): void {
   baseStatus = message;
-  statusTextElement.textContent = baseStatus;
+  hudFlushController.setStatus(baseStatus);
 }
 
-function setParsingLoader(isVisible: boolean): void {
-  parsingLoaderElement.hidden = !isVisible;
+function beginLoaderProgress(token: number): void {
+  loaderProgressUiToken = token;
+  hudFlushController.setLoader(true, "Parsing / loading 0.00%");
+}
+
+function updateLoaderProgress(token: number, progress: PDFLoadProgress): void {
+  if (token !== loadToken || token !== loaderProgressUiToken) {
+    return;
+  }
+  loadProgressDebugTracker.update(token, progress);
+  const stageLabel = formatLoadProgressStage(progress.stage);
+  const executionPathLabel = progress.executionPath ? ` [${progress.executionPath}]` : "";
+  const clampedValue = clamp(progress.value, 0, 1);
+  hudFlushController.setLoader(true, `${stageLabel}${executionPathLabel} ${(clampedValue * 100).toFixed(2)}%`);
+}
+
+function finishLoaderProgress(token: number, shouldHide: boolean): void {
+  if (token !== loaderProgressUiToken) {
+    return;
+  }
+  hudFlushController.setLoader(false);
+}
+
+function beginLoadProgressDebug(token: number, label: string): void {
+  hudFlushController.clearDebug();
+  loadProgressDebugTracker.begin(token, label);
+}
+
+function finishLoadProgressDebug(token: number, successful: boolean, error?: string): void {
+  loadProgressDebugTracker.finish(token, successful, error);
 }
 
 function setDownloadDataButtonState(hasParsedData: boolean, isBusy = false): void {
@@ -918,19 +1025,12 @@ async function downloadAllExampleParsedZips(): Promise<void> {
       const step = index + 1;
       setDownloadAllDataButtonState(true, true, `Exporting ${step}/${pdfEntries.length}...`);
       setStatus(`Batch ${step}/${pdfEntries.length}: loading ${entry.name}...`);
-      const response = await fetch(entry.pdfPath, { cache: "no-store" });
-      if (!response.ok) {
-        throw new Error(`${entry.name} (HTTP ${response.status})`);
-      }
-
-      const fileBuffer = await response.arrayBuffer();
-      const bytes = cloneSourceBytes(fileBuffer);
-      lastLoadedSource = { kind: "pdf", bytes, label: entry.name };
-      parsedPdfPageCache = null;
+      lastLoadedSource = { kind: "pdf", source: entry.pdfPath, label: entry.name };
+      parsedPdfCompiledCache = null;
       lastCompiledDocument = null;
       lastParsedSceneLabel = null;
 
-      await loadPdfBuffer(createParseBuffer(bytes), entry.name, { preserveView: false, autoMaxPagesPerRow: true });
+      await loadPdfSource(entry.pdfPath, entry.name, { preserveView: false, autoMaxPagesPerRow: true });
       if (!lastCompiledDocument || lastParsedSceneLabel !== entry.name) {
         throw new Error(`${entry.name}: parsed data not available after load`);
       }
@@ -959,10 +1059,10 @@ async function downloadParsedDataZip(): Promise<void> {
   }
 
   const label = lastParsedSceneLabel;
-  const previousStatusText = statusTextElement.textContent;
+  const previousStatusText = hudFlushController.getStatus();
 
   setDownloadDataButtonState(true, true);
-  statusTextElement.textContent = "Preparing parsed ZIP (v4)...";
+  hudFlushController.setStatus("Preparing parsed ZIP (v4)...");
 
   try {
     const selectedZip = await buildParsedDataZipV4Blob(lastCompiledDocument, {
@@ -980,7 +1080,7 @@ async function downloadParsedDataZip(): Promise<void> {
     console.log(
       `[Parsed data export] ${label}: wrote v4 ZIP (${selectedZip.textureCount.toLocaleString()} textures, ${selectedZip.rasterLayerCount.toLocaleString()} raster layers) to ${zipFileName} (${formatKilobytes(selectedZip.byteLength)} kB, compression=${EXPORT_ZIP_COMPRESSION.toLowerCase()})`
     );
-    statusTextElement.textContent = previousStatusText || baseStatus;
+    hudFlushController.setStatus(previousStatusText || baseStatus);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     setStatus(`Failed to download parsed data: ${message}`);
@@ -1021,10 +1121,10 @@ function setMetricPlaceholder(label: string = "-"): void {
   metricReductionsTextElement.textContent = "-";
   metricCullDiscardsTextElement.textContent = "-";
   metricTimesTextElement.textContent = "-";
-  metricFpsTextElement.textContent = "-";
   metricTextureTextElement.textContent = "-";
   metricGridMaxCellTextElement.textContent = "-";
   metricsPanelElement.dataset.ready = "false";
+  hudFlushController.setFps("-");
 }
 
 function updateMetricsPanel(
@@ -1092,7 +1192,7 @@ function updateFpsMetric(): void {
     if (deltaMs > 0) {
       const fpsNow = 1000 / deltaMs;
       fpsSmoothed = fpsSmoothed === 0 ? fpsNow : fpsSmoothed * 0.85 + fpsNow * 0.15;
-      metricFpsTextElement.textContent = `${fpsSmoothed.toFixed(0)} FPS`;
+      hudFlushController.setFps(`${fpsSmoothed.toFixed(0)} FPS`);
     }
   }
   fpsLastSampleTime = now;
@@ -1169,14 +1269,6 @@ function logTextVectorStats(label: string, scene: VectorScene): void {
   console.log(
     `[Text vectors] ${label}: instances=${scene.textInstanceCount.toLocaleString()}, sourceText=${scene.sourceTextCount.toLocaleString()}, glyphs=${scene.textGlyphCount.toLocaleString()}, glyphSegments=${scene.textGlyphSegmentCount.toLocaleString()}, inPage=${scene.textInPageCount.toLocaleString()}, outOfPage=${scene.textOutOfPageCount.toLocaleString()}, fillPaths=${scene.fillPathCount.toLocaleString()}, fillSegments=${scene.fillSegmentCount.toLocaleString()}`
   );
-}
-
-function cloneSourceBytes(buffer: ArrayBuffer): Uint8Array {
-  return new Uint8Array(buffer).slice();
-}
-
-function createParseBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.slice().buffer;
 }
 
 function delayMilliseconds(ms: number): Promise<void> {

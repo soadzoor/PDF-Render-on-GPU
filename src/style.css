@@ -226,10 +226,16 @@ button:disabled {
 }
 
 .parse-loader {
-  margin-top: 6px;
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(15, 23, 42, 0.16);
+  background: rgba(255, 255, 255, 0.82);
   color: #0f172a;
   font-size: 0.84rem;
 }
@@ -262,6 +268,35 @@ button:disabled {
   border-radius: 8px;
   padding: 8px 10px;
   background: rgba(255, 255, 255, 0.72);
+}
+
+.load-debug {
+  margin-top: 8px;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(248, 250, 252, 0.92);
+}
+
+.load-debug[hidden] {
+  display: none !important;
+}
+
+.load-debug summary {
+  cursor: pointer;
+  color: #475569;
+  font-size: 0.8rem;
+}
+
+.load-debug-log {
+  margin: 8px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: #0f172a;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  font-family: "IBM Plex Mono", "Cascadia Mono", monospace;
 }
 
 .metric-row {

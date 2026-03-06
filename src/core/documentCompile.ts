@@ -1,4 +1,5 @@
 import type { VectorScene } from "../pdfVectorExtractor";
+import type { LoadProgressReporter } from "./loadProgress";
 import type {
   CompiledDocumentStats,
   CompiledPdfDocument,
@@ -6,9 +7,13 @@ import type {
   CompiledRasterLayer
 } from "./types";
 
-export function compilePdfPageScenes(pageScenes: VectorScene[]): CompiledPdfDocument {
+export function compilePdfPageScenes(
+  pageScenes: VectorScene[],
+  progress?: LoadProgressReporter
+): CompiledPdfDocument {
+  progress?.report(0, { stage: "compile", unit: "pages", processed: 0, total: pageScenes.length });
   if (pageScenes.length === 0) {
-    return {
+    const empty: CompiledPdfDocument = {
       pageCount: 0,
       pages: [],
       maxSegmentCountPerPage: 0,
@@ -40,6 +45,8 @@ export function compilePdfPageScenes(pageScenes: VectorScene[]): CompiledPdfDocu
       rasterLayers: [],
       stats: createEmptyCompiledDocumentStats()
     };
+    progress?.complete({ stage: "compile", unit: "pages", processed: 0, total: 0 });
+    return empty;
   }
 
   let totalOperatorCount = 0;
@@ -106,6 +113,13 @@ export function compilePdfPageScenes(pageScenes: VectorScene[]): CompiledPdfDocu
         matrix: layer.matrix
       });
     }
+
+    progress?.report((pageIndex + 1) / Math.max(1, pageScenes.length) * 0.25, {
+      stage: "compile",
+      unit: "pages",
+      processed: pageIndex + 1,
+      total: pageScenes.length
+    });
   }
 
   const endpoints = new Float32Array(totalSegmentCount * 4);
@@ -231,9 +245,16 @@ export function compilePdfPageScenes(pageScenes: VectorScene[]): CompiledPdfDocu
     textGlyphOffset += scene.textGlyphCount;
     textGlyphSegmentOffset += scene.textGlyphSegmentCount;
     rasterLayerOffset += pageRasterLayers.length;
+
+    progress?.report(0.25 + ((pageIndex + 1) / Math.max(1, pageScenes.length)) * 0.75, {
+      stage: "compile",
+      unit: "pages",
+      processed: pageIndex + 1,
+      total: pageScenes.length
+    });
   }
 
-  return {
+  const compiled: CompiledPdfDocument = {
     pageCount: pageScenes.length,
     pages,
     maxSegmentCountPerPage,
@@ -278,6 +299,9 @@ export function compilePdfPageScenes(pageScenes: VectorScene[]): CompiledPdfDocu
       maxCellPopulation
     }
   };
+
+  progress?.complete({ stage: "compile", unit: "pages", processed: pageScenes.length, total: pageScenes.length });
+  return compiled;
 }
 
 function resolveScenePrimaryPageRect(scene: VectorScene): [number, number, number, number] {

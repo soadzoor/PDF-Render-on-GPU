@@ -7,6 +7,9 @@ const repoRootDir = path.dirname(fileURLToPath(import.meta.url));
 export default defineConfig(({ mode }) => {
   if (mode === "three-lib") {
     return {
+      worker: {
+        format: "es"
+      },
       build: {
         outDir: "dist/three",
         emptyOutDir: true,
@@ -26,6 +29,9 @@ export default defineConfig(({ mode }) => {
   return {
     // Use relative asset URLs so builds work when hosted from a repo subpath on GitHub Pages.
     base: "./",
+    worker: {
+      format: "es"
+    },
     build: {
       rollupOptions: {
         input: {

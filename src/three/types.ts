@@ -1,7 +1,9 @@
 import type * as THREE from "three";
+import type { PDFLoadProgress } from "../core/loadProgress";
 import type { PDFSource } from "../core/pdfSource";
 
 export type { PDFSource };
+export type { PDFLoadProgress };
 
 export interface LoadPDFObjectOptions {
   maxPages?: number;
@@ -10,6 +12,7 @@ export interface LoadPDFObjectOptions {
     enableInvisibleCull?: boolean;
   };
   worker?: "auto" | false | { url?: string; instance?: Worker };
+  onProgress?: (progress: PDFLoadProgress) => void;
   page?: {
     worldUnitsPerPoint?: number;
     side?: THREE.Side;
