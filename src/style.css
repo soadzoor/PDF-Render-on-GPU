@@ -33,6 +33,7 @@ body {
   position: fixed;
   left: 16px;
   top: 16px;
+  z-index: 20;
   width: min(560px, calc(100vw - 32px));
   max-height: calc(100vh - 32px);
   max-height: calc(100dvh - 32px);
@@ -338,6 +339,7 @@ button:disabled {
   position: fixed;
   top: 50%;
   left: 50%;
+  z-index: 10;
   width: min(420px, calc(100vw - 48px));
   min-height: 88px;
   display: none;
