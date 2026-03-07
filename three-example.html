@@ -47,6 +47,26 @@
         backdrop-filter: blur(4px);
       }
 
+      .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .panel-content {
+        margin-top: 10px;
+      }
+
+      #hud.collapsed {
+        width: auto;
+        max-width: calc(100vw - 32px);
+      }
+
+      #hud.collapsed .panel-content {
+        display: none;
+      }
+
       .toolbar {
         display: flex;
         gap: 8px;
@@ -75,8 +95,28 @@
         border-color: #9aa6bb;
       }
 
+      .chevron-button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        min-width: 30px;
+        height: 30px;
+        min-height: 30px;
+        padding: 0;
+        border: 1px solid rgba(15, 23, 42, 0.45);
+        background: rgba(15, 23, 42, 0.08);
+        color: #0f172a;
+        font-size: 0.95rem;
+        line-height: 1;
+      }
+
+      .chevron-button:hover {
+        border-color: rgba(15, 23, 42, 0.55);
+        background: rgba(15, 23, 42, 0.16);
+      }
+
       .rows {
-        margin-top: 10px;
         display: grid;
         gap: 8px;
       }
@@ -254,7 +294,7 @@
         }
       }
     </style>
-    <script type="module" crossorigin src="./assets/threeExample-z14LMZog.js"></script>
+    <script type="module" crossorigin src="./assets/threeExample-DPOXk-RM.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/client-GTiz-NFi.js">
     <link rel="modulepreload" crossorigin href="./assets/pdf-TYrZqVzP.js">
   </head>
@@ -262,14 +302,32 @@
     <div id="app">
       <canvas id="viewport"></canvas>
       <div id="hud">
-        <div class="toolbar">
-          <button id="open-file" type="button">Open PDF / ZIP</button>
-          <select id="example-select" aria-label="Load example PDF or parsed ZIP" disabled>
-            <option value="">Examples (loading...)</option>
-          </select>
-          <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" hidden />
+        <div class="panel-header">
+          <div class="toolbar">
+            <button id="open-file" type="button">Open PDF / ZIP</button>
+            <select id="example-select" aria-label="Load example PDF or parsed ZIP" disabled>
+              <option value="">Examples (loading...)</option>
+            </select>
+            <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" hidden />
+          </div>
+          <button id="toggle-hud" class="chevron-button" type="button" aria-expanded="true" aria-controls="hud-content" title="Collapse panel">
+            <span id="toggle-hud-icon" aria-hidden="true">▾</span>
+          </button>
         </div>
-        <div class="rows">
+        <div id="hud-content" class="panel-content">
+          <div class="rows">
+          <label class="toggle">
+            <input id="toggle-pan-optimization" type="checkbox" checked />
+            <span>Pan optimization</span>
+          </label>
+          <label class="toggle">
+            <input id="toggle-segment-merge" type="checkbox" checked />
+            <span>Segment merge</span>
+          </label>
+          <label class="toggle">
+            <input id="toggle-invisible-cull" type="checkbox" checked />
+            <span>Invisible cull</span>
+          </label>
           <label class="toggle">
             <input id="toggle-stroke-curves" type="checkbox" checked />
             <span>Curve strokes</span>
@@ -278,6 +336,15 @@
             <input id="toggle-vector-text-only" type="checkbox" />
             <span>Vector only</span>
           </label>
+          <div class="color-row">
+            <label for="page-mode">Page mode</label>
+            <div class="color-controls">
+              <select id="page-mode" aria-label="Page render mode">
+                <option value="pages">Individual pages</option>
+                <option value="instanced">Instanced mesh</option>
+              </select>
+            </div>
+          </div>
           <div class="color-row">
             <label for="page-bg-color">Page Background</label>
             <div class="color-controls">
@@ -294,31 +361,32 @@
               <span id="vector-opacity-value">0%</span>
             </div>
           </div>
+          </div>
+          <div id="status">Waiting for PDF or parsed ZIP...</div>
+          <div id="parse-loader" hidden>
+            <span class="loader-spinner" aria-hidden="true"></span>
+            <span id="parse-loader-text"></span>
+          </div>
+          <div id="runtime"></div>
+          <div id="metrics">
+            <div class="metric-row"><span class="metric-label">File</span><span id="metric-file" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">Operators</span><span id="metric-operators" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">Source Segments</span><span id="metric-source-segments" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">Merged Segments</span><span id="metric-merged-segments" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">Visible Segments</span><span id="metric-visible-segments" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">Reductions</span><span id="metric-reductions" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">Cull Discards</span><span id="metric-cull-discards" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">Parse / Upload</span><span id="metric-times" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">FPS</span><span id="metric-fps" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
+            <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
+          </div>
+          <details id="load-debug" hidden>
+            <summary>Load Debug</summary>
+            <pre id="load-debug-log"></pre>
+          </details>
+          <div id="help">Drag to pan, mouse wheel or pinch to zoom, or drag-and-drop a PDF or parsed ZIP.</div>
         </div>
-        <div id="status">Waiting for PDF or parsed ZIP...</div>
-        <div id="parse-loader" hidden>
-          <span class="loader-spinner" aria-hidden="true"></span>
-          <span id="parse-loader-text"></span>
-        </div>
-        <div id="runtime"></div>
-        <div id="metrics">
-          <div class="metric-row"><span class="metric-label">File</span><span id="metric-file" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Operators</span><span id="metric-operators" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Source Segments</span><span id="metric-source-segments" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Merged Segments</span><span id="metric-merged-segments" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Visible Segments</span><span id="metric-visible-segments" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Reductions</span><span id="metric-reductions" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Cull Discards</span><span id="metric-cull-discards" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Parse / Upload</span><span id="metric-times" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">FPS</span><span id="metric-fps" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
-          <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
-        </div>
-        <details id="load-debug" hidden>
-          <summary>Load Debug</summary>
-          <pre id="load-debug-log"></pre>
-        </details>
-        <div id="help">Drag to pan, mouse wheel or pinch to zoom, or drag-and-drop a PDF or parsed ZIP.</div>
       </div>
       <div id="drop-indicator" class="active">Drop PDF or parsed ZIP to render</div>
     </div>
