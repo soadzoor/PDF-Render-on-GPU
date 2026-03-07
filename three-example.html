@@ -40,6 +40,11 @@
         top: 16px;
         left: 16px;
         width: min(420px, calc(100vw - 32px));
+        max-height: calc(100vh - 32px);
+        max-height: calc(100dvh - 32px);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
         background: rgba(255, 255, 255, 0.94);
         border: 1px solid rgba(12, 19, 32, 0.16);
         border-radius: 12px;
@@ -56,6 +61,8 @@
 
       .panel-content {
         margin-top: 10px;
+        min-height: 0;
+        overflow-y: auto;
       }
 
       #hud.collapsed {
@@ -265,15 +272,24 @@
 
       #drop-indicator {
         position: absolute;
-        inset: 0;
         display: none;
         align-items: center;
         justify-content: center;
-        background: rgba(16, 47, 96, 0.18);
+        top: 50%;
+        left: 50%;
+        width: min(420px, calc(100vw - 48px));
+        min-height: 88px;
+        padding: 18px 24px;
+        transform: translate(-50%, -50%);
+        border: 1px solid rgba(11, 45, 99, 0.18);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.82);
+        box-shadow: 0 18px 42px rgba(15, 23, 42, 0.12);
         color: #0b2d63;
         font-size: 22px;
         font-weight: 600;
         letter-spacing: 0.2px;
+        text-align: center;
         pointer-events: none;
       }
 
@@ -284,6 +300,8 @@
       @media (max-width: 640px) {
         #hud {
           width: calc(100vw - 24px);
+          max-height: calc(100vh - 24px);
+          max-height: calc(100dvh - 24px);
           left: 12px;
           top: 12px;
           padding: 10px;
@@ -294,7 +312,7 @@
         }
       }
     </style>
-    <script type="module" crossorigin src="./assets/threeExample-DPOXk-RM.js"></script>
+    <script type="module" crossorigin src="./assets/threeExample-0kIUdGJl.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/client-GTiz-NFi.js">
     <link rel="modulepreload" crossorigin href="./assets/pdf-TYrZqVzP.js">
   </head>
