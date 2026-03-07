@@ -28,6 +28,7 @@ export class PanCacheController {
   private readonly owner: Object3D;
   private readonly fallbackTexture: Texture;
   private readonly materialSets = new Set<PdfMaterialSet>();
+  private enabled = true;
 
   private cacheTarget: WebGLRenderTarget | null = null;
   private cacheValid = false;
@@ -60,9 +61,10 @@ export class PanCacheController {
   private readonly tmpDelta = new Vector3();
   private readonly tmpClearColor = new Color();
 
-  constructor(owner: Object3D, fallbackTexture: Texture) {
+  constructor(owner: Object3D, fallbackTexture: Texture, enabled = true) {
     this.owner = owner;
     this.fallbackTexture = fallbackTexture;
+    this.enabled = enabled;
   }
 
   registerMaterialSet(materialSet: PdfMaterialSet): void {
@@ -83,6 +85,19 @@ export class PanCacheController {
     this.cacheValid = false;
   }
 
+  setEnabled(enabled: boolean): void {
+    if (this.enabled === enabled) {
+      return;
+    }
+
+    this.enabled = enabled;
+    this.invalidate();
+    this.lastHandledFrame = -1;
+    if (!enabled) {
+      this.disablePanCache();
+    }
+  }
+
   onBeforeRender(renderer: WebGLRenderer, scene: Object3D, camera: Camera): void {
     if (this.isRefreshingCache || scene === this.owner) {
       return;
@@ -94,6 +109,13 @@ export class PanCacheController {
     }
 
     renderer.getDrawingBufferSize(this.tmpViewport);
+
+    if (!this.enabled) {
+      this.disablePanCache();
+      this.recordCameraState(camera, this.tmpViewport);
+      this.lastHandledFrame = renderer.info.render.frame;
+      return;
+    }
 
     const orthographicCamera = camera as OrthographicCamera;
     if (orthographicCamera.isOrthographicCamera !== true) {
@@ -330,15 +352,20 @@ function matricesApproxEqual(a: Matrix4, b: Matrix4, epsilon: number): boolean {
 }
 
 function computeTransformHash(root: Object3D): number {
-  let hash = 2166136261;
+  let hash = hashObjectState(2166136261, root);
   for (const child of root.children) {
-    hash = hashMatrixElements(hash, child.matrixWorld.elements);
-    const maybeInstanced = child as { instanceMatrix?: { version?: number } };
-    if (maybeInstanced.instanceMatrix) {
-      hash = mixHash(hash, maybeInstanced.instanceMatrix.version ?? 0);
-    }
+    hash = hashObjectState(hash, child);
   }
   return hash >>> 0;
+}
+
+function hashObjectState(seed: number, object: Object3D): number {
+  let hash = hashMatrixElements(seed, object.matrixWorld.elements);
+  const maybeInstanced = object as { instanceMatrix?: { version?: number } };
+  if (maybeInstanced.instanceMatrix) {
+    hash = mixHash(hash, maybeInstanced.instanceMatrix.version ?? 0);
+  }
+  return hash;
 }
 
 function hashMatrixElements(seed: number, elements: ArrayLike<number>): number {

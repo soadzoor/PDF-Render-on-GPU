@@ -268,6 +268,18 @@
         </div>
         <div class="rows">
           <label class="toggle">
+            <input id="toggle-pan-optimization" type="checkbox" checked />
+            <span>Pan optimization</span>
+          </label>
+          <label class="toggle">
+            <input id="toggle-segment-merge" type="checkbox" checked />
+            <span>Segment merge</span>
+          </label>
+          <label class="toggle">
+            <input id="toggle-invisible-cull" type="checkbox" checked />
+            <span>Invisible cull</span>
+          </label>
+          <label class="toggle">
             <input id="toggle-stroke-curves" type="checkbox" checked />
             <span>Curve strokes</span>
           </label>
@@ -275,6 +287,15 @@
             <input id="toggle-vector-text-only" type="checkbox" />
             <span>Vector only</span>
           </label>
+          <div class="color-row">
+            <label for="page-mode">Page mode</label>
+            <div class="color-controls">
+              <select id="page-mode" aria-label="Page render mode">
+                <option value="pages">Individual pages</option>
+                <option value="instanced">Instanced mesh</option>
+              </select>
+            </div>
+          </div>
           <div class="color-row">
             <label for="page-bg-color">Page Background</label>
             <div class="color-controls">
@@ -353,8 +374,12 @@
       const loadDebugElement = document.querySelector("#load-debug");
       const loadDebugLogElement = document.querySelector("#load-debug-log");
       const dropIndicator = document.querySelector("#drop-indicator");
+      const panOptimizationToggle = document.querySelector("#toggle-pan-optimization");
+      const segmentMergeToggle = document.querySelector("#toggle-segment-merge");
+      const invisibleCullToggle = document.querySelector("#toggle-invisible-cull");
       const strokeCurveToggle = document.querySelector("#toggle-stroke-curves");
       const vectorOnlyToggle = document.querySelector("#toggle-vector-text-only");
+      const pageModeSelect = document.querySelector("#page-mode");
       const pageBgColorInput = document.querySelector("#page-bg-color");
       const pageBgOpacityInput = document.querySelector("#page-bg-opacity");
       const pageBgOpacityValue = document.querySelector("#page-bg-opacity-value");
@@ -386,8 +411,12 @@
         !loadDebugElement ||
         !loadDebugLogElement ||
         !dropIndicator ||
+        !panOptimizationToggle ||
+        !segmentMergeToggle ||
+        !invisibleCullToggle ||
         !strokeCurveToggle ||
         !vectorOnlyToggle ||
+        !pageModeSelect ||
         !pageBgColorInput ||
         !pageBgOpacityInput ||
         !pageBgOpacityValue ||
@@ -460,8 +489,6 @@
         minDelta: 0.03,
         minIntervalMs: 2000
       });
-
-      const WORLD_UNITS_PER_POINT = 0.01;
 
       function setStatus(message) {
         hudController.setStatus(message);
@@ -614,7 +641,6 @@
 
         return {
           strokeCurveEnabled: strokeCurveToggle.checked,
-          textVectorOnly: vectorOnlyToggle.checked,
           pageBackgroundColor: pageBgColorInput.value,
           pageBackgroundOpacity: bgOpacity,
           vectorColorOverride: vectorOpacity > 0 ? vectorColorInput.value : null,
@@ -629,7 +655,11 @@
           return;
         }
 
-        pdfObject.setMaterialOptions(readMaterialOptions());
+        pdfObject.setPanOptimizationEnabled(panOptimizationToggle.checked);
+        pdfObject.setMaterialOptions({
+          ...readMaterialOptions(),
+          textVectorOnly: vectorOnlyToggle.checked
+        });
       }
 
       function refreshDropIndicator() {
@@ -642,7 +672,7 @@
           return;
         }
 
-        rootGroup.remove(pdfObject);
+        rootGroup.remove(pdfObject.object3d);
         pdfObject.dispose();
         pdfObject = null;
         hudController.setRuntime("");
@@ -659,8 +689,8 @@
         let maxHeight = 0;
 
         for (const page of pageMeshes) {
-          maxWidth = Math.max(maxWidth, page.pageWidthPt * WORLD_UNITS_PER_POINT);
-          maxHeight = Math.max(maxHeight, page.pageHeightPt * WORLD_UNITS_PER_POINT);
+          maxWidth = Math.max(maxWidth, page.pageWidth);
+          maxHeight = Math.max(maxHeight, page.pageHeight);
         }
 
         const gap = Math.max(0.2, Math.min(maxWidth, maxHeight) * 0.08);
@@ -750,12 +780,16 @@
         try {
           const loadStart = performance.now();
           const next = await LoadPDFObject(source, {
+            segmentMerge: segmentMergeToggle.checked,
+            invisibleCull: invisibleCullToggle.checked,
+            panOptimization: panOptimizationToggle.checked,
+            vectorOnly: vectorOnlyToggle.checked,
+            pageMode: pageModeSelect.value === "instanced" ? "instanced" : "pages",
             worker: "auto",
             onProgress: (progress) => {
               updateLoaderProgress(loadToken, progress);
             },
             page: {
-              worldUnitsPerPoint: WORLD_UNITS_PER_POINT,
               depthWrite: false,
               side: THREE.DoubleSide
             },
@@ -763,8 +797,8 @@
           });
 
           pdfObject = next;
-          layoutPages(pdfObject.pages);
-          rootGroup.add(pdfObject);
+          layoutPages(pdfObject.pageTransforms);
+          rootGroup.add(pdfObject.object3d);
           fitCameraToObject(pdfObject);
           refreshDropIndicator();
           const loadMs = performance.now() - loadStart;
@@ -993,6 +1027,7 @@
 
       window.addEventListener("resize", resizeRenderer);
 
+      panOptimizationToggle.addEventListener("change", applyMaterialOptions);
       strokeCurveToggle.addEventListener("change", applyMaterialOptions);
       vectorOnlyToggle.addEventListener("change", applyMaterialOptions);
       pageBgColorInput.addEventListener("input", applyMaterialOptions);

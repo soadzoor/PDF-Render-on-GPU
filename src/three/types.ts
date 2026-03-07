@@ -4,9 +4,15 @@ import type { PDFSource } from "../core/pdfSource";
 
 export type { PDFSource };
 export type { PDFLoadProgress };
+export type PDFPageMode = "pages" | "instanced";
 
 export interface LoadPDFObjectOptions {
   maxPages?: number;
+  segmentMerge?: boolean;
+  invisibleCull?: boolean;
+  panOptimization?: boolean;
+  vectorOnly?: boolean;
+  pageMode?: PDFPageMode;
   extraction?: {
     enableSegmentMerge?: boolean;
     enableInvisibleCull?: boolean;
@@ -14,7 +20,6 @@ export interface LoadPDFObjectOptions {
   worker?: "auto" | false | { url?: string; instance?: Worker };
   onProgress?: (progress: PDFLoadProgress) => void;
   page?: {
-    worldUnitsPerPoint?: number;
     side?: THREE.Side;
     depthWrite?: boolean;
   };
@@ -29,7 +34,6 @@ export interface LoadPDFObjectOptions {
 }
 
 export interface ResolvedPageOptions {
-  worldUnitsPerPoint: number;
   side: THREE.Side;
   depthWrite: boolean;
 }
@@ -49,6 +53,8 @@ export interface ResolvedLoadOptions {
     enableSegmentMerge?: boolean;
     enableInvisibleCull?: boolean;
   };
+  panOptimization: boolean;
+  pageMode: PDFPageMode;
   worker: "auto" | false | { url?: string; instance?: Worker };
   page: ResolvedPageOptions;
   material: ResolvedMaterialOptions;

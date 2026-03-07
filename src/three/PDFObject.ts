@@ -1,8 +1,9 @@
-import { Box3, Group, Vector3, type BufferGeometry } from "three";
+import { Box3, Group, Matrix4, Vector3, type BufferGeometry, type Object3D } from "three";
 
 import type { CompiledPdfDocument } from "../core/types";
 import type {
   LoadPDFObjectOptions,
+  PDFPageMode,
   PDFDocumentMetrics,
   PDFLoadTimingMetrics,
   PDFTextureMetrics,
@@ -12,11 +13,16 @@ import { createPdfMaterialSet, type PdfMaterialSet } from "./materials/createPdf
 import type { SharedGpuData } from "./gpu/sharedGpuData";
 import { PDFPageInstancedMesh } from "./PDFPageInstancedMesh";
 import { PDFPageMesh } from "./PDFPageMesh";
+import { PDFPageTransform } from "./PDFPageTransform";
 import { PanCacheController } from "./PanCacheController";
 
-export class PDFObject extends Group {
+export class PDFObject {
+  readonly object3d: Object3D;
   readonly pages: PDFPageMesh[];
+  readonly pageTransforms: Array<PDFPageMesh | PDFPageTransform>;
   readonly pageCount: number;
+  readonly pageMode: PDFPageMode;
+  readonly instancedPages: PDFPageInstancedMesh | null;
   readonly documentMetrics: PDFDocumentMetrics;
   readonly textureMetrics: PDFTextureMetrics;
   readonly loadTiming: PDFLoadTimingMetrics;
@@ -24,7 +30,7 @@ export class PDFObject extends Group {
   private readonly document: CompiledPdfDocument;
   private readonly shared: SharedGpuData;
   private readonly options: ResolvedLoadOptions;
-  private readonly pageMaterialSet: PdfMaterialSet;
+  private readonly pageMaterialSet: PdfMaterialSet | null;
   private readonly panCacheController: PanCacheController;
   private readonly instancedMaterialSets = new Set<PdfMaterialSet>();
   private readonly instancedGeometries = new Set<BufferGeometry>();
@@ -35,92 +41,96 @@ export class PDFObject extends Group {
     options: ResolvedLoadOptions,
     loadTiming: PDFLoadTimingMetrics
   ) {
-    super();
     this.document = document;
     this.shared = shared;
     this.options = options;
     this.loadTiming = { ...loadTiming };
+    this.pageMode = options.pageMode;
+    this.pageCount = document.pageCount;
     this.documentMetrics = createDocumentMetrics(document);
     this.textureMetrics = createTextureMetrics(shared);
-    this.pageMaterialSet = createPdfMaterialSet(shared, options, "mesh");
-    this.panCacheController = new PanCacheController(this, shared.textAtlasTexture);
-    this.panCacheController.registerMaterialSet(this.pageMaterialSet);
 
-    this.pages = document.pages.map(
-      (pageInfo) =>
-        new PDFPageMesh(
-          pageInfo,
-          shared.geometry,
-          this.pageMaterialSet.all,
-          (renderer, scene, camera) => {
-            this.panCacheController.onBeforeRender(renderer, scene, camera);
-          }
-        )
-    );
-    this.pageCount = this.pages.length;
-    this.pages.forEach((page) => this.add(page));
+    if (this.pageMode === "instanced") {
+      this.pages = [];
+      this.pageTransforms = document.pages.map((pageInfo) => new PDFPageTransform(pageInfo));
+      this.pageMaterialSet = null;
+      this.instancedPages = this.createPrimaryInstancedPages();
+      this.object3d = this.instancedPages;
+      this.panCacheController = new PanCacheController(this.object3d, shared.textAtlasTexture, options.panOptimization);
+      for (const set of this.instancedMaterialSets) {
+        this.panCacheController.registerMaterialSet(set);
+      }
+    } else {
+      this.instancedPages = null;
+      this.pageMaterialSet = createPdfMaterialSet(shared, options, "mesh");
+      const pageMaterialSet = this.pageMaterialSet;
+      this.object3d = new Group();
+      this.panCacheController = new PanCacheController(this.object3d, shared.textAtlasTexture, options.panOptimization);
+      this.panCacheController.registerMaterialSet(pageMaterialSet);
+      this.pages = document.pages.map(
+        (pageInfo) =>
+          new PDFPageMesh(
+            pageInfo,
+            shared.geometry,
+            pageMaterialSet.all,
+            (renderer, scene, camera) => {
+              this.panCacheController.onBeforeRender(renderer, scene, camera);
+            }
+          )
+      );
+      this.pageTransforms = this.pages;
+      for (const page of this.pages) {
+        this.object3d.add(page);
+      }
+    }
   }
 
-  createInstancedPages(pageIndices?: number[]): PDFPageInstancedMesh {
-    const indices = pageIndices && pageIndices.length > 0
-      ? normalizePageIndexList(pageIndices, this.pageCount)
-      : this.pages.map((page) => page.pageIndex);
-
-    const geometry = this.shared.createInstancedGeometry(indices);
-    const materialSet = createPdfMaterialSet(this.shared, this.options, "instanced");
-    this.panCacheController.registerMaterialSet(materialSet);
-    this.instancedMaterialSets.add(materialSet);
-    this.instancedGeometries.add(geometry);
-
-    const sourcePages = indices.map((index) => this.pages[index]);
-    const instanced = new PDFPageInstancedMesh(
-      geometry,
-      materialSet.all,
-      indices,
-      sourcePages,
-      (renderer, scene, camera) => {
-        this.panCacheController.onBeforeRender(renderer, scene, camera);
-      }
-    );
-    this.add(instanced);
-    this.panCacheController.invalidate();
-    return instanced;
+  get renderObjects(): readonly (PDFPageMesh | PDFPageInstancedMesh)[] {
+    if (this.instancedPages) {
+      return [this.instancedPages];
+    }
+    return this.pages;
   }
 
   setMaterialOptions(options: Partial<NonNullable<LoadPDFObjectOptions["material"]>>): void {
-    this.pageMaterialSet.setMaterialOptions(options);
+    this.pageMaterialSet?.setMaterialOptions(options);
     for (const set of this.instancedMaterialSets) {
       set.setMaterialOptions(options);
     }
     this.panCacheController.invalidate();
   }
 
+  setPanOptimizationEnabled(enabled: boolean): void {
+    this.panCacheController.setEnabled(enabled);
+  }
+
   getWorldBounds(target = new Box3()): Box3 {
     target.makeEmpty();
 
-    const worldUnitsPerPoint = this.options.page.worldUnitsPerPoint;
-    if (!Number.isFinite(worldUnitsPerPoint) || worldUnitsPerPoint <= 0 || this.pages.length === 0) {
+    if (this.pageTransforms.length === 0) {
       return target;
     }
 
-    this.updateWorldMatrix(true, true);
-
-    for (const page of this.pages) {
-      const halfWidth = page.pageWidthPt * worldUnitsPerPoint * 0.5;
-      const halfHeight = page.pageHeightPt * worldUnitsPerPoint * 0.5;
-
-      for (const [x, y] of PAGE_LOCAL_CORNERS) {
-        BOUNDS_POINT.set(x * halfWidth, y * halfHeight, 0).applyMatrix4(page.matrixWorld);
-        target.expandByPoint(BOUNDS_POINT);
+    if (this.pageMode === "pages") {
+      for (const page of this.pages) {
+        page.updateWorldMatrix(true, false);
+        expandBoundsForPage(target, page.pageWidth, page.pageHeight, page.matrixWorld);
       }
+      return target;
     }
 
+    this.object3d.updateWorldMatrix(true, false);
+    for (const page of this.pageTransforms) {
+      page.updateMatrix();
+      BOUNDS_PAGE_MATRIX.multiplyMatrices(this.object3d.matrixWorld, page.matrix);
+      expandBoundsForPage(target, page.pageWidth, page.pageHeight, BOUNDS_PAGE_MATRIX);
+    }
     return target;
   }
 
   dispose(): void {
     this.panCacheController.dispose();
-    this.pageMaterialSet.dispose();
+    this.pageMaterialSet?.dispose();
 
     for (const set of this.instancedMaterialSets) {
       set.dispose();
@@ -134,9 +144,37 @@ export class PDFObject extends Group {
 
     this.shared.dispose();
 
-    for (const child of [...this.children]) {
-      this.remove(child);
+    if (this.object3d instanceof Group) {
+      for (const child of [...this.object3d.children]) {
+        this.object3d.remove(child);
+      }
     }
+  }
+
+  private createPrimaryInstancedPages(): PDFPageInstancedMesh {
+    const pageIndices = this.pageTransforms.map((page) => page.pageIndex);
+    return this.createInstancedPages(pageIndices);
+  }
+
+  private createInstancedPages(pageIndices?: number[]): PDFPageInstancedMesh {
+    const indices = pageIndices && pageIndices.length > 0
+      ? normalizePageIndexList(pageIndices, this.pageCount)
+      : this.pageTransforms.map((page) => page.pageIndex);
+
+    const geometry = this.shared.createInstancedGeometry(indices);
+    const materialSet = createPdfMaterialSet(this.shared, this.options, "instanced");
+    this.instancedMaterialSets.add(materialSet);
+    this.instancedGeometries.add(geometry);
+
+    return new PDFPageInstancedMesh(
+      geometry,
+      materialSet.all,
+      indices,
+      indices.map((index) => this.pageTransforms[index]),
+      (renderer, scene, camera) => {
+        this.panCacheController.onBeforeRender(renderer, scene, camera);
+      }
+    );
   }
 }
 
@@ -220,3 +258,14 @@ const PAGE_LOCAL_CORNERS = [
 ] as const;
 
 const BOUNDS_POINT = new Vector3();
+const BOUNDS_PAGE_MATRIX = new Matrix4();
+
+function expandBoundsForPage(target: Box3, pageWidth: number, pageHeight: number, matrixWorld: Matrix4): void {
+  const halfWidth = pageWidth * 0.5;
+  const halfHeight = pageHeight * 0.5;
+
+  for (const [x, y] of PAGE_LOCAL_CORNERS) {
+    BOUNDS_POINT.set(x * halfWidth, y * halfHeight, 0).applyMatrix4(matrixWorld);
+    target.expandByPoint(BOUNDS_POINT);
+  }
+}

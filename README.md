@@ -129,6 +129,36 @@ npm run preview
 npm run examples:generate
 ```
 
+## Three.js Package
+
+`hepr/three` exports `LoadPDFObject(source, options)` for loading the compiled PDF renderer into a three.js scene.
+
+```ts
+import { LoadPDFObject } from "hepr/three";
+
+const pdf = await LoadPDFObject(file, {
+  worker: "auto",
+  segmentMerge: true,
+  invisibleCull: true,
+  panOptimization: true,
+  vectorOnly: false,
+  pageMode: "instanced",
+  page: {
+    depthWrite: false
+  },
+  material: {
+    strokeCurveEnabled: true
+  }
+});
+
+scene.add(pdf.object3d);
+```
+
+Notes:
+- `PDFObject` is a non-renderable wrapper. Add `pdf.object3d` to the scene, not `pdf` itself.
+- PDF points are the default world units in `hepr/three`; scale `pdf.object3d` with normal three.js transforms if you want a different scene scale.
+- Use `pdf.pageTransforms` for page layout/editing. In pages mode, `pdf.pages` contains the actual `PDFPageMesh` children; in instanced mode, `pdf.instancedPages` is the single render mesh.
+
 ## Notes
 
 - WebGPU mode is marked preview and depends on browser/GPU support.

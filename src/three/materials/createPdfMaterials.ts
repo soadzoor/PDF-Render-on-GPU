@@ -48,7 +48,6 @@ export function createPdfMaterialSet(
   const panCacheFallbackTexture: Texture = shared.textAtlasTexture;
 
   const commonUniforms = {
-    uWorldUnitsPerPoint: { value: options.page.worldUnitsPerPoint },
     uPageIndex: { value: 0 },
     uPageMetaTexA: { value: shared.pageMetaTextureA.texture },
     uPageMetaTexB: { value: shared.pageMetaTextureB.texture },
@@ -283,7 +282,6 @@ ${isInstanced ? "in float aPageIndex;" : ""}
 uniform mat4 modelViewMatrix;
 uniform mat4 projectionMatrix;
 uniform mat4 modelMatrix;
-uniform float uWorldUnitsPerPoint;
 uniform int uPageIndex;
 uniform float uPanCacheEnabled;
 uniform float uPanCachePrimaryPass;
@@ -308,7 +306,7 @@ ${isInstanced ? "  return int(aPageIndex + 0.5);" : "  return uPageIndex;"}
 }
 
 vec4 toClip(vec2 pagePoint, vec2 pageCenter) {
-  vec3 local = vec3((pagePoint - pageCenter) * uWorldUnitsPerPoint, 0.0);
+  vec3 local = vec3(pagePoint - pageCenter, 0.0);
   vec4 modelLocal = vec4(local, 1.0);
 #ifdef USE_INSTANCING
   modelLocal = instanceMatrix * modelLocal;
@@ -317,7 +315,7 @@ vec4 toClip(vec2 pagePoint, vec2 pageCenter) {
 }
 
 vec3 toWorldPosition(vec2 pagePoint, vec2 pageCenter) {
-  vec3 local = vec3((pagePoint - pageCenter) * uWorldUnitsPerPoint, 0.0);
+  vec3 local = vec3(pagePoint - pageCenter, 0.0);
   vec4 modelLocal = vec4(local, 1.0);
 #ifdef USE_INSTANCING
   modelLocal = instanceMatrix * modelLocal;
