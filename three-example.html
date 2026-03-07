@@ -3,412 +3,136 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>HEPR Three Example</title>
+    <title>HEPR Three.js Example</title>
     <style>
       :root {
         color-scheme: light;
       }
 
-      * {
-        box-sizing: border-box;
-      }
-
       html,
       body {
         margin: 0;
-        width: 100%;
         height: 100%;
         overflow: hidden;
-        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-        background: #f3f5f8;
+        overscroll-behavior: none;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background: #11161d;
+        color: #e8edf5;
       }
 
       #app {
-        position: relative;
-        width: 100%;
-        height: 100%;
+        position: fixed;
+        inset: 0;
       }
 
       #viewport {
         width: 100%;
         height: 100%;
         display: block;
+        touch-action: none;
+        cursor: grab;
       }
 
-      #hud {
-        position: absolute;
+      #viewport:active {
+        cursor: grabbing;
+      }
+
+      #panel {
+        position: fixed;
         top: 16px;
         left: 16px;
-        z-index: 20;
-        width: min(420px, calc(100vw - 32px));
-        max-height: calc(100vh - 32px);
-        max-height: calc(100dvh - 32px);
-        display: flex;
-        flex-direction: column;
-        overflow: hidden;
-        background: rgba(255, 255, 255, 0.94);
-        border: 1px solid rgba(12, 19, 32, 0.16);
-        border-radius: 12px;
+        width: min(620px, calc(100vw - 32px));
+        background: rgba(13, 18, 26, 0.9);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 10px;
         padding: 12px;
-        backdrop-filter: blur(4px);
+        box-sizing: border-box;
+        backdrop-filter: blur(8px);
       }
 
-      .panel-header {
+      .row {
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        gap: 10px;
-      }
-
-      .panel-content {
-        margin-top: 10px;
-        min-height: 0;
-        overflow-y: auto;
-      }
-
-      #hud.collapsed {
-        width: auto;
-        max-width: calc(100vw - 32px);
-      }
-
-      #hud.collapsed .panel-content {
-        display: none;
-      }
-
-      .toolbar {
-        display: flex;
         gap: 8px;
-        align-items: center;
-        flex-wrap: wrap;
+        margin-bottom: 8px;
       }
 
-      button,
+      .row:last-child {
+        margin-bottom: 0;
+      }
+
+      input[type="text"],
       select,
-      input {
+      button,
+      input[type="file"] {
         font: inherit;
       }
 
-      button,
-      select {
-        min-height: 34px;
-        border-radius: 8px;
-        border: 1px solid #c3cad6;
-        background: #ffffff;
-        color: #111827;
-        padding: 0 10px;
+      input[type="text"] {
+        flex: 1;
+        background: #0a0f16;
+        color: #e8edf5;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 6px;
+        padding: 7px 10px;
+        min-width: 0;
       }
 
-      button:hover,
-      select:hover {
-        border-color: #9aa6bb;
+      select,
+      button {
+        background: #162030;
+        color: #e8edf5;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 6px;
+        padding: 7px 10px;
       }
 
-      .chevron-button {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 30px;
-        min-width: 30px;
-        height: 30px;
-        min-height: 30px;
-        padding: 0;
-        border: 1px solid rgba(15, 23, 42, 0.45);
-        background: rgba(15, 23, 42, 0.08);
-        color: #0f172a;
-        font-size: 0.95rem;
-        line-height: 1;
+      button {
+        cursor: pointer;
       }
 
-      .chevron-button:hover {
-        border-color: rgba(15, 23, 42, 0.55);
-        background: rgba(15, 23, 42, 0.16);
-      }
-
-      .rows {
-        display: grid;
-        gap: 8px;
-      }
-
-      .toggle {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .color-row {
-        display: grid;
-        grid-template-columns: 130px 1fr;
-        gap: 8px;
-        align-items: center;
-      }
-
-      .color-controls {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .color-controls input[type="range"] {
-        width: 120px;
+      button:disabled {
+        opacity: 0.6;
+        cursor: default;
       }
 
       #status {
-        margin-top: 10px;
         font-size: 13px;
-        color: #293446;
-      }
-
-      #parse-loader {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        width: fit-content;
-        max-width: 100%;
-        margin-top: 6px;
-        padding: 8px 10px;
-        border-radius: 10px;
-        border: 1px solid rgba(12, 19, 32, 0.16);
-        background: rgba(255, 255, 255, 0.82);
-        color: #0f172a;
-        font-size: 12px;
-      }
-
-      #parse-loader[hidden] {
-        display: none !important;
-      }
-
-      .loader-spinner {
-        width: 14px;
-        height: 14px;
-        border-radius: 50%;
-        border: 2px solid rgba(15, 23, 42, 0.2);
-        border-top-color: #0f172a;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        from {
-          transform: rotate(0deg);
-        }
-        to {
-          transform: rotate(360deg);
-        }
-      }
-
-      #runtime,
-      #help {
-        margin-top: 6px;
-        font-size: 12px;
-        line-height: 1.35;
-      }
-
-      #runtime {
-        color: #334155;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      }
-
-      #help {
-        color: #475569;
-      }
-
-      #metrics {
-        margin-top: 8px;
-        border: 1px solid rgba(15, 23, 42, 0.12);
-        border-radius: 8px;
-        padding: 8px 10px;
-        background: rgba(255, 255, 255, 0.72);
-      }
-
-      #load-debug {
-        margin-top: 8px;
-        border: 1px solid rgba(15, 23, 42, 0.12);
-        border-radius: 8px;
-        padding: 8px 10px;
-        background: rgba(248, 250, 252, 0.92);
-      }
-
-      #load-debug[hidden] {
-        display: none !important;
-      }
-
-      #load-debug summary {
-        cursor: pointer;
-        color: #475569;
-        font-size: 12px;
-      }
-
-      #load-debug-log {
-        margin: 8px 0 0;
-        max-height: 180px;
-        overflow: auto;
-        white-space: pre-wrap;
-        color: #0f172a;
-        font-size: 11px;
-        line-height: 1.4;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      }
-
-      .metric-row {
-        display: grid;
-        grid-template-columns: minmax(120px, 150px) 1fr;
-        gap: 10px;
-        align-items: baseline;
-      }
-
-      .metric-row + .metric-row {
-        margin-top: 4px;
-      }
-
-      .metric-label {
-        color: #475569;
-        font-size: 12px;
-      }
-
-      .metric-value {
-        color: #0f172a;
-        font-size: 12px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-        word-break: break-word;
-      }
-
-      #drop-indicator {
-        position: absolute;
-        display: none;
-        align-items: center;
-        justify-content: center;
-        top: 50%;
-        left: 50%;
-        z-index: 10;
-        width: min(420px, calc(100vw - 48px));
-        min-height: 88px;
-        padding: 18px 24px;
-        transform: translate(-50%, -50%);
-        border: 1px solid rgba(11, 45, 99, 0.18);
-        border-radius: 18px;
-        background: rgba(255, 255, 255, 0.82);
-        box-shadow: 0 18px 42px rgba(15, 23, 42, 0.12);
-        color: #0b2d63;
-        font-size: 22px;
-        font-weight: 600;
-        letter-spacing: 0.2px;
-        text-align: center;
-        pointer-events: none;
-      }
-
-      #drop-indicator.active {
-        display: flex;
-      }
-
-      @media (max-width: 640px) {
-        #hud {
-          width: calc(100vw - 24px);
-          max-height: calc(100vh - 24px);
-          max-height: calc(100dvh - 24px);
-          left: 12px;
-          top: 12px;
-          padding: 10px;
-        }
-
-        .color-row {
-          grid-template-columns: 1fr;
-        }
+        opacity: 0.92;
       }
     </style>
-    <script type="module" crossorigin src="./assets/threeExample-0kIUdGJl.js"></script>
-    <link rel="modulepreload" crossorigin href="./assets/client-GTiz-NFi.js">
+    <script type="module" crossorigin src="./assets/three-Dc_wMAJq.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/exampleManifest-BYaABfLS.js">
     <link rel="modulepreload" crossorigin href="./assets/pdf-TYrZqVzP.js">
   </head>
   <body>
     <div id="app">
       <canvas id="viewport"></canvas>
-      <div id="hud">
-        <div class="panel-header">
-          <div class="toolbar">
-            <button id="open-file" type="button">Open PDF / ZIP</button>
-            <select id="example-select" aria-label="Load example PDF or parsed ZIP" disabled>
-              <option value="">Examples (loading...)</option>
-            </select>
-            <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" hidden />
-          </div>
-          <button id="toggle-hud" class="chevron-button" type="button" aria-expanded="true" aria-controls="hud-content" title="Collapse panel">
-            <span id="toggle-hud-icon" aria-hidden="true">▾</span>
-          </button>
-        </div>
-        <div id="hud-content" class="panel-content">
-          <div class="rows">
-          <label class="toggle">
-            <input id="toggle-pan-optimization" type="checkbox" checked />
-            <span>Pan optimization</span>
-          </label>
-          <label class="toggle">
-            <input id="toggle-segment-merge" type="checkbox" checked />
-            <span>Segment merge</span>
-          </label>
-          <label class="toggle">
-            <input id="toggle-invisible-cull" type="checkbox" checked />
-            <span>Invisible cull</span>
-          </label>
-          <label class="toggle">
-            <input id="toggle-stroke-curves" type="checkbox" checked />
-            <span>Curve strokes</span>
-          </label>
-          <label class="toggle">
-            <input id="toggle-vector-text-only" type="checkbox" />
-            <span>Vector only</span>
-          </label>
-          <div class="color-row">
-            <label for="page-mode">Page mode</label>
-            <div class="color-controls">
-              <select id="page-mode" aria-label="Page render mode">
-                <option value="pages">Individual pages</option>
-                <option value="instanced">Instanced mesh</option>
-              </select>
-            </div>
-          </div>
-          <div class="color-row">
-            <label for="page-bg-color">Page Background</label>
-            <div class="color-controls">
-              <input id="page-bg-color" type="color" value="#ffffff" />
-              <input id="page-bg-opacity" type="range" min="0" max="100" step="1" value="100" />
-              <span id="page-bg-opacity-value">100%</span>
-            </div>
-          </div>
-          <div class="color-row">
-            <label for="vector-color">Vector Override</label>
-            <div class="color-controls">
-              <input id="vector-color" type="color" value="#000000" />
-              <input id="vector-opacity" type="range" min="0" max="100" step="1" value="0" />
-              <span id="vector-opacity-value">0%</span>
-            </div>
-          </div>
-          </div>
-          <div id="status">Waiting for PDF or parsed ZIP...</div>
-          <div id="parse-loader" hidden>
-            <span class="loader-spinner" aria-hidden="true"></span>
-            <span id="parse-loader-text"></span>
-          </div>
-          <div id="runtime"></div>
-          <div id="metrics">
-            <div class="metric-row"><span class="metric-label">File</span><span id="metric-file" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">Operators</span><span id="metric-operators" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">Source Segments</span><span id="metric-source-segments" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">Merged Segments</span><span id="metric-merged-segments" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">Visible Segments</span><span id="metric-visible-segments" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">Reductions</span><span id="metric-reductions" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">Cull Discards</span><span id="metric-cull-discards" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">Parse / Upload</span><span id="metric-times" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">FPS</span><span id="metric-fps" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
-            <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
-          </div>
-          <details id="load-debug" hidden>
-            <summary>Load Debug</summary>
-            <pre id="load-debug-log"></pre>
-          </details>
-          <div id="help">Drag to pan, mouse wheel or pinch to zoom, or drag-and-drop a PDF or parsed ZIP.</div>
-        </div>
+    </div>
+
+    <div id="panel" role="group" aria-label="Three.js HEPR controls">
+      <div class="row">
+        <input
+          id="source-input"
+          type="text"
+          placeholder="PDF/ZIP path, URL, or base64"
+          aria-label="PDF or ZIP path/URL/base64"
+        />
+        <button id="load-source" type="button">Load Source</button>
       </div>
-      <div id="drop-indicator" class="active">Drop PDF or parsed ZIP to render</div>
+      <div class="row">
+        <select id="example-select" aria-label="Load example PDF or parsed ZIP" disabled>
+          <option value="">Examples (loading...)</option>
+        </select>
+        <select id="backend-select" aria-label="Renderer backend">
+          <option value="webgl" selected>WebGL</option>
+          <option value="webgpu">WebGPU</option>
+        </select>
+      </div>
+      <div class="row">
+        <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" />
+      </div>
+      <div id="status" class="row">Waiting for PDF or parsed ZIP source.</div>
     </div>
 
   </body>

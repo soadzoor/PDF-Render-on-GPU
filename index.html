@@ -4,10 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Highly Efficient PDF Renderer</title>
-    <script type="module" crossorigin src="./assets/main-BHwLhTqx.js"></script>
-    <link rel="modulepreload" crossorigin href="./assets/client-GTiz-NFi.js">
+    <script type="module" crossorigin src="./assets/main-BmSJ9gKa.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/exampleManifest-BYaABfLS.js">
     <link rel="modulepreload" crossorigin href="./assets/pdf-TYrZqVzP.js">
-    <link rel="stylesheet" crossorigin href="./assets/main-BYWuSNY-.css">
+    <link rel="stylesheet" crossorigin href="./assets/main-vb0SM_Oa.css">
   </head>
   <body>
     <canvas id="viewport"></canvas>
@@ -19,7 +19,6 @@
             <option value="">Examples (loading...)</option>
           </select>
           <button id="download-data" type="button" hidden disabled>Download Parsed Data</button>
-          <button id="download-all-data" type="button" disabled>Download All Example ZIPs</button>
           <input id="file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip,application/x-zip-compressed" hidden />
         </div>
         <button id="toggle-hud" class="chevron-button" type="button" aria-expanded="true" aria-controls="hud-content" title="Collapse panel">
@@ -82,7 +81,7 @@
         <div id="status" class="status">Waiting for PDF or parsed ZIP...</div>
         <div id="parse-loader" class="parse-loader" hidden>
           <span class="loader-spinner" aria-hidden="true"></span>
-          <span id="parse-loader-text"></span>
+          <span>Parsing / loading...</span>
         </div>
         <div id="runtime" class="runtime"></div>
         <div id="metrics" class="metrics">
@@ -98,10 +97,6 @@
           <div class="metric-row"><span class="metric-label">Texture</span><span id="metric-texture" class="metric-value">-</span></div>
           <div class="metric-row"><span class="metric-label">Grid Max Cell</span><span id="metric-grid-max-cell" class="metric-value">-</span></div>
         </div>
-        <details id="load-debug" class="load-debug" hidden>
-          <summary>Load Debug</summary>
-          <pre id="load-debug-log" class="load-debug-log"></pre>
-        </details>
         <div class="help">Drag to pan, mouse wheel or pinch to zoom, or drag-and-drop a PDF or parsed ZIP.</div>
       </div>
     </div>
