@@ -34,6 +34,11 @@ body {
   left: 16px;
   top: 16px;
   width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: rgba(250, 251, 252, 0.9);
   border: 1px solid rgba(15, 23, 42, 0.16);
   border-radius: 10px;
@@ -51,6 +56,8 @@ body {
 
 .panel-content {
   margin-top: 8px;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .panel.collapsed {
@@ -329,22 +336,42 @@ button:disabled {
 
 .drop-indicator {
   position: fixed;
-  inset: 0;
-  display: grid;
-  place-items: center;
+  top: 50%;
+  left: 50%;
+  width: min(420px, calc(100vw - 48px));
+  min-height: 88px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 18px 24px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(11, 45, 99, 0.18);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.12);
   pointer-events: none;
-  opacity: 0;
-  background: transparent;
   color: #0f172a;
   font-size: clamp(1.1rem, 2.2vw, 1.6rem);
   font-weight: 600;
-  transition: opacity 120ms ease-out;
+  text-align: center;
 }
 
 .drop-indicator.active {
-  opacity: 1;
+  display: flex;
 }
 
 .drop-indicator.dragging {
-  background: rgba(10, 22, 40, 0.18);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 22px 48px rgba(15, 23, 42, 0.16);
+}
+
+@media (max-width: 640px) {
+  .panel {
+    width: calc(100vw - 24px);
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - 24px);
+    left: 12px;
+    top: 12px;
+    padding: 10px 12px;
+  }
 }

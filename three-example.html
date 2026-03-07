@@ -40,6 +40,11 @@
         top: 16px;
         left: 16px;
         width: min(420px, calc(100vw - 32px));
+        max-height: calc(100vh - 32px);
+        max-height: calc(100dvh - 32px);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
         background: rgba(255, 255, 255, 0.94);
         border: 1px solid rgba(12, 19, 32, 0.16);
         border-radius: 12px;
@@ -56,6 +61,8 @@
 
       .panel-content {
         margin-top: 10px;
+        min-height: 0;
+        overflow-y: auto;
       }
 
       #hud.collapsed {
@@ -265,15 +272,24 @@
 
       #drop-indicator {
         position: absolute;
-        inset: 0;
         display: none;
         align-items: center;
         justify-content: center;
-        background: rgba(16, 47, 96, 0.18);
+        top: 50%;
+        left: 50%;
+        width: min(420px, calc(100vw - 48px));
+        min-height: 88px;
+        padding: 18px 24px;
+        transform: translate(-50%, -50%);
+        border: 1px solid rgba(11, 45, 99, 0.18);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.82);
+        box-shadow: 0 18px 42px rgba(15, 23, 42, 0.12);
         color: #0b2d63;
         font-size: 22px;
         font-weight: 600;
         letter-spacing: 0.2px;
+        text-align: center;
         pointer-events: none;
       }
 
@@ -284,6 +300,8 @@
       @media (max-width: 640px) {
         #hud {
           width: calc(100vw - 24px);
+          max-height: calc(100vh - 24px);
+          max-height: calc(100dvh - 24px);
           left: 12px;
           top: 12px;
           padding: 10px;
@@ -717,6 +735,7 @@
 
       function refreshDropIndicator() {
         const shouldShow = isDragActive || !pdfObject;
+        updateDropIndicatorLayout();
         dropIndicator.classList.toggle("active", shouldShow);
       }
 
@@ -725,6 +744,30 @@
         toggleHudButton.setAttribute("aria-expanded", String(!collapsed));
         toggleHudButton.title = collapsed ? "Expand panel" : "Collapse panel";
         toggleHudIcon.textContent = collapsed ? "▸" : "▾";
+        updateDropIndicatorLayout();
+      }
+
+      function updateDropIndicatorLayout() {
+        const viewportWidth = Math.max(window.innerWidth, 1);
+        const viewportHeight = Math.max(window.innerHeight, 1);
+        const hudRect = hudElement.getBoundingClientRect();
+        const hudCollapsed = hudElement.classList.contains("collapsed");
+        const sideGap = viewportWidth <= 640 ? 12 : 24;
+        const minRightAreaWidth = 280;
+        const availableLeft = Math.min(viewportWidth - sideGap, hudRect.right + sideGap);
+        const availableWidth = Math.max(0, viewportWidth - availableLeft - sideGap);
+
+        let centerX = viewportWidth * 0.5;
+        let indicatorWidth = Math.min(420, Math.max(220, viewportWidth - sideGap * 2));
+
+        if (!hudCollapsed && availableWidth >= minRightAreaWidth) {
+          centerX = availableLeft + availableWidth * 0.5;
+          indicatorWidth = Math.min(420, availableWidth);
+        }
+
+        dropIndicator.style.left = `${Math.round(centerX)}px`;
+        dropIndicator.style.top = `${Math.round(viewportHeight * 0.5)}px`;
+        dropIndicator.style.width = `${Math.round(indicatorWidth)}px`;
       }
 
       function disposeCurrentPdfObject() {
@@ -1012,6 +1055,7 @@
         const width = Math.max(window.innerWidth, 1);
         const height = Math.max(window.innerHeight, 1);
         renderer.setSize(width, height, false);
+        updateDropIndicatorLayout();
         if (pdfObject) {
           fitCameraToObject(pdfObject);
         } else {

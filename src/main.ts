@@ -447,6 +447,7 @@ uiControlManager.bindEventListeners({
 canvasInteractionController.attach(canvasElement);
 
 window.addEventListener("resize", () => {
+  updateDropIndicatorLayout();
   renderer.resize();
 });
 
@@ -493,8 +494,32 @@ window.addEventListener("drop", async (event) => {
 
 function refreshDropIndicator(): void {
   const shouldShow = isDropDragActive || !lastParsedScene;
+  updateDropIndicatorLayout();
   dropIndicatorElement.classList.toggle("active", shouldShow);
   dropIndicatorElement.classList.toggle("dragging", isDropDragActive);
+}
+
+function updateDropIndicatorLayout(): void {
+  const viewportWidth = Math.max(window.innerWidth, 1);
+  const viewportHeight = Math.max(window.innerHeight, 1);
+  const hudRect = hudPanelElement.getBoundingClientRect();
+  const hudCollapsed = hudPanelElement.classList.contains("collapsed");
+  const sideGap = viewportWidth <= 640 ? 12 : 24;
+  const minRightAreaWidth = 280;
+  const availableLeft = Math.min(viewportWidth - sideGap, hudRect.right + sideGap);
+  const availableWidth = Math.max(0, viewportWidth - availableLeft - sideGap);
+
+  let centerX = viewportWidth * 0.5;
+  let indicatorWidth = Math.min(420, Math.max(220, viewportWidth - sideGap * 2));
+
+  if (!hudCollapsed && availableWidth >= minRightAreaWidth) {
+    centerX = availableLeft + availableWidth * 0.5;
+    indicatorWidth = Math.min(420, availableWidth);
+  }
+
+  dropIndicatorElement.style.left = `${Math.round(centerX)}px`;
+  dropIndicatorElement.style.top = `${Math.round(viewportHeight * 0.5)}px`;
+  dropIndicatorElement.style.width = `${Math.round(indicatorWidth)}px`;
 }
 
 async function loadExampleManifest(): Promise<void> {
@@ -1007,6 +1032,7 @@ function setHudCollapsed(collapsed: boolean): void {
   toggleHudButtonElement.setAttribute("aria-expanded", String(!collapsed));
   toggleHudButtonElement.title = collapsed ? "Expand panel" : "Collapse panel";
   toggleHudIconElement.textContent = collapsed ? "▸" : "▾";
+  updateDropIndicatorLayout();
 }
 
 async function downloadAllExampleParsedZips(): Promise<void> {
